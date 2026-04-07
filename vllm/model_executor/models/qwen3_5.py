@@ -24,14 +24,16 @@
 # limitations under the License.
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
-import typing
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
+from itertools import islice
 
 import torch
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import (
+    VllmConfig,
+)
 from vllm.distributed import (
     get_pp_group,
 )
@@ -39,21 +41,21 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
 )
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.gdn_linear_attn import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
+from vllm.model_executor.model_loader.weight_utils import (  # noqa: F401
     default_weight_loader,
-    maybe_remap_kv_scale_name,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
@@ -71,7 +73,6 @@ from .interfaces import (
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
-    SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
     _require_is_multimodal,
@@ -80,9 +81,11 @@ from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from .qwen3_next import (
     Qwen3NextAttention,
     Qwen3NextDecoderLayer,
+    Qwen3NextGatedDeltaNet,
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
+    _maybe_sm70_projection,
 )
 from .qwen3_vl import (
     Qwen3_VisionTransformer,
@@ -96,13 +99,36 @@ from .utils import (
     PPMissingLayer,
     _merge_multimodal_embeddings,
     extract_layer_index,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
 
 logger = init_logger(__name__)
+
+
+def _should_split_linear_attn_ba(
+    quant_config: QuantizationConfig | None,
+) -> bool:
+    modules_to_not_convert = (
+        getattr(quant_config, "modules_to_not_convert", None) or []
+    )
+    return any("linear_attn.in_proj_b" in module
+               or "linear_attn.in_proj_a" in module
+               for module in modules_to_not_convert)
+
+
+def _get_qwen35_linear_attn_packed_modules_mapping(
+    quant_config: QuantizationConfig | None,
+) -> dict[str, list[str]]:
+    if _should_split_linear_attn_ba(quant_config):
+        return {
+            "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+            "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        }
+    return {
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
+    }
 
 
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
@@ -113,6 +139,141 @@ class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
 class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5MoeConfig)
+
+
+class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
+    def create_qkvz_proj(
+        self,
+        hidden_size: int,
+        key_dim: int,
+        value_dim: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> MergedColumnParallelLinear:
+        if _should_split_linear_attn_ba(quant_config):
+            return MergedColumnParallelLinear(
+                input_size=hidden_size,
+                output_sizes=[
+                    key_dim,
+                    key_dim,
+                    value_dim,
+                    value_dim,
+                ],
+                bias=False,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+        return MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[
+                key_dim,
+                key_dim,
+                value_dim,
+                value_dim,
+                self.num_v_heads,
+                self.num_v_heads,
+            ],
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def create_ba_proj(
+        self,
+        hidden_size: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> MergedColumnParallelLinear | None:
+        if _should_split_linear_attn_ba(quant_config):
+            return MergedColumnParallelLinear(
+                input_size=hidden_size,
+                output_sizes=[self.num_v_heads, self.num_v_heads],
+                bias=False,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+        return None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ):
+        """
+        Forward pass with three parts:
+        1. Input projection
+        2. Core attention (custom op)
+        3. Output projection
+        """
+        num_tokens = hidden_states.size(0)
+
+        # ============================================================
+        # Part 1: Input Projection
+        # ============================================================
+        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+        z_size = self.value_dim // self.tp_size
+        ba_size = self.num_v_heads // self.tp_size
+        projected_states_qkvz = _maybe_sm70_projection(
+            self.in_proj_qkvz, hidden_states
+        )
+        if projected_states_qkvz is None:
+            projected_states_qkvz = self.in_proj_qkvz(hidden_states)
+        projected_states_qkvz, _ = projected_states_qkvz
+        if self.in_proj_ba is None:
+            mixed_qkv, z, b, a = projected_states_qkvz.split(
+                [qkv_size, z_size, ba_size, ba_size], dim=-1
+            )
+        else:
+            projected_states_ba = _maybe_sm70_projection(
+                self.in_proj_ba, hidden_states
+            )
+            if projected_states_ba is None:
+                projected_states_ba = self.in_proj_ba(hidden_states)
+            projected_states_ba, _ = projected_states_ba
+            mixed_qkv, z = projected_states_qkvz.split(
+                [qkv_size, z_size], dim=-1
+            )
+            b, a = projected_states_ba.split([ba_size, ba_size], dim=-1)
+        # Normalize split views so torch.compile/cudagraph do not specialize
+        # on the fused projection's parent stride.
+        mixed_qkv = mixed_qkv.contiguous()
+        z = z.contiguous().reshape(z.size(0), -1, self.head_v_dim)
+        b = b.contiguous()
+        a = a.contiguous()
+
+        # ============================================================
+        # Part 2: Core Attention (Custom Op)
+        # ============================================================
+        # Note: we should not use torch.empty here like other attention backends,
+        # see discussions in https://github.com/vllm-project/vllm/pull/28182
+        core_attn_out = torch.zeros(
+            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        torch.ops.vllm.gdn_attention_core(
+            mixed_qkv,
+            b,
+            a,
+            core_attn_out,
+            self.prefix,
+        )
+
+        # ============================================================
+        # Part 3: Output Projection
+        # ============================================================
+        z_shape_og = z.shape
+        # Reshape input data into 2D tensor
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z = z.reshape(-1, z.shape[-1])
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        out_proj = _maybe_sm70_projection(self.out_proj, core_attn_out)
+        if out_proj is None:
+            out_proj = self.out_proj(core_attn_out)
+        output[:num_tokens], _ = out_proj
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
@@ -128,17 +289,19 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        speculative_config = vllm_config.speculative_config
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = GatedDeltaNetAttention(
-                config=config,
-                vllm_config=vllm_config,
+            self.linear_attn = Qwen3_5GatedDeltaNet(
+                config,
+                model_config=model_config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                speculative_config=speculative_config,
                 prefix=f"{prefix}.linear_attn",
-                gqa_interleaved_layout=False,
-                create_in_proj_qkvz=vllm_config.lora_config is None,
             )
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
@@ -178,11 +341,16 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
 
         self.layer_scale = getattr(config, "layer_scale", False)
         if self.layer_scale:
+            # Use model_config.dtype (runtime dtype, e.g. fp16 on SM70)
+            # instead of config.dtype (HF config dtype, e.g. bf16)
+            _scale_dtype = (model_config.dtype
+                            if model_config is not None else config.dtype)
             self.attn_layer_scale = torch.nn.Parameter(
                 torch.zeros(
                     1,
                     1,
                     config.hidden_size,
+                    dtype=_scale_dtype,
                 ),
             )
             self.ffn_layer_scale = torch.nn.Parameter(
@@ -190,6 +358,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     1,
                     1,
                     config.hidden_size,
+                    dtype=_scale_dtype,
                 ),
             )
 
@@ -217,7 +386,6 @@ class Qwen3_5Model(Qwen3NextModel):
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
         self.config = config
-        self.enable_lora = vllm_config.lora_config is not None
 
         self.vocab_size = config.vocab_size
 
@@ -245,34 +413,6 @@ class Qwen3_5Model(Qwen3NextModel):
         else:
             self.norm = PPMissingLayer()
 
-        self.aux_hidden_state_layers: tuple[int, ...] = ()
-
-    def load_fused_expert_weights(
-        self,
-        name: str,
-        params_dict: dict,
-        loaded_weight: torch.Tensor,
-        shard_id: str,
-        num_experts: int,
-    ) -> bool:
-        param = params_dict[name]
-        weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
-        loaded_local_expert = False
-        for expert_id in range(num_experts):
-            curr_expert_weight = loaded_weight[expert_id]
-            success = weight_loader(
-                param,
-                curr_expert_weight,
-                name,
-                shard_id,
-                expert_id,
-                return_success=True,
-            )
-            if success:
-                loaded_local_expert = True
-
-        return loaded_local_expert
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -283,36 +423,38 @@ class Qwen3_5Model(Qwen3NextModel):
             # mlp
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            ("in_proj_ba", "in_proj_b", 0),
-            ("in_proj_ba", "in_proj_a", 1),
         ]
 
-        if self.enable_lora:
-            stacked_params_mapping.extend(
-                [
-                    ("in_proj_qkv", "in_proj_qkv", (0, 1, 2)),
-                    ("in_proj_z", "in_proj_z", 0),
-                ]
-            )
-        else:
-            stacked_params_mapping.extend(
-                [
-                    ("in_proj_qkvz", "in_proj_qkv", (0, 1, 2)),
-                    ("in_proj_qkvz", "in_proj_z", 3),
-                ]
-            )
+        from vllm.model_executor.model_loader.weight_utils import (
+            default_weight_loader,
+            maybe_remap_kv_scale_name,
+        )
+        from .utils import is_pp_missing_parameter
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
-        is_fused_expert = False
-        fused_expert_params_mapping = [
-            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
-            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
-        ]
-        num_experts = (
-            self.config.num_experts if hasattr(self.config, "num_experts") else 0
+        split_linear_attn_ba = any(
+            ".linear_attn.in_proj_ba." in name for name in params_dict
         )
+        # Qwen3.5 checkpoints store in_proj_qkv/in_proj_z/in_proj_b/in_proj_a
+        # as separate tensors. Some dense AWQ checkpoints intentionally keep
+        # in_proj_b/a in higher precision, so they must stay in a separate BA
+        # projection instead of being fused into in_proj_qkvz.
+        stacked_params_mapping.extend([
+            ("in_proj_qkvz", "in_proj_qkv", (0, 1, 2)),
+            ("in_proj_qkvz", "in_proj_z", 3),
+        ])
+        if split_linear_attn_ba:
+            stacked_params_mapping.extend([
+                ("in_proj_ba", "in_proj_b", 0),
+                ("in_proj_ba", "in_proj_a", 1),
+            ])
+        else:
+            stacked_params_mapping.extend([
+                ("in_proj_qkvz", "in_proj_b", 4),
+                ("in_proj_qkvz", "in_proj_a", 5),
+            ])
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -327,10 +469,6 @@ class Qwen3_5Model(Qwen3NextModel):
                     continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
-                    is_fused_expert = True
-                    expert_params_mapping = fused_expert_params_mapping
-
                 if weight_name not in name:
                     continue
 
@@ -338,99 +476,119 @@ class Qwen3_5Model(Qwen3NextModel):
                     continue
 
                 name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # Skip layers on other devices.
                 if is_pp_missing_parameter(name, self):
                     continue
-                # name = apply_attn_prefix(name, params_dict)
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                if param_name == "in_proj_z" and self.enable_lora:
-                    weight_loader(param, loaded_weight)
+                if isinstance(shard_id, tuple):
+                    # Split by the target module's output shard metadata
+                    # instead of hardcoding tensor shapes.
+                    owner = getattr(weight_loader, "__self__", None)
+                    output_sizes = getattr(owner, "output_sizes", None)
+                    if output_sizes is None:
+                        raise RuntimeError(
+                            f"Missing output_sizes for tuple shard load: {name}"
+                        )
+                    max_sub_id = max(shard_id)
+                    if max_sub_id >= len(output_sizes):
+                        raise RuntimeError(
+                            "Tuple shard index out of range for "
+                            f"{name}: shard_ids={shard_id}, "
+                            f"output_sizes={output_sizes}"
+                        )
+                    logger.debug(
+                        "Tuple shard load for %s: shard_ids=%s output_sizes=%s "
+                        "weight_shape=%s output_dim=%d",
+                        name,
+                        shard_id,
+                        output_sizes,
+                        tuple(loaded_weight.shape),
+                        param.output_dim,
+                    )
+                    for sub_id in shard_id:
+                        shard_offset = sum(output_sizes[:sub_id])
+                        shard_size = output_sizes[sub_id]
+
+                        # Match MergedColumnParallelLinear packing behavior.
+                        if (
+                            hasattr(param, "packed_dim")
+                            and hasattr(param, "output_dim")
+                            and param.packed_dim == param.output_dim
+                            and hasattr(param, "adjust_shard_indexes_for_packing")
+                        ):
+                            shard_size, shard_offset = (
+                                param.adjust_shard_indexes_for_packing(
+                                    shard_size=shard_size,
+                                    shard_offset=shard_offset,
+                                )
+                            )
+                        if shard_offset + shard_size > loaded_weight.size(
+                            param.output_dim
+                        ):
+                            raise RuntimeError(
+                                "Tuple shard range exceeds loaded tensor for "
+                                f"{name}: sub_id={sub_id}, "
+                                f"offset={shard_offset}, size={shard_size}, "
+                                f"loaded_dim={loaded_weight.size(param.output_dim)}, "
+                                f"output_dim={param.output_dim}, "
+                                f"weight_shape={tuple(loaded_weight.shape)}, "
+                                f"output_sizes={output_sizes}"
+                            )
+
+                        try:
+                            loaded_weight_shard = loaded_weight.narrow(
+                                param.output_dim, shard_offset, shard_size
+                            )
+                        except RuntimeError as e:
+                            raise RuntimeError(
+                                "Failed tuple shard narrow for "
+                                f"{name}: sub_id={sub_id}, "
+                                f"offset={shard_offset}, size={shard_size}, "
+                                f"output_dim={param.output_dim}, "
+                                f"weight_shape={tuple(loaded_weight.shape)}, "
+                                f"output_sizes={output_sizes}"
+                            ) from e
+                        weight_loader(param, loaded_weight_shard, sub_id)
                 else:
                     weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                is_expert_weight = False
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    is_expert_weight = True
-                    name_mapped = name.replace(weight_name, param_name)
-                    # Skip layers on other devices.
-                    if is_pp_missing_parameter(name_mapped, self):
+                    name = name.replace(weight_name, param_name)
+                    if is_pp_missing_parameter(name, self):
                         continue
-                    if is_fused_expert:
-                        # qwen3.5 no need to transpose
-                        # loaded_weight = loaded_weight.transpose(-1, -2)
-                        if "experts.gate_up_proj" in name:
-                            loaded_weight = loaded_weight.chunk(2, dim=-2)
-                            success_w1 = self.load_fused_expert_weights(
-                                name_mapped,
-                                params_dict,
-                                loaded_weight[0],
-                                "w1",
-                                num_experts,
-                            )
-                            success_w3 = self.load_fused_expert_weights(
-                                name_mapped,
-                                params_dict,
-                                loaded_weight[1],
-                                "w3",
-                                num_experts,
-                            )
-                            success = success_w1 and success_w3
-                        else:
-                            # down_proj
-                            success = self.load_fused_expert_weights(
-                                name_mapped,
-                                params_dict,
-                                loaded_weight,
-                                shard_id,
-                                num_experts,
-                            )
-                        if success:
-                            name = name_mapped
-                            break
-                    else:
-                        # Skip loading extra bias for GPTQ models.
-                        if (
-                            name_mapped.endswith(".bias")
-                            or name_mapped.endswith("_bias")
-                        ) and name_mapped not in params_dict:
-                            continue
-                        param = params_dict[name_mapped]
-                        weight_loader = param.weight_loader
-                        success = weight_loader(
-                            param,
-                            loaded_weight,
-                            name_mapped,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
-                            return_success=True,
-                        )
-                    if success:
-                        name = name_mapped
-                        break
+                    if (
+                        name.endswith(".bias") or name.endswith("_bias")
+                    ) and name not in params_dict:
+                        continue
+                    if name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+                    break
                 else:
-                    if is_expert_weight:
-                        # We've checked that this is an expert weight
-                        # However it's not mapped locally to this rank
-                        # So we simply skip it
-                        continue
-                    # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     if is_pp_missing_parameter(name, self):
                         continue
                     if name not in params_dict:
                         logger.warning_once(
-                            f"Parameter {name} not found in params_dict, skip loading"
+                            f"Parameter {name} not found in "
+                            "params_dict, skip loading"
                         )
                         continue
                     param = params_dict[name]
@@ -441,11 +599,42 @@ class Qwen3_5Model(Qwen3NextModel):
             loaded_params.add(name)
         return loaded_params
 
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
 
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
-    SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
 ):
@@ -457,8 +646,7 @@ class Qwen3_5ForCausalLMBase(
         ],
         "gate_up_proj": ["gate_proj", "up_proj"],
         # GDN fused projections.
-        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -478,18 +666,17 @@ class Qwen3_5ForCausalLMBase(
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
+        self.packed_modules_mapping = dict(type(self).packed_modules_mapping or {})
+        self.packed_modules_mapping.update(
+            _get_qwen35_linear_attn_packed_modules_mapping(self.quant_config)
+        )
+        if self.quant_config is not None:
+            self.quant_config.packed_modules_mapping.update(
+                self.packed_modules_mapping
+            )
         self.model = Qwen3_5Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-
-        # When LoRA is enabled, GDN uses separate in_proj_qkv and in_proj_z
-        # instead of merged in_proj_qkvz; pack mapping must match.
-        if vllm_config.lora_config:
-            base = getattr(Qwen3_5ForCausalLMBase, "packed_modules_mapping", {})
-            self.packed_modules_mapping = {k: list(v) for k, v in base.items()}
-            self.packed_modules_mapping.pop("in_proj_qkvz", None)
-            self.packed_modules_mapping["in_proj_qkv"] = ["in_proj_qkv"]
-            self.packed_modules_mapping["in_proj_z"] = ["in_proj_z"]
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -511,13 +698,6 @@ class Qwen3_5ForCausalLMBase(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.model.aux_hidden_state_layers = layers
-
-    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        num_layers = len(self.model.layers)
-        return (2, num_layers // 2, num_layers - 3)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -537,6 +717,9 @@ class Qwen3_5ForCausalLMBase(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
@@ -572,18 +755,13 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
-    # Qwen3.5 does not support multimodal pruning (EVS).
-    supports_multimodal_pruning = False
-
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
-        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # protocols have not __init__ method, so we need to use nn.Module.__init__
         nn.Module.__init__(self)
-        self.update_packed_mapping(enable_lora=vllm_config.lora_config is not None)
         config: Qwen3_5Config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
@@ -591,8 +769,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         self.config = config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-        # Qwen3.5 does not support multimodal pruning (EVS).
-        self.is_multimodal_pruning_enabled = False
+        self.video_pruning_rate = multimodal_config.video_pruning_rate
+        self.is_multimodal_pruning_enabled = (
+            multimodal_config.is_multimodal_pruning_enabled()
+        )
+        self.packed_modules_mapping = dict(type(self).packed_modules_mapping or {})
+        self.packed_modules_mapping.update(
+            _get_qwen35_linear_attn_packed_modules_mapping(quant_config)
+        )
+        if quant_config is not None:
+            quant_config.packed_modules_mapping.update(self.packed_modules_mapping)
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.visual = Qwen3_VisionTransformer(
@@ -611,27 +797,19 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             self.language_model.make_empty_intermediate_tensors
         )
 
-    def update_packed_mapping(self, enable_lora: bool):
-        # When LoRA is enabled, GDN uses separate in_proj_qkv and in_proj_z
-        if enable_lora:
-            base = getattr(
-                Qwen3_5ForConditionalGeneration, "packed_modules_mapping", {}
-            )
-            self.packed_modules_mapping = {k: list(v) for k, v in base.items()}
-            self.packed_modules_mapping.pop("in_proj_qkvz", None)
-            self.packed_modules_mapping["in_proj_qkv"] = ["in_proj_qkv"]
-
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
+        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         inputs_embeds = self._embed_text_input_ids(
             input_ids,
             self.language_model.embed_input_ids,
             is_multimodal=is_multimodal,
+            handle_oov_mm_token=handle_oov_mm_token,
         )
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
@@ -646,12 +824,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         )
 
         return inputs_embeds
-
-    def recompute_mrope_positions(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Qwen3.5 does not support multimodal pruning (EVS). "
-            "recompute_mrope_positions should never be called."
-        )
 
     def forward(
         self,
@@ -801,13 +973,9 @@ class Qwen3_5_MoeMixtureOfExperts(MixtureOfExperts):
 class Qwen3_5MoeForConditionalGeneration(
     Qwen3_5ForConditionalGeneration, Qwen3_5_MoeMixtureOfExperts
 ):
-    # For MoE LoRA weights loading
-    is_3d_moe_weight: bool = True
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # protocols have not __init__ method, so we need to use nn.Module.__init__
         nn.Module.__init__(self)
-        self.update_packed_mapping(enable_lora=vllm_config.lora_config is not None)
         config: Qwen3_5MoeConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
@@ -815,8 +983,16 @@ class Qwen3_5MoeForConditionalGeneration(
         self.config = config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-        # Qwen3.5 does not support multimodal pruning (EVS).
-        self.is_multimodal_pruning_enabled = False
+        self.video_pruning_rate = multimodal_config.video_pruning_rate
+        self.is_multimodal_pruning_enabled = (
+            multimodal_config.is_multimodal_pruning_enabled()
+        )
+        self.packed_modules_mapping = dict(type(self).packed_modules_mapping or {})
+        self.packed_modules_mapping.update(
+            _get_qwen35_linear_attn_packed_modules_mapping(quant_config)
+        )
+        if quant_config is not None:
+            quant_config.packed_modules_mapping.update(self.packed_modules_mapping)
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.visual = Qwen3_VisionTransformer(

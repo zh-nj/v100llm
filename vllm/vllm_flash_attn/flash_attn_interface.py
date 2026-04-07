@@ -1,18 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) 2023, Tri Dao.
-# ruff: noqa: E501
 
+from typing import Optional, Union, Tuple, List
 
 import torch
+import torch.nn as nn
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
 # Use relative import to support build-from-source installation in vLLM
 
 try:
-    from . import _vllm_fa2_C  # type: ignore[attr-defined]  # noqa: F401
-
+    from . import _vllm_fa2_C  # noqa: F401
     FA2_UNAVAILABLE_REASON = None
     FA2_AVAILABLE = True
 except ImportError as e:
@@ -20,27 +18,18 @@ except ImportError as e:
     FA2_AVAILABLE = False
 
 try:
-    from . import _vllm_fa3_C  # type: ignore[attr-defined]  # noqa: F401
-
+    from . import _vllm_fa3_C  # noqa: F401
     FA3_UNAVAILABLE_REASON = None
     FA3_AVAILABLE = True
 except ImportError as e:
     FA3_UNAVAILABLE_REASON = str(e)
     FA3_AVAILABLE = False
 
-
 try:
-    import os
-
-    _cute_interface_path = os.path.join(
-        os.path.dirname(__file__), "cute", "interface.py"
-    )
-    if not os.path.exists(_cute_interface_path):
-        raise ImportError("vllm.vllm_flash_attn.cute.interface not found")
-
+    from flash_attn.cute.interface import _flash_attn_fwd  # noqa: F401
     FA4_UNAVAILABLE_REASON = None
     FA4_AVAILABLE = True
-except (ImportError, ModuleNotFoundError) as e:
+except ImportError as e:
     FA4_UNAVAILABLE_REASON = str(e)
     FA4_AVAILABLE = False
 
@@ -48,68 +37,52 @@ except (ImportError, ModuleNotFoundError) as e:
 
 DEFAULT_FA_VERSION = 2
 
-
-def _is_fa2_supported() -> tuple[bool, str | None]:
+def _is_fa2_supported(device = None) -> Tuple[bool, Optional[str]]:
     if not FA2_AVAILABLE:
-        return False, f"FA2 is unavailable due to: {FA2_UNAVAILABLE_REASON}"
-    from vllm.platforms import current_platform
-
-    if not current_platform.has_device_capability(80):
-        return False, "FA2 is only supported on devices with compute capability >= 8"
+        return False, f"FA2 is unavaible due to: {FA2_UNAVAILABLE_REASON}"
+    if torch.cuda.get_device_capability(device)[0] < 8:
+        return False, \
+            "FA2 is only supported on devices with compute capability >= 8"
     return True, None
-
-
-def _is_fa3_supported() -> tuple[bool, str | None]:
+    
+def _is_fa3_supported(device = None) -> Tuple[bool, Optional[str]]:
     if not FA3_AVAILABLE:
-        return False, f"FA3 is unavailable due to: {FA3_UNAVAILABLE_REASON}"
-    from vllm.platforms import current_platform
-
-    if not current_platform.is_device_capability_family(90):
-        return False, "FA3 is only supported on devices with compute capability 9.x"
+        return False, f"FA3 is unavaible due to: {FA3_UNAVAILABLE_REASON}"
+    if torch.cuda.get_device_capability(device)[0] < 9 \
+        or torch.cuda.get_device_capability(device)[0] >= 10:
+        return False, \
+            "FA3 is only supported on devices with compute capability 9.0"
     return True, None
 
-
-def _is_fa4_supported() -> tuple[bool, str | None]:
+def _is_fa4_supported(device = None) -> Tuple[bool, Optional[str]]:
     if not FA4_AVAILABLE:
-        return False, f"FA4 is unavailable due to: {FA4_UNAVAILABLE_REASON}"
-    from vllm.platforms import current_platform
-
-    if not (
-        current_platform.is_device_capability_family(90)
-        or current_platform.is_device_capability_family(100)
-        or current_platform.is_device_capability_family(110)
-    ):
-        return (
-            False,
-            "FA4 is only supported on devices with compute capability 9.x, 10.x, or 11.x",
-        )
+        return False, f"FA4 is unavaible due to: {FA4_UNAVAILABLE_REASON}"
+    if torch.cuda.get_device_capability(device)[0] != 10:
+        return False, \
+            "FA4 is only supported on devices with compute capability == 10"
     return True, None
 
-
-def is_fa_version_supported(fa_version: int) -> bool:
+def is_fa_version_supported(fa_version: int, device = None) -> bool:
+    assert fa_version in [2, 3, 4], f"Unsupported FA version: {fa_version}"
     if fa_version == 2:
-        return _is_fa2_supported()[0]
+        return _is_fa2_supported(device)[0]
     elif fa_version == 3:
-        return _is_fa3_supported()[0]
+        return _is_fa3_supported(device)[0]
     elif fa_version == 4:
-        return _is_fa4_supported()[0]
-    else:
-        raise ValueError(f"Unsupported FA version: {fa_version}")
+        return _is_fa4_supported(device)[0]
 
-
-def fa_version_unsupported_reason(fa_version: int) -> str | None:
+def fa_version_unsupported_reason(fa_version: int, device = None) \
+    -> Optional[str]:
+    assert fa_version in [2, 3, 4], f"Unsupported FA version: {fa_version}"
     if fa_version == 2:
-        return _is_fa2_supported()[1]
+        return _is_fa2_supported(device)[1]
     elif fa_version == 3:
-        return _is_fa3_supported()[1]
+        return _is_fa3_supported(device)[1]
     elif fa_version == 4:
-        return _is_fa4_supported()[1]
-    else:
-        raise ValueError(f"Unsupported FA version: {fa_version}")
-
+        return _is_fa4_supported(device)[1]
 
 #
-#  For vLLM we only care about `flash_attn_varlen_func` and
+#  For vLLM we only care about `flash_attn_varlen_func` and 
 #   `flash_attn_with_kvcache` so we only maintain wrappers for these two.
 #
 
@@ -117,41 +90,29 @@ def fa_version_unsupported_reason(fa_version: int) -> str | None:
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
-
 # NOTE only used in FA3
 def get_scheduler_metadata(
-    batch_size,
-    max_seqlen_q,
-    max_seqlen_k,
-    num_heads_q,
-    num_heads_kv,
-    headdim,
+    batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim,
     cache_seqlens: torch.Tensor,
     qkv_dtype=torch.bfloat16,
     headdim_v=None,
-    cu_seqlens_q: torch.Tensor | None = None,
-    cu_seqlens_k_new: torch.Tensor | None = None,
-    cache_leftpad: torch.Tensor | None = None,
-    page_size: int | None = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
     max_seqlen_k_new=0,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     has_softcap=False,
-    num_splits=0,  # Can be tuned for speed
-    pack_gqa=None,  # Can be tuned for speed
-    sm_margin=0,  # Can be tuned if some SMs are used for communication
+    num_splits=0,    # Can be tuned for speed
+    pack_gqa=None,   # Can be tuned for speed
+    sm_margin=0,     # Can be tuned if some SMs are used for communication
 ):
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim
     scheduler_metadata = torch.ops._vllm_fa3_C.get_scheduler_metadata(
-        batch_size,
-        max_seqlen_q,
-        max_seqlen_k,
-        num_heads_q,
-        num_heads_kv,
-        headdim,
-        headdim_v,
+        batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
         qkv_dtype,
         cache_seqlens,
         cu_seqlens_q,
@@ -162,8 +123,7 @@ def get_scheduler_metadata(
         page_size,
         max_seqlen_k_new,
         causal,
-        window_size[0],
-        window_size[1],
+        window_size[0], window_size[1],
         has_softcap,
         num_splits,
         pack_gqa,
@@ -180,14 +140,14 @@ def flash_attn_varlen_func(
     max_seqlen_q,
     cu_seqlens_q,
     max_seqlen_k,
-    cu_seqlens_k=None,  # only used for non-paged prefill
+    cu_seqlens_k=None, # only used for non-paged prefill
     seqused_k=None,
     q_v=None,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size: list[int] | None = None,
-    softcap=0.0,  # 0.0 means deactivated
+    window_size: Optional[List[int]] = None,
+    softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -259,51 +219,42 @@ def flash_attn_varlen_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    assert cu_seqlens_k is not None or seqused_k is not None, (
+    assert cu_seqlens_k is not None or seqused_k is not None, \
         "cu_seqlens_k or seqused_k must be provided"
-    )
-    assert cu_seqlens_k is None or seqused_k is None, (
+    assert cu_seqlens_k is None or seqused_k is None, \
         "cu_seqlens_k and seqused_k cannot be provided at the same time"
-    )
-    assert block_table is None or seqused_k is not None, (
+    assert block_table is None or seqused_k is not None, \
         "seqused_k must be provided if block_table is provided"
-    )
-
+    
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     # custom op does not support non-tuple input
-    real_window_size: tuple[int, int]
+    real_window_size: Tuple[int, int]
     if window_size is None:
         real_window_size = (-1, -1)
     else:
         assert len(window_size) == 2
         real_window_size = (window_size[0], window_size[1])
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-
+    
     dummy_cu_seqlens_k = torch.empty_like(cu_seqlens_q)
-
+    
     if fa_version == 2:
-        if (
-            scheduler_metadata is not None
-            and q_descale is not None
-            and k_descale is not None
-            and v_descale is not None
-        ):
-            raise NotImplementedError(
-                "FA2 does not support scheduler_metadata, q_descale, "
-                "k_descale, v_descale"
-            )
+        if scheduler_metadata is not None and q_descale is not None \
+            and k_descale is not None and v_descale is not None:
+                raise NotImplementedError(
+                    "FA2 does not support scheduler_metadata, q_descale, "
+                    "k_descale, v_descale"
+                )
         if s_aux is not None:
             raise NotImplementedError("FA2 does not support s_aux")
         if num_splits > 1:
             raise NotImplementedError("FA2 does not support num_splits > 1")
         out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
-            q,
-            k,
-            v,
+            q, k, v,
             out,
             cu_seqlens_q,
-            # cu_seqlens_k not used since we use seqused_k, but flash_api.cpp
+            # cu_seqlens_k not used since we use seqused_k, but flash_api.cpp 
             # still wants it so we pass all zeros
             dummy_cu_seqlens_k if cu_seqlens_k is None else cu_seqlens_k,
             seqused_k,
@@ -326,74 +277,33 @@ def flash_attn_varlen_func(
     elif fa_version == 3:
         assert alibi_slopes is None, "Alibi is not supported in FA3"
         out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
-            q,
-            k,
-            v,
-            None,
-            None,  # k_new, v_new
+            q, k, v,
+            None, None,       # k_new, v_new
             q_v,
             out,
             cu_seqlens_q,
-            cu_seqlens_k,  # cu_seqlens_k
-            None,  # cu_seqlens_k_new
-            None,
-            seqused_k,  # seqused_q, seqused_k
-            max_seqlen_q,
-            max_seqlen_k,
+            cu_seqlens_k,     # cu_seqlens_k
+            None,             # cu_seqlens_k_new
+            None, seqused_k,  # seqused_q, seqused_k
+            max_seqlen_q, max_seqlen_k,
             block_table,
-            None,  # kv_batch_idx
-            None,  # leftpad_k
-            None,
-            None,
-            None,  # rotary_cos, rotary_sin, seqlens_rotary
-            q_descale,
-            k_descale,
-            v_descale,
+            None,             # kv_batch_idx
+            None,             # leftpad_k
+            None, None, None, # rotary_cos, rotary_sin, seqlens_rotary
+            q_descale, k_descale, v_descale,
             softmax_scale,
             causal,
-            real_window_size[0],
-            real_window_size[1],
+            real_window_size[0], real_window_size[1],
             softcap,
-            True,  # rotary_interleaved
+            True,             # rotary_interleaved
             scheduler_metadata,
             num_splits,
-            None,  # pack_gqa
-            0,  # sm_margin
-            s_aux,  # s_aux
+            None,             # pack_gqa
+            0,                # sm_margin
+            s_aux,            # s_aux
             cp_world_size,
             cp_rank,
             cp_tot_seqused_k,
-        )
-    elif fa_version == 4:
-        assert alibi_slopes is None, "Alibi is not supported in FA4"
-        # FA4 on SM90 doesn't support paged KV; SM100+ does
-        from vllm.platforms import current_platform
-
-        if block_table is not None and current_platform.is_device_capability_family(90):
-            raise NotImplementedError(
-                "FA4 with paged KV is not supported on SM90 (Hopper). "
-                "Use FA3 or upgrade to Blackwell (SM100+)."
-            )
-        from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
-
-        out, softmax_lse = _flash_attn_fwd(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            seqused_k=seqused_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            page_table=block_table,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            softcap=softcap,
-            window_size_left=real_window_size[0] if real_window_size[0] >= 0 else None,
-            window_size_right=real_window_size[1] if real_window_size[1] >= 0 else None,
-            num_splits=num_splits,
-            return_lse=return_softmax_lse,
-            out=out,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")
@@ -411,7 +321,7 @@ def sparse_attn_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    softcap=0.0,  # 0.0 means deactivated
+    softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -490,7 +400,7 @@ def sparse_attn_varlen_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    softcap=0.0,  # 0.0 means deactivated
+    softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -503,7 +413,7 @@ def sparse_attn_varlen_func(
     block_count and block_offset for slash sparsity patterns, and
     column_count and column_index for vertical sparsity patterns.
     For more details please refer to Appendix C.4.2 of paper https://arxiv.org/abs/2407.02490.
-
+    
     Arguments:
         q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
         k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
@@ -539,7 +449,7 @@ def sparse_attn_varlen_func(
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
-
+        
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd_sparse(
         q,

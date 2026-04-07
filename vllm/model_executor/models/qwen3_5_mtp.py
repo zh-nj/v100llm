@@ -3,6 +3,8 @@
 """Inference-only Qwen3_5 MTP model."""
 
 import typing
+import os
+import copy
 from collections.abc import Callable, Iterable
 
 import torch
@@ -66,6 +68,12 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.config = config
 
         self.vocab_size = config.vocab_size
+
+        if os.getenv("VLLM_DEBUG_MTP_LOAD") == "1":
+            logger.warning(
+                "Qwen3_5MultiTokenPredictor init quant_config=%s",
+                type(quant_config).__name__ if quant_config is not None else "None",
+            )
 
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
@@ -283,6 +291,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                             or name_mapped.endswith("_bias")
                         ) and name_mapped not in params_dict:
                             continue
+                        # Some checkpoints (e.g. MoE with dense early layer)
+                        # can include expert tensors that do not map to a
+                        # local parameter on this rank.
+                        if name_mapped not in params_dict:
+                            continue
                         param = params_dict[name_mapped]
                         weight_loader = param.weight_loader
                         success = weight_loader(
@@ -318,6 +331,27 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        if os.getenv("VLLM_DEBUG_MTP_LOAD") == "1":
+            logger.warning(
+                "Qwen3_5MultiTokenPredictor loaded %d tensors into %d params",
+                len(loaded_params),
+                len(params_dict),
+            )
+            if os.getenv("VLLM_DEBUG_MTP_LOAD_VERBOSE") == "1":
+                missing_params = sorted(set(params_dict.keys()) - loaded_params)
+                if missing_params:
+                    logger.warning(
+                        "Qwen3_5MultiTokenPredictor missing params (%d): %s",
+                        len(missing_params),
+                        ", ".join(missing_params),
+                    )
+                loaded_param_names = sorted(loaded_params)
+                if loaded_param_names:
+                    logger.warning(
+                        "Qwen3_5MultiTokenPredictor loaded params (%d): %s",
+                        len(loaded_param_names),
+                        ", ".join(loaded_param_names),
+                    )
         return loaded_params
 
 
@@ -339,8 +373,32 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
             "k_proj",
             "v_proj",
         ],
-        "gate_up_proj": ["gate_proj", "up_proj"],
+        "gate_up_proj": ["up_proj", "down_proj"],
     }
+
+    @staticmethod
+    def _mtp_quant_disabled_in_hf_config(*hf_configs: object) -> bool:
+        for cfg in hf_configs:
+            if cfg is None:
+                continue
+            quant_cfg = getattr(cfg, "quantization_config", None)
+            if quant_cfg is None:
+                continue
+
+            modules_to_not_convert = None
+            if isinstance(quant_cfg, dict):
+                modules_to_not_convert = quant_cfg.get("modules_to_not_convert")
+            else:
+                modules_to_not_convert = getattr(
+                    quant_cfg, "modules_to_not_convert", None
+                )
+
+            if modules_to_not_convert and any(
+                str(module).startswith("mtp") for module in modules_to_not_convert
+            ):
+                return True
+
+        return False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
@@ -353,11 +411,27 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
             )
 
         self.quant_config = vllm_config.quant_config
+        mtp_vllm_config = vllm_config
+        if self.quant_config is not None and self._mtp_quant_disabled_in_hf_config(
+            config,
+            vllm_config.model_config.hf_config,
+        ):
+            # Qwen3.5 AWQ checkpoints commonly keep the MTP branch in full
+            # precision (`modules_to_not_convert` includes "mtp"), so trying to
+            # instantiate quantized MTP experts would create qweight/qzeros params
+            # that do not exist in checkpoint tensors.
+            self.quant_config = None
+            mtp_vllm_config = copy.copy(vllm_config)
+            mtp_vllm_config.quant_config = None
+            logger.info(
+                "Qwen3_5MTP: disabling quantization for MTP branch based on "
+                "config.quantization_config.modules_to_not_convert."
+            )
 
         super().__init__()
         self.config = config
         self.model = Qwen3_5MultiTokenPredictor(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
+            vllm_config=mtp_vllm_config, prefix=maybe_prefix(prefix, "mtp")
         )
 
         if get_pp_group().is_last_rank:
@@ -380,11 +454,13 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
+        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         inputs_embeds = self._embed_text_input_ids(
             input_ids,
             self.model.embed_input_ids,
             is_multimodal=is_multimodal,
+            handle_oov_mm_token=handle_oov_mm_token,
         )
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
@@ -409,8 +485,14 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ):
+        spec_step_idx = int(kwargs.get("spec_step_idx", 0))
         hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx=spec_step_idx,
         )
         return hidden_states
 
@@ -420,6 +502,13 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names(weights):
@@ -434,7 +523,29 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
                 yield name, weight
 
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))
+        loaded = loader.load_weights(remap_weight_names(weights))
+        if os.getenv("VLLM_DEBUG_MTP_LOAD") == "1":
+            logger.warning(
+                "Qwen3_5MTP loaded %d tensors across module params",
+                len(loaded),
+            )
+            if os.getenv("VLLM_DEBUG_MTP_LOAD_VERBOSE") == "1":
+                params_dict = dict(self.named_parameters())
+                missing_params = sorted(set(params_dict.keys()) - loaded)
+                if missing_params:
+                    logger.warning(
+                        "Qwen3_5MTP missing params (%d): %s",
+                        len(missing_params),
+                        ", ".join(missing_params),
+                    )
+                loaded_param_names = sorted(loaded)
+                if loaded_param_names:
+                    logger.warning(
+                        "Qwen3_5MTP loaded params (%d): %s",
+                        len(loaded_param_names),
+                        ", ".join(loaded_param_names),
+                    )
+        return loaded
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):

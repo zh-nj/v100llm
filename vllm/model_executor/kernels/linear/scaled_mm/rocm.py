@@ -29,6 +29,7 @@ def rocm_per_tensor_float_w8a8_scaled_mm_impl(
         and B.shape[0] % 16 == 0  # M TODO: needed?
         and B.shape[1] % 16 == 0  # K
         and ((bias is None) or (bias.dtype == out_dtype))
+        and A.is_contiguous()
     ):
         output = ops.wvSplitKQ(
             B.t(),

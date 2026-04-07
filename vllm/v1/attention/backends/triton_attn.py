@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -41,6 +41,58 @@ logger = init_logger(__name__)
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+SM70_TARGET_DECODE_GRID_SIZE = 80
+SM70_MAX_NUM_PAR_SOFTMAX_SEGMENTS = 128
+
+
+def _get_fp8_kv_cache_torch_dtype(kv_cache_dtype: str) -> torch.dtype:
+    if kv_cache_dtype == "fp8_e5m2":
+        return torch.float8_e5m2
+    return current_platform.fp8_dtype()
+
+
+def _parse_positive_int_env(name: str) -> int | None:
+    value = os.getenv(name)
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning_once(
+            "Ignoring invalid %s=%r; expected a positive integer.",
+            name,
+            value,
+        )
+        return None
+    if parsed <= 0:
+        logger.warning_once(
+            "Ignoring invalid %s=%r; expected a positive integer.",
+            name,
+            value,
+        )
+        return None
+    return parsed
+
+
+def _is_sm70() -> bool:
+    capability = current_platform.get_device_capability()
+    return capability is not None and capability.major == 7
+
+
+def _get_default_num_par_softmax_segments(num_heads_kv: int) -> int:
+    if not _is_sm70():
+        return NUM_PAR_SOFTMAX_SEGMENTS
+
+    # For single-request decode, the 3D launch grid is roughly
+    # (1 q-block, num_heads_kv, num_segments). On SM70, low kv-head
+    # parallelism under-utilizes the 80 SMs unless we increase segments.
+    target_segments = next_power_of_2(
+        (SM70_TARGET_DECODE_GRID_SIZE + num_heads_kv - 1) // num_heads_kv
+    )
+    return max(
+        NUM_PAR_SOFTMAX_SEGMENTS,
+        min(SM70_MAX_NUM_PAR_SOFTMAX_SEGMENTS, target_segments),
+    )
 
 
 @dataclass
@@ -166,7 +218,31 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 key=lambda x: abs(x - self.seq_threshold_3D),
             )
 
-        self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+        seq_threshold_override = _parse_positive_int_env(
+            "VLLM_TRITON_ATTN_SEQ_THRESHOLD_3D"
+        )
+        if seq_threshold_override is not None:
+            self.seq_threshold_3D = seq_threshold_override
+
+        num_par_softmax_segments_override = _parse_positive_int_env(
+            "VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS"
+        )
+        if num_par_softmax_segments_override is not None:
+            self.num_par_softmax_segments = num_par_softmax_segments_override
+        else:
+            self.num_par_softmax_segments = _get_default_num_par_softmax_segments(
+                self.num_heads_kv
+            )
+
+        if _is_sm70() or seq_threshold_override is not None:
+            logger.info_once(
+                "TRITON_ATTN decode config: seq_threshold_3D=%d, "
+                "num_par_softmax_segments=%d, kv_heads_per_rank=%d",
+                self.seq_threshold_3D,
+                self.num_par_softmax_segments,
+                self.num_heads_kv,
+            )
+
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
             (
@@ -263,7 +339,6 @@ class TritonAttentionBackend(AttentionBackend):
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
-        "float16",
         "bfloat16",
         "fp8",
         "fp8_e4m3",
@@ -273,12 +348,6 @@ class TritonAttentionBackend(AttentionBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(16)]
-
-    @classmethod
-    def supports_block_size(cls, block_size: int | None) -> bool:
-        if block_size is None:
-            return True
-        return block_size % 16 == 0
 
     forward_includes_kv_cache_update: bool = False
 
@@ -396,7 +465,11 @@ class TritonAttentionImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
         self.attn_type = attn_type
-        self.fp8_dtype = current_platform.fp8_dtype()
+        self.fp8_dtype = (
+            _get_fp8_kv_cache_torch_dtype(kv_cache_dtype)
+            if kv_cache_dtype.startswith("fp8")
+            else None
+        )
 
         self.sinks = sinks
         if sinks is not None:
@@ -473,6 +546,7 @@ class TritonAttentionImpl(AttentionImpl):
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(1)
         if self.kv_cache_dtype.startswith("fp8"):
+            assert self.fp8_dtype is not None
             if key_cache.dtype != self.fp8_dtype:
                 key_cache = key_cache.view(self.fp8_dtype)
                 value_cache = value_cache.view(self.fp8_dtype)
@@ -587,59 +661,27 @@ class TritonAttentionImpl(AttentionImpl):
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(1)
 
-        # Reshape the input keys and values and store them in the cache.
-        if self.kv_cache_dtype.startswith("fp8"):
-            key_cache = key_cache.view(self.fp8_dtype)
-            value_cache = value_cache.view(self.fp8_dtype)
-            # triton kernel does not support uint8 kv_cache
-            #  (because some explicit casts (e.g. float8_e4m3fnuz)
-            #   are not supported)
-        triton_reshape_and_cache_flash(
-            key,
-            value,
-            key_cache,
-            value_cache,
-            slot_mapping,
-            self.kv_cache_dtype,
-            layer._k_scale,
-            layer._v_scale,
-        )
-
-    def fused_rope_kvcache_supported(self):
-        return rocm_aiter_ops.is_enabled()
-
-    def do_rope_and_kv_cache_update(
-        self,
-        layer: AttentionLayer,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        positions: torch.Tensor,
-        cos_sin_cache: torch.Tensor,
-        is_neox: bool,
-        kv_cache: torch.Tensor,
-        layer_slot_mapping: torch.Tensor,
-    ):
-        key_cache, value_cache = kv_cache.unbind(1)
-        flash_layout = True
-
-        is_fp8_kv_cache = self.kv_cache_dtype.startswith("fp8")
-        if is_fp8_kv_cache:
-            key_cache = key_cache.view(self.fp8_dtype)
-            value_cache = value_cache.view(self.fp8_dtype)
-
-        rocm_aiter_ops.triton_rope_and_cache(
-            query,
-            key,
-            value,
-            positions,
-            cos_sin_cache,
-            is_neox,
-            key_cache,
-            value_cache,
-            layer_slot_mapping,
-            layer._k_scale,
-            layer._v_scale,
-            flash_layout,
-            is_fp8_kv_cache,
-        )
+        if (
+            self.kv_sharing_target_layer_name is None
+            and key is not None
+            and value is not None
+        ):
+            # Reshape the input keys and values and store them in the cache.
+            # Skip this if sharing KV cache with an earlier attention layer.
+            if self.kv_cache_dtype.startswith("fp8"):
+                assert self.fp8_dtype is not None
+                key_cache = key_cache.view(self.fp8_dtype)
+                value_cache = value_cache.view(self.fp8_dtype)
+                # triton kernel does not support uint8 kv_cache
+                #  (because some explicit casts (e.g. float8_e4m3fnuz)
+                #   are not supported)
+            triton_reshape_and_cache_flash(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )

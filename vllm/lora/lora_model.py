@@ -91,6 +91,9 @@ class LoRAModel:
             # Skip modules based on model-defined prefixes (e.g., MTP layers)
             if skip_prefixes and cls._should_skip_module(tensor_name, skip_prefixes):
                 continue
+            # Skip modules based on model-defined prefixes (e.g., MTP layers)
+            if skip_prefixes and cls._should_skip_module(tensor_name, skip_prefixes):
+                continue
             module_name, is_lora_a = parse_fine_tuned_lora_name(
                 tensor_name, weights_mapper
             )

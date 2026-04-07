@@ -1,6 +1,6 @@
 # Upstream Sync Workflow
 
-## Baselines
+## Current Baselines
 
 - Root upstream baseline: `vLLM v0.19.0`
 - Vendored subtree baseline: `lmdeploy v0.12.1`
@@ -13,16 +13,22 @@
 - `vllm-upstream` -> `/mnt/data/apps/vllm`
 - `lmdeploy-upstream` -> `/mnt/data/apps/lmdeploy`
 
+## Replay Commits
+
+- `1cat(vllm): SM70/Qwen3.5/AWQ/runtime/build customizations`
+- `1cat(lmdeploy): turbomind SM70 kernel customizations`
+
 ## Future Upgrade Commands
 
 ```bash
 git fetch vllm-upstream --tags
 git subtree pull --prefix=lmdeploy /mnt/data/apps/lmdeploy v0.12.1 --squash
+git diff final/1cat-vllm^ final/1cat-vllm -- \
+  . ':(exclude)lmdeploy' | git apply --3way
 ```
 
-For root `vLLM` upgrades, import the new root snapshot and then replay the
-single `1cat(vllm)` commit with a
-`git diff phase1/1cat-vllm^ phase1/1cat-vllm | git apply --3way` style flow.
+Use the subtree command only for `lmdeploy/`. Use the root import plus replay
+flow only for `vLLM` upgrades.
 
 For `lmdeploy` upgrades, do not fetch its tags into the `1Cat-vLLM` repository,
 because `vLLM` and `lmdeploy` reuse tag names like `v0.10.0` and `v0.12.0`.

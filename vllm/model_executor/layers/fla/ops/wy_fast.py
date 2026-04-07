@@ -9,6 +9,8 @@
 
 # ruff: noqa: E501
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -16,13 +18,49 @@ from vllm.triton_utils import tl, triton
 from .index import prepare_chunk_indices
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
-    configs=[
+from .utils import is_sm70
+
+
+def _parse_sm70_int_list(env_name: str, default_vals: list[int]) -> list[int]:
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default_vals
+    out: list[int] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            val = int(tok)
+        except ValueError:
+            continue
+        if val > 0:
+            out.append(val)
+    return out or default_vals
+
+
+# SM70: default to a single safe config to avoid Triton autotune OOM on V100,
+# while keeping env overrides for follow-up tuning.
+_sm70_wy_fast_warps = _parse_sm70_int_list("VLLM_SM70_GDN_WY_FAST_WARPS", [4])
+_sm70_wy_fast_stages = _parse_sm70_int_list("VLLM_SM70_GDN_WY_FAST_STAGES", [2])
+_wy_fast_configs = (
+    [
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in _sm70_wy_fast_warps
+        for num_stages in _sm70_wy_fast_stages
+    ]
+    if is_sm70
+    else [
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
-    ],
+    ]
+)
+
+
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.autotune(
+    configs=_wy_fast_configs,
     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])

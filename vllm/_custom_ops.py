@@ -29,81 +29,6 @@ else:
         from torch.library import impl_abstract as register_fake
 
 
-# scaled_fp4_quant functional + out variant for torch.compile buffer management
-
-
-def create_fp4_scale_tensor(
-    m: int,
-    n: int,
-    device: torch.device,
-    is_sf_swizzled_layout: bool,
-) -> torch.Tensor:
-    """
-    Allocate the output scale tensor for scaled_fp4_quant.
-
-    When is_sf_swizzled_layout=True, we use rounded values to store the
-    swizzled scales. Due to the requirement of the Tensor Core, the minimum
-    tile is 128x4 for the scales. So, we first pad the scales to multiples
-    of 128 (rows) and 4 (cols). Then, the scales (in float8_e4m3fn) are
-    packed into an int32 for every 4 values. More:
-    https://docs.nvidia.com/cuda/parallel-thread-execution/
-    #tcgen05-mma-scale-factor-b-layout-4x
-    """
-    from vllm.utils.math_utils import round_up
-
-    block_size = 16
-    if is_sf_swizzled_layout:
-        rounded_m = round_up(m, 128)
-        scale_n = n // block_size
-        rounded_n = round_up(scale_n, 4)
-        return torch.empty(
-            (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
-        )
-    else:
-        return torch.empty((m, n // block_size), device=device, dtype=torch.uint8)
-
-
-def create_fp4_output_tensors(
-    m: int,
-    n: int,
-    device: torch.device,
-    is_sf_swizzled_layout: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Allocate both output tensors for scaled_fp4_quant:
-    (quantized_output, output_scale).
-
-    Must match the C++ scaled_fp4_quant_func allocation exactly.
-    """
-    output = torch.empty((m, n // 2), device=device, dtype=torch.uint8)
-    output_scale = create_fp4_scale_tensor(m, n, device, is_sf_swizzled_layout)
-    return output, output_scale
-
-
-if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "scaled_fp4_quant"):
-
-    @register_fake("_C::scaled_fp4_quant")
-    def _scaled_fp4_quant_fake(
-        input: torch.Tensor,
-        input_scale: torch.Tensor,
-        is_sf_swizzled_layout: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        n = input.shape[-1]
-        m = input.numel() // n
-        return create_fp4_output_tensors(m, n, input.device, is_sf_swizzled_layout)
-
-    @register_fake("_C::scaled_fp4_quant.out")
-    def _scaled_fp4_quant_out_fake(
-        input: torch.Tensor,
-        input_scale: torch.Tensor,
-        is_sf_swizzled_layout: bool,
-        *,
-        output: torch.Tensor,
-        output_scale: torch.Tensor,
-    ) -> None:
-        return None
-
-
 # page attention ops
 def paged_attention_v1(
     out: torch.Tensor,
@@ -253,7 +178,9 @@ def mla_decode_kvcache_cpu(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
 ) -> None:
-    torch.ops._C.mla_decode_kvcache(out, query, kv_cache, scale, block_tables, seq_lens)
+    torch.ops._C_cpu.mla_decode_kvcache(
+        out, query, kv_cache, scale, block_tables, seq_lens
+    )
 
 
 # merge attn states ops
@@ -502,7 +429,7 @@ def rms_norm_dynamic_per_token_quant(
     scale_ub: torch.Tensor | None = None,
     residual: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    output = torch.empty(input.shape, dtype=quant_dtype, device=input.device)
+    output = torch.empty_like(input, dtype=quant_dtype)
     scales = torch.empty(
         (input.numel() // input.shape[-1], 1), device=input.device, dtype=torch.float32
     )
@@ -523,40 +450,21 @@ def rms_norm_per_block_quant(
     scale_ub: torch.Tensor | None = None,
     residual: torch.Tensor | None = None,
     is_scale_transposed: bool = False,
-    tma_alignment: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert len(group_size) == 2
-    output = torch.empty(input.shape, dtype=quant_dtype, device=input.device)
+    output = torch.empty_like(input, dtype=quant_dtype)
     if is_scale_transposed:
-        if tma_alignment == 0:
-            scales = torch.empty(
-                (input.shape[-1] // group_size[1], input.numel() // input.shape[-1]),
-                device=input.device,
-                dtype=torch.float32,
-            ).transpose(0, 1)
-        else:
-            m = input.shape[-2]
-            sf_k = input.shape[-1] // group_size[1]
-            tma_aligned_m = (m + tma_alignment - 1) // tma_alignment * tma_alignment
-            shape = input.shape[:-2] + (m, sf_k)
-            stride = (
-                (1, tma_aligned_m)
-                if input.dim() == 2
-                else (tma_aligned_m * sf_k, 1, tma_aligned_m)
-            )
-            scales = torch.empty_strided(
-                shape, stride, device=input.device, dtype=torch.float32
-            )
+        scales = torch.empty(
+            (input.shape[-1] // group_size[1], input.numel() // input.shape[-1]),
+            device=input.device,
+            dtype=torch.float32,
+        ).transpose(0, 1)
     else:
         scales = torch.empty(
             (input.numel() // input.shape[-1], input.shape[-1] // group_size[1]),
             device=input.device,
             dtype=torch.float32,
         )
-
-    assert tma_alignment in [0, 4], "Expected TMA alignment 0 or 4, but got " + str(
-        tma_alignment
-    )
 
     torch.ops._C.rms_norm_per_block_quant(
         output,
@@ -640,6 +548,417 @@ if hasattr(torch.ops._C, "awq_gemm"):
         ).sum(0)
 
 
+def awq_sm70_prepare(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int,
+    interleave_gated_silu: bool = False,
+) -> list[torch.Tensor]:
+    return torch.ops._C.awq_sm70_prepare(
+        qweight, scales, qzeros, group_size, interleave_gated_silu
+    )
+
+
+if hasattr(torch.ops._C, "awq_sm70_prepare"):
+
+    @register_fake("_C::awq_sm70_prepare")
+    def _awq_sm70_prepare_fake(
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        qzeros: torch.Tensor,
+        group_size: int,
+        interleave_gated_silu: bool,
+    ) -> list[torch.Tensor]:
+        n = qweight.size(1) * 8
+        num_groups = scales.size(0)
+        tm_weight = torch.empty_like(qweight)  # int32
+        tm_scales = torch.empty(
+            (num_groups, n),
+            dtype=torch.int32,
+            device=qweight.device,
+        )
+        meta = torch.empty((2,), dtype=torch.int64)
+        return [tm_weight, tm_scales, meta]
+
+
+def sm70_f16_prepare(weight: torch.Tensor) -> list[torch.Tensor]:
+    return torch.ops._C.sm70_f16_prepare(weight)
+
+
+if hasattr(torch.ops._C, "sm70_f16_prepare"):
+
+    @register_fake("_C::sm70_f16_prepare")
+    def _sm70_f16_prepare_fake(weight: torch.Tensor) -> list[torch.Tensor]:
+        meta = torch.empty((1,), dtype=torch.int64)
+        return [torch.empty_like(weight), meta]
+
+
+def awq_gemm_sm70(
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+) -> torch.Tensor:
+    return torch.ops._C.awq_gemm_sm70(
+        input, qweight, scales, group_size, k_ld, q_ld
+    )
+
+
+def awq_gemm_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    gated_silu: bool = False,
+) -> None:
+    torch.ops._C.awq_gemm_sm70_out(
+        out, input, qweight, scales, group_size, k_ld, q_ld, gated_silu
+    )
+
+
+def sm70_f16_gemm(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.ops._C.sm70_f16_gemm(input, weight)
+
+
+def sm70_f16_gemm_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    k_ld: int,
+    gated_silu: bool = False,
+) -> None:
+    torch.ops._C.sm70_f16_gemm_out(out, input, weight, k_ld, gated_silu)
+
+
+def sm70_f16_gate_mul_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> None:
+    torch.ops._C.sm70_f16_gate_mul_out(out, input, gate_weight)
+
+
+def sm70_gemm_import_cache(device_hint: torch.Tensor, path: str) -> int:
+    return torch.ops._C.sm70_gemm_import_cache(device_hint, path)
+
+
+def sm70_gemm_export_cache(device_hint: torch.Tensor, path: str) -> int:
+    return torch.ops._C.sm70_gemm_export_cache(device_hint, path)
+
+
+if hasattr(torch.ops._C, "awq_gemm_sm70"):
+
+    @register_fake("_C::awq_gemm_sm70")
+    def _awq_gemm_sm70_fake(
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+    ) -> torch.Tensor:
+        num_in_feats = input.size(0)
+        return torch.empty(
+            (num_in_feats, qweight.size(1) * 8),
+            dtype=input.dtype,
+            device=input.device,
+        )
+
+
+if hasattr(torch.ops._C, "sm70_f16_gemm"):
+
+    @register_fake("_C::sm70_f16_gemm")
+    def _sm70_f16_gemm_fake(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        num_in_feats = input.size(0)
+        out_dim = weight.size(0)
+        return torch.empty(
+            (num_in_feats, out_dim),
+            dtype=input.dtype,
+            device=input.device,
+        )
+
+
+if hasattr(torch.ops._C, "awq_gemm_sm70_out"):
+
+    @register_fake("_C::awq_gemm_sm70_out")
+    def _awq_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "sm70_f16_gemm_out"):
+
+    @register_fake("_C::sm70_f16_gemm_out")
+    def _sm70_f16_gemm_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        k_ld: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "sm70_f16_gate_mul_out"):
+
+    @register_fake("_C::sm70_f16_gate_mul_out")
+    def _sm70_f16_gate_mul_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        gate_weight: torch.Tensor,
+    ) -> None:
+        return None
+
+
+def awq_moe_build_strided_ptrs(
+    tm_weights: torch.Tensor,
+    tm_scales: torch.Tensor,
+    k_ld: int,
+    q_ld: int,
+    num_experts: int,
+) -> list[torch.Tensor]:
+    return torch.ops._C.awq_moe_build_strided_ptrs(
+        tm_weights, tm_scales, k_ld, q_ld, num_experts
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_build_strided_ptrs"):
+
+    @register_fake("_C::awq_moe_build_strided_ptrs")
+    def _awq_moe_build_strided_ptrs_fake(
+        tm_weights: torch.Tensor,
+        tm_scales: torch.Tensor,
+        k_ld: int,
+        q_ld: int,
+        num_experts: int,
+    ) -> list[torch.Tensor]:
+        buf = num_experts * 16
+        opts = dict(dtype=torch.uint8, device=tm_weights.device)
+        return [torch.empty(buf, **opts), torch.empty(buf, **opts)]
+
+
+def awq_moe_single_token_compact_prepare(
+    topk_ids: torch.Tensor,
+    src_w13_ptrs_w_rows: torch.Tensor,
+    src_w13_ptrs_s_rows: torch.Tensor,
+    src_w2_ptrs_w_rows: torch.Tensor,
+    src_w2_ptrs_s_rows: torch.Tensor,
+    dst_w13_ptrs_w_rows: torch.Tensor,
+    dst_w13_ptrs_s_rows: torch.Tensor,
+    dst_w2_ptrs_w_rows: torch.Tensor,
+    dst_w2_ptrs_s_rows: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+) -> None:
+    torch.ops._C.awq_moe_single_token_compact_prepare(
+        topk_ids,
+        src_w13_ptrs_w_rows,
+        src_w13_ptrs_s_rows,
+        src_w2_ptrs_w_rows,
+        src_w2_ptrs_s_rows,
+        dst_w13_ptrs_w_rows,
+        dst_w13_ptrs_s_rows,
+        dst_w2_ptrs_w_rows,
+        dst_w2_ptrs_s_rows,
+        inv_permuted_idx,
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_single_token_compact_prepare"):
+
+    @register_fake("_C::awq_moe_single_token_compact_prepare")
+    def _awq_moe_single_token_compact_prepare_fake(
+        topk_ids: torch.Tensor,
+        src_w13_ptrs_w_rows: torch.Tensor,
+        src_w13_ptrs_s_rows: torch.Tensor,
+        src_w2_ptrs_w_rows: torch.Tensor,
+        src_w2_ptrs_s_rows: torch.Tensor,
+        dst_w13_ptrs_w_rows: torch.Tensor,
+        dst_w13_ptrs_s_rows: torch.Tensor,
+        dst_w2_ptrs_w_rows: torch.Tensor,
+        dst_w2_ptrs_s_rows: torch.Tensor,
+        inv_permuted_idx: torch.Tensor,
+    ) -> None:
+        return None
+
+
+def awq_moe_single_token_sm70_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    src_w13_ptrs_w_rows: torch.Tensor,
+    src_w13_ptrs_s_rows: torch.Tensor,
+    src_w2_ptrs_w_rows: torch.Tensor,
+    src_w2_ptrs_s_rows: torch.Tensor,
+    compact_input: torch.Tensor,
+    intermediate: torch.Tensor,
+    sorted_output: torch.Tensor,
+    dst_w13_ptrs_w_rows: torch.Tensor,
+    dst_w13_ptrs_s_rows: torch.Tensor,
+    dst_w2_ptrs_w_rows: torch.Tensor,
+    dst_w2_ptrs_s_rows: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+    w13_k: int,
+    w13_n: int,
+    w2_k: int,
+    w2_n: int,
+    group_size: int,
+    hidden_logical_size: int,
+) -> None:
+    torch.ops._C.awq_moe_single_token_sm70_out(
+        out,
+        x,
+        topk_weights,
+        topk_ids,
+        src_w13_ptrs_w_rows,
+        src_w13_ptrs_s_rows,
+        src_w2_ptrs_w_rows,
+        src_w2_ptrs_s_rows,
+        compact_input,
+        intermediate,
+        sorted_output,
+        dst_w13_ptrs_w_rows,
+        dst_w13_ptrs_s_rows,
+        dst_w2_ptrs_w_rows,
+        dst_w2_ptrs_s_rows,
+        expert_offsets,
+        inv_permuted_idx,
+        w13_k,
+        w13_n,
+        w2_k,
+        w2_n,
+        group_size,
+        hidden_logical_size,
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_single_token_sm70_out"):
+
+    @register_fake("_C::awq_moe_single_token_sm70_out")
+    def _awq_moe_single_token_sm70_out_fake(
+        out: torch.Tensor,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        src_w13_ptrs_w_rows: torch.Tensor,
+        src_w13_ptrs_s_rows: torch.Tensor,
+        src_w2_ptrs_w_rows: torch.Tensor,
+        src_w2_ptrs_s_rows: torch.Tensor,
+        compact_input: torch.Tensor,
+        intermediate: torch.Tensor,
+        sorted_output: torch.Tensor,
+        dst_w13_ptrs_w_rows: torch.Tensor,
+        dst_w13_ptrs_s_rows: torch.Tensor,
+        dst_w2_ptrs_w_rows: torch.Tensor,
+        dst_w2_ptrs_s_rows: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        inv_permuted_idx: torch.Tensor,
+        w13_k: int,
+        w13_n: int,
+        w2_k: int,
+        w2_n: int,
+        group_size: int,
+        hidden_logical_size: int,
+    ) -> None:
+        return None
+
+
+def awq_moe_gemm_sm70(
+    sorted_input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    strided_ptrs_w: torch.Tensor,
+    strided_ptrs_s: torch.Tensor,
+    num_experts: int,
+    k: int,
+    n: int,
+    group_size: int,
+) -> torch.Tensor:
+    return torch.ops._C.awq_moe_gemm_sm70(
+        sorted_input, expert_offsets, strided_ptrs_w, strided_ptrs_s,
+        num_experts, k, n, group_size,
+    )
+
+
+def awq_moe_gemm_sm70_out(
+    out: torch.Tensor,
+    sorted_input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    strided_ptrs_w: torch.Tensor,
+    strided_ptrs_s: torch.Tensor,
+    num_experts: int,
+    k: int,
+    n: int,
+    group_size: int,
+    gated_silu: bool = False,
+) -> None:
+    torch.ops._C.awq_moe_gemm_sm70_out(
+        out,
+        sorted_input,
+        expert_offsets,
+        strided_ptrs_w,
+        strided_ptrs_s,
+        num_experts,
+        k,
+        n,
+        group_size,
+        gated_silu,
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_gemm_sm70"):
+
+    @register_fake("_C::awq_moe_gemm_sm70")
+    def _awq_moe_gemm_sm70_fake(
+        sorted_input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        strided_ptrs_w: torch.Tensor,
+        strided_ptrs_s: torch.Tensor,
+        num_experts: int,
+        k: int,
+        n: int,
+        group_size: int,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (sorted_input.size(0), n),
+            dtype=sorted_input.dtype,
+            device=sorted_input.device,
+        )
+
+
+if hasattr(torch.ops._C, "awq_moe_gemm_sm70_out"):
+
+    @register_fake("_C::awq_moe_gemm_sm70_out")
+    def _awq_moe_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        sorted_input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        strided_ptrs_w: torch.Tensor,
+        strided_ptrs_s: torch.Tensor,
+        num_experts: int,
+        k: int,
+        n: int,
+        group_size: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
 # gptq
 def gptq_gemm(
     a: torch.Tensor,
@@ -876,6 +1195,10 @@ def cutlass_scaled_mm_azp(
     return out.view(*target_shape)
 
 
+def cutlass_sparse_scaled_mm_supported(cuda_device_capability: int) -> bool:
+    return torch.ops._C.cutlass_sparse_scaled_mm_supported(cuda_device_capability)
+
+
 def cutlass_group_gemm_supported(cuda_device_capability: int) -> bool:
     if cuda_device_capability < 90 or cuda_device_capability >= 110:
         return False
@@ -884,6 +1207,94 @@ def cutlass_group_gemm_supported(cuda_device_capability: int) -> bool:
     except AttributeError:
         # Return False on non-CUDA platforms where it is not available
         return False
+
+
+def cutlass_sparse_compress(a: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compresses a sparse matrix for use with Cutlass sparse operations.
+
+    This function takes a dense tensor and compresses it into two components:
+    non-zero elements and metadata. The compressed representation is compatible
+    with Cutlass sparse kernels.
+
+    Args:
+        a (torch.Tensor):
+            The input tensor to be compressed. Must have one of the following data types:
+            - `torch.int8`
+            - `torch.float8_e4m3fn`
+            - `torch.bfloat16`
+            - `torch.float16`
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            A tuple containing:
+            - `a_nzs` (torch.Tensor): A tensor containing non-zero elements of `a`.
+            - `a_meta` (torch.Tensor): A tensor containing metadata for the sparse representation.
+
+    Raises:
+        ValueError: If the compression operation fails.
+
+    Notes:
+        - The `a_meta` tensor has a data type of `torch.uint8`.
+        - Each metadata element encodes the sparsity of 4 non-zero elements (i.e., `elemsPerMetaElem = 4`).
+        - The shape of `a_nzs` is `(m, k // 2)`, where `m` and `k` are the dimensions of the input tensor.
+        - The shape of `a_meta` is `(m, k // 2 // elemsPerMetaElem)`.
+    """
+    assert a.dtype in [torch.int8, torch.float8_e4m3fn, torch.bfloat16, torch.float16]
+    assert a.is_contiguous()
+
+    # a_meta.dtype: torch.uint8 so elemsPerMetaElem = 8b / 2b_per_nz = 4
+    elemsPerMetaElem = 4
+    assert a.shape[1] % (2 * elemsPerMetaElem) == 0
+
+    return torch.ops._C.cutlass_sparse_compress(a)
+
+
+def cutlass_scaled_sparse_mm(
+    a: torch.Tensor,
+    bt_nzs: torch.Tensor,
+    bt_meta: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Performs a scaled sparse matrix multiplication using Cutlass.
+
+    Steps:
+    1. Create a dense matrix `a` of shape (m, k) on the CUDA device:
+    `a = torch.randn((m, k), device='cuda')`.
+
+    2. Create a dense matrix `b` of shape (k, n) on the CUDA device:
+    `b = torch.randn((k, n), device='cuda')`.
+
+    3. Prune matrix `b` to 2:4 sparsity along the specified dimension:
+    `b = prune_to_2_4(b, dim=0)`.
+
+    4. Compress the transposed sparse matrix `b.t()`:
+    `bt_nzs, bt_meta = cutlass_sparse_compress(b.t())`.
+
+    5. Perform sparse matrix multiplication using the compressed matrix,
+    applying scaling factors for `a` and `b`, and the output data type:
+    `out = cutlass_scaled_sparse_mm(a, bt_nzs, bt_meta, scale_a, scale_b, out_dtype)`.
+
+    Returns:
+    - The result of the scaled sparse matrix multiplication.
+    """
+    assert bt_nzs.shape[0] % 16 == 0 and bt_nzs.shape[1] % 16 == 0
+    assert out_dtype is torch.bfloat16 or out_dtype is torch.float16
+    assert bias is None or bias.shape[0] == bt_nzs.shape[0] and bias.dtype == out_dtype
+
+    m = a.shape[0]
+    n = bt_nzs.shape[0]
+    out = torch.empty((m, n), dtype=out_dtype, device=a.device)
+
+    torch.ops._C.cutlass_scaled_sparse_mm(
+        out, a, bt_nzs, bt_meta, scale_a, scale_b, bias
+    )
+
+    return out
 
 
 def get_cutlass_moe_mm_data(
@@ -897,7 +1308,6 @@ def get_cutlass_moe_mm_data(
     n: int,
     k: int,
     blockscale_offsets: torch.Tensor | None = None,
-    is_gated: bool = True,
 ):
     """
     Prepare data necessary to perform CUTLASS grouped matrix multiplications
@@ -921,8 +1331,6 @@ def get_cutlass_moe_mm_data(
                           its computation. The number of block scale rows
                           computed with expert E is blockscale_offsets[E + 1] -
                           blockscale_offsets[E]
-    - is_gated: Whether the activation is gated (gate + up). When True, the
-                first GEMM N dimension is 2*n; when False, it is n.
     """
     return torch.ops._C.get_cutlass_moe_mm_data(
         topk_ids,
@@ -935,7 +1343,6 @@ def get_cutlass_moe_mm_data(
         n,
         k,
         blockscale_offsets,
-        is_gated,
     )
 
 
@@ -973,7 +1380,7 @@ def shuffle_rows(input_tensor: torch.Tensor, dst2src_map: torch.Tensor):
     return output_tensor
 
 
-def get_cutlass_batched_moe_mm_data(
+def get_cutlass_pplx_moe_mm_data(
     expert_offsets: torch.Tensor,
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
@@ -996,7 +1403,7 @@ def get_cutlass_batched_moe_mm_data(
                                       multiplication in two grouped MMs used in
                                       the fused MoE operation.
     """
-    return torch.ops._C.get_cutlass_batched_moe_mm_data(
+    return torch.ops._C.get_cutlass_pplx_moe_mm_data(
         expert_offsets,
         problem_sizes1,
         problem_sizes2,
@@ -1087,76 +1494,6 @@ def cutlass_fp4_moe_mm(
         expert_offsets,
         sf_offsets,
     )
-
-
-def mxfp8_experts_quant(
-    input_tensor: torch.Tensor,
-    problem_sizes: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    blockscale_offsets: torch.Tensor,
-    quant_output: torch.Tensor,
-    scale_factor: torch.Tensor,
-) -> None:
-    torch.ops._C.mxfp8_experts_quant(
-        input_tensor,
-        problem_sizes,
-        expert_offsets,
-        blockscale_offsets,
-        quant_output,
-        scale_factor,
-    )
-
-
-def cutlass_mxfp8_grouped_mm(
-    a_tensors: torch.Tensor,
-    b_tensors: torch.Tensor,
-    a_scales: torch.Tensor,
-    b_scales: torch.Tensor,
-    out_tensors: torch.Tensor,
-    problem_sizes: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    blockscale_offsets: torch.Tensor,
-) -> None:
-    torch.ops._C.cutlass_mxfp8_grouped_mm(
-        a_tensors,
-        b_tensors,
-        a_scales,
-        b_scales,
-        out_tensors,
-        problem_sizes,
-        expert_offsets,
-        blockscale_offsets,
-    )
-
-
-if hasattr(torch.ops._C, "mxfp8_experts_quant"):
-
-    @register_fake("_C::mxfp8_experts_quant")
-    def _mxfp8_experts_quant_fake(
-        input_tensor: torch.Tensor,
-        problem_sizes: torch.Tensor,
-        expert_offsets: torch.Tensor,
-        blockscale_offsets: torch.Tensor,
-        quant_output: torch.Tensor,
-        scale_factor: torch.Tensor,
-    ) -> None:
-        return None
-
-
-if hasattr(torch.ops._C, "cutlass_mxfp8_grouped_mm"):
-
-    @register_fake("_C::cutlass_mxfp8_grouped_mm")
-    def _cutlass_mxfp8_grouped_mm_fake(
-        a_tensors: torch.Tensor,
-        b_tensors: torch.Tensor,
-        a_scales: torch.Tensor,
-        b_scales: torch.Tensor,
-        out_tensors: torch.Tensor,
-        problem_sizes: torch.Tensor,
-        expert_offsets: torch.Tensor,
-        blockscale_offsets: torch.Tensor,
-    ) -> None:
-        return None
 
 
 # gptq_marlin
@@ -1631,6 +1968,7 @@ def scaled_fp4_quant(
     input = input.reshape(other_dims, input.shape[-1])
     m, n = input.shape
     block_size = 16
+    device = input.device
 
     assert n % block_size == 0, f"last dim has to be multiple of 16, but got {n}."
     assert input.dtype in (torch.float16, torch.bfloat16), (
@@ -1644,16 +1982,26 @@ def scaled_fp4_quant(
             input, input_global_scale
         )
     else:
-        # Pre-allocate and call .out variant (same behavior as old in-place API)
-        output, output_scale = create_fp4_output_tensors(
-            m, n, input.device, is_sf_swizzled_layout
-        )
-        torch.ops._C.scaled_fp4_quant.out(
-            input,
-            input_global_scale,
-            is_sf_swizzled_layout,
-            output=output,
-            output_scale=output_scale,
+        # Two fp4 values will be packed into an uint8.
+        output = torch.empty((m, n // 2), device=device, dtype=torch.uint8)
+        if is_sf_swizzled_layout:
+            # We use the rounded values to store the swizzled values. Due to the
+            # requirement of the Tensor Core, the minimum tile is 128x4 for the scales.
+            # So, we first pad the scales to multiples of 128 and 4. Then, the scales
+            # (in float8_e4m3fn) are packed into an int32 for every 4 values. More:
+            # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-b-layout-4x
+            round_up = lambda x, y: (x + y - 1) // y * y
+            rounded_m = round_up(m, 128)
+            scale_n = n // block_size
+            rounded_n = round_up(scale_n, 4)
+            output_scale = torch.empty(
+                (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
+            )
+        else:
+            output_scale = torch.empty((m, n // 16), device=device, dtype=torch.uint8)
+
+        torch.ops._C.scaled_fp4_quant(
+            output, input, output_scale, input_global_scale, is_sf_swizzled_layout
         )
 
     output_scale = output_scale.view(torch.float8_e4m3fn)
@@ -2067,8 +2415,6 @@ def selective_scan_fwd(
     block_idx_first_scheduled_token: torch.Tensor | None = None,
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
-    cu_chunk_seqlen: torch.Tensor | None = None,
-    last_chunk_indices: torch.Tensor | None = None,
 ):
     torch.ops._C.selective_scan_fwd(
         u,
@@ -2089,8 +2435,6 @@ def selective_scan_fwd(
         block_idx_first_scheduled_token,
         block_idx_last_scheduled_token,
         initial_state_idx,
-        cu_chunk_seqlen,
-        last_chunk_indices,
     )
 
 
@@ -2236,51 +2580,6 @@ def moe_wna16_gemm(
         BLOCK_SIZE_K,
         bit,
     )
-
-
-def router_gemm_bf16_fp32(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """bf16 x bf16 -> fp32 GEMM via cuBLAS. weight shape: (N, K)."""
-    return torch.ops._moe_C.router_gemm_bf16_fp32(input, weight)
-
-
-if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "router_gemm_bf16_fp32"):
-
-    @register_fake("_moe_C::router_gemm_bf16_fp32")
-    def router_gemm_bf16_fp32_fake(
-        input: torch.Tensor,
-        weight: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.empty(
-            input.shape[0], weight.shape[0], dtype=torch.float32, device=input.device
-        )
-
-
-def dsv3_router_gemm(
-    hidden_states: torch.Tensor,
-    router_weight: torch.Tensor,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    output = torch.empty(
-        hidden_states.shape[0],
-        router_weight.shape[0],
-        device=hidden_states.device,
-        dtype=output_dtype,
-    )
-    torch.ops._moe_C.dsv3_router_gemm(output, hidden_states, router_weight)
-    return output
-
-
-def gpt_oss_router_gemm(
-    hidden_states: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
-) -> torch.Tensor:
-    output = torch.empty(
-        hidden_states.shape[0],
-        weight.shape[0],
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    torch.ops._moe_C.gpt_oss_router_gemm(output, hidden_states, weight, bias)
-    return output
 
 
 def topk_softmax(
@@ -2661,21 +2960,6 @@ def cp_gather_and_upconvert_fp8_kv_cache(
     )
 
 
-def concat_mla_q(
-    ql_nope: torch.Tensor,
-    q_pe: torch.Tensor,
-    q_out: torch.Tensor,
-) -> None:
-    """Concatenate query nope and rope for MLA/DSA attention.
-
-    Args:
-        ql_nope: Query nope component [num_tokens, num_heads, nope_dim]
-        q_pe: Query rope component [num_tokens, num_heads, rope_dim]
-        q_out: Output tensor [num_tokens, num_heads, nope_dim + rope_dim]
-    """
-    torch.ops._C_cache_ops.concat_mla_q(ql_nope, q_pe, q_out)
-
-
 def indexer_k_quant_and_cache(
     k: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -2897,24 +3181,6 @@ def sm100_cutlass_mla_get_workspace_size(
     )
 
 
-def dsv3_fused_a_gemm(
-    output: torch.Tensor,
-    mat_a: torch.Tensor,
-    mat_b: torch.Tensor,
-) -> None:
-    """DeepSeek V3 fused A GEMM (SM 9.0+, bf16 only, 1-16 tokens).
-
-    Computes output = mat_a @ mat_b.T where:
-      mat_a: [num_tokens, 7168] row-major bf16 (hidden states)
-      mat_b: [7168, 2112] column-major bf16 (weight transposed)
-      output: [num_tokens, 2112] row-major bf16
-
-    Optimized for the DeepSeek V2/V3 QKV A-projection at small batch sizes.
-    Requires SM 9.0+ (Hopper).
-    """
-    torch.ops._C.dsv3_fused_a_gemm(output, mat_a, mat_b)
-
-
 if hasattr(torch.ops._C, "weight_packed_linear"):
 
     @register_fake("_C::weight_packed_linear")
@@ -3110,7 +3376,7 @@ def cpu_attn_get_scheduler_metadata(
     isa: str,
     enable_kv_split: bool,
 ) -> torch.Tensor:
-    scheduler_metadata = torch.ops._C.get_scheduler_metadata(
+    sheduler_metadata = torch.ops._C.get_scheduler_metadata(
         num_reqs,
         num_heads,
         num_kv_heads,
@@ -3123,7 +3389,7 @@ def cpu_attn_get_scheduler_metadata(
         isa,
         enable_kv_split,
     )
-    return scheduler_metadata
+    return sheduler_metadata
 
 
 def cpu_attn_reshape_and_cache(
@@ -3223,7 +3489,6 @@ def cpu_fused_moe(
     topk_ids: torch.Tensor,
     act: str,
     isa: str,
-    skip_weighted: bool = False,
 ) -> torch.Tensor:
     output = torch.empty_like(input)
     torch.ops._C.cpu_fused_moe(
@@ -3235,7 +3500,6 @@ def cpu_fused_moe(
         w2_bias,
         topk_weights,
         topk_ids,
-        skip_weighted,
         act,
         isa,
     )
