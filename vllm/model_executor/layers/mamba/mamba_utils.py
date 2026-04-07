@@ -82,15 +82,9 @@ class MambaStateDtypeCalculator:
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType = "auto",
     ) -> tuple[torch.dtype, torch.dtype]:
-        conv_state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype,
-                                                    model_dtype)
-        if mamba_ssm_cache_dtype == "auto":
-            # GDN recurrent state needs float32 for numerical stability
-            # (accumulates over sequence, fp16 can overflow)
-            ssm_state_dtype = torch.float32
-        else:
-            ssm_state_dtype = STR_DTYPE_TO_TORCH_DTYPE[mamba_ssm_cache_dtype]
-        return (conv_state_dtype, ssm_state_dtype)
+        return cls._mamba_state_dtype(
+            model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
+        )
 
     @classmethod
     def kda_state_dtype(
@@ -139,6 +133,7 @@ class MambaStateShapeCalculator:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
+        num_spec: int = 0,
     ) -> tuple[tuple[int, int], tuple[int, int, int]]:
         # if n_groups is not divisible by world_size, need to extend the shards
         # to ensure all groups needed by a head is sharded along with it
@@ -147,7 +142,7 @@ class MambaStateShapeCalculator:
         conv_dim = intermediate_size + 2 * n_groups * state_size
 
         # contiguous along 'dim' axis
-        conv_state_shape = (conv_kernel - 1, divide(conv_dim, tp_world_size))
+        conv_state_shape = (conv_kernel - 1 + num_spec, divide(conv_dim, tp_world_size))
 
         # These are not TP-ed as they depend on A, dt_bias, D
         # - they are typically small
@@ -292,9 +287,6 @@ def get_temporal_copy_spec(
     return MambaCopySpec(
         start_addr=src_state.data_ptr(), num_elements=src_state.numel()
     )
-
-
-get_full_copy_spec = get_temporal_copy_spec
 
 
 class MambaStateCopyFuncCalculator:

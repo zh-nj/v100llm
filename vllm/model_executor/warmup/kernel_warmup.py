@@ -12,7 +12,6 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor.warmup.awq_sm70_warmup import sm70_awq_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
@@ -37,11 +36,13 @@ def kernel_warmup(worker: "Worker"):
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
 
-    # SM70 AWQ autotune warmup for V100 decode shapes.
-    sm70_awq_warmup(worker)
-
+    enable_flashinfer_autotune = (
+        worker.vllm_config.kernel_config.enable_flashinfer_autotune
+    )
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
-    if has_flashinfer() and current_platform.has_device_capability(90):
+    if enable_flashinfer_autotune is False:
+        logger.info("Skipping FlashInfer autotune because it is disabled.")
+    elif has_flashinfer() and current_platform.has_device_capability(90):
         flashinfer_autotune(worker.model_runner)
 
     # FlashInfer attention warmup
@@ -87,9 +88,14 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     Without autotuning, FlashInfer will rely on heuristics, which may
     be significantly slower.
     """
-    from vllm.utils.flashinfer import autotune
+    import vllm.utils.flashinfer as fi_utils
 
-    with torch.inference_mode(), autotune():
+    with torch.inference_mode(), fi_utils.autotune():
+        # Certain FlashInfer kernels (e.g. nvfp4 routed moe) are
+        # incompatible with autotuning. This state is used to skip
+        # those kernels during the autotuning process.
+        fi_utils._is_fi_autotuning = True
+
         # We skip EPLB here since we don't want to record dummy metrics
         # When autotuning with number of tokens m, flashinfer will autotune
         # operations for all number of tokens up to m.
@@ -99,3 +105,5 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             skip_eplb=True,
             is_profile=True,
         )
+
+        fi_utils._is_fi_autotuning = False

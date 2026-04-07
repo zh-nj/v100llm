@@ -3,7 +3,6 @@
 """Benchmark the latency of processing a single batch of requests."""
 
 import argparse
-import dataclasses
 import json
 import os
 import time
@@ -35,9 +34,6 @@ def add_cli_args(parser: argparse.ArgumentParser):
     parser.add_argument("--input-len", type=int, default=32)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--top-k", type=int, default=-1)
     parser.add_argument(
         "--n",
         type=int,
@@ -88,7 +84,7 @@ def main(args: argparse.Namespace):
 
     # NOTE(woosuk): If the request cannot be processed in a single batch,
     # the engine will automatically process the request in multiple batches.
-    llm = LLM(**dataclasses.asdict(engine_args))
+    llm = LLM.from_engine_args(engine_args)
     assert llm.llm_engine.model_config.max_model_len >= (
         args.input_len + args.output_len
     ), (
@@ -98,9 +94,8 @@ def main(args: argparse.Namespace):
 
     sampling_params = SamplingParams(
         n=args.n,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
+        temperature=1.0,
+        top_p=1.0,
         ignore_eos=True,
         max_tokens=args.output_len,
         detokenize=not args.disable_detokenize,

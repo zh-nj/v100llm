@@ -135,16 +135,9 @@ class ApplyRotaryEmb(CustomOp):
 
         self.apply_rotary_emb_flash_attn = None
         if find_spec("flash_attn") is not None:
-            try:
-                from flash_attn.ops.triton.rotary import apply_rotary
+            from flash_attn.ops.triton.rotary import apply_rotary
 
-                self.apply_rotary_emb_flash_attn = apply_rotary
-            except Exception as e:
-                logger.warning_once(
-                    "flash_attn rotary import failed; falling back to native "
-                    "rotary implementation. Error: %s",
-                    e,
-                )
+            self.apply_rotary_emb_flash_attn = apply_rotary
 
     @staticmethod
     def forward_static(
@@ -244,7 +237,7 @@ class ApplyRotaryEmb(CustomOp):
         Arguments of apply_rotary_emb() in vllm_flash_attn:
             x: [batch_size, seq_len, nheads, headdim]
             cos, sin: [seqlen_rotary, rotary_dim / 2]
-            interleaved: defalut as False (Neox-style).
+            interleaved: default as False (Neox-style).
             ...
         """
         interleaved = not self.is_neox_style
@@ -266,7 +259,7 @@ class ApplyRotaryEmb(CustomOp):
             Arguments of apply_rotary() in flash_attn:
                 x: [batch_size, seq_len, nheads, headdim]
                 cos, sin: [seqlen_rotary, rotary_dim / 2]
-                interleaved: defalut as False (Neox-style).
+                interleaved: default as False (Neox-style).
                 ...
             """
             interleaved = not self.is_neox_style

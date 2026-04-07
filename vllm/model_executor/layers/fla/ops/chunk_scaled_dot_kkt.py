@@ -8,52 +8,12 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
-import os
-
 import torch
 
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
-from .utils import is_sm70
-
-
-def _parse_sm70_int_list(env_name: str, default_vals: list[int]) -> list[int]:
-    raw = os.getenv(env_name)
-    if raw is None or not raw.strip():
-        return default_vals
-    out: list[int] = []
-    for tok in raw.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        try:
-            val = int(tok)
-        except ValueError:
-            continue
-        if val > 0:
-            out.append(val)
-    return out or default_vals
-
-
-# SM70: default to one conservative config to avoid first-request autotune OOM.
-_sm70_kkt_bk = _parse_sm70_int_list("VLLM_SM70_GDN_KKT_BK", [32])
-_sm70_kkt_warps = _parse_sm70_int_list("VLLM_SM70_GDN_KKT_WARPS", [4])
-_kkt_configs = (
-    [
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=2)
-        for BK in _sm70_kkt_bk
-        for num_warps in _sm70_kkt_warps
-    ]
-    if is_sm70
-    else [
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ]
-)
 
 
 @triton.heuristics(
@@ -63,7 +23,12 @@ _kkt_configs = (
     }
 )
 @triton.autotune(
-    configs=_kkt_configs,
+    configs=[
+        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64, 128]
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
     key=["H", "K", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -137,7 +102,7 @@ def chunk_scaled_dot_kkt_fwd(
     k: torch.Tensor,
     g: torch.Tensor | None = None,
     beta: torch.Tensor | None = None,
-    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     chunk_size: int = 64,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
@@ -151,7 +116,7 @@ def chunk_scaled_dot_kkt_fwd(
             The beta tensor of shape `[B, T, H]`.
         g (torch.Tensor):
             The cumulative sum of the gate tensor of shape `[B, T, H]`. Default: `None`.
-        cu_seqlens (torch.LongTensor):
+        cu_seqlens (torch.Tensor):
             The cumulative sequence lengths of the input tensor.
             Default: None
         chunk_size (int):

@@ -8,11 +8,11 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
-import os
 
 import torch
 import torch.nn as nn
 
+from vllm.model_executor.custom_op import CustomOp
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, next_power_of_2
 
@@ -23,32 +23,10 @@ from .index import prepare_chunk_indices
 from .l2norm import l2norm_fwd
 from .op import exp, log
 from .solve_tril import solve_tril
-from .utils import is_amd, is_sm70
+from .utils import is_amd
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
-
-
-def _parse_sm70_int_list(env_name: str, default_vals: list[int]) -> list[int]:
-    raw = os.getenv(env_name)
-    if raw is None or not raw.strip():
-        return default_vals
-    out: list[int] = []
-    for tok in raw.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        try:
-            val = int(tok)
-        except ValueError:
-            continue
-        if val > 0:
-            out.append(val)
-    return out or default_vals
-
-
-_sm70_kda_warps = _parse_sm70_int_list("VLLM_SM70_GDN_KDA_WARPS", [4])
-_sm70_kda_stages = _parse_sm70_int_list("VLLM_SM70_GDN_KDA_STAGES", [2])
 
 
 def fused_recurrent_kda_fwd(
@@ -60,7 +38,7 @@ def fused_recurrent_kda_fwd(
     scale: float,
     initial_state: torch.Tensor,
     inplace_final_state: bool = True,
-    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
@@ -138,7 +116,7 @@ def fused_recurrent_kda(
     initial_state: torch.Tensor = None,
     inplace_final_state: bool = True,
     use_qk_l2norm_in_kernel: bool = True,
-    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.LongTensor | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -454,7 +432,8 @@ def rms_norm_gated(
     return y if not prenorm else (y, residual_out.reshape(x_shape_og))
 
 
-class FusedRMSNormGated(nn.Module):
+@CustomOp.register("fused_rms_norm_gated")
+class FusedRMSNormGated(CustomOp):
     def __init__(
         self,
         hidden_size: int,
@@ -481,7 +460,33 @@ class FusedRMSNormGated(nn.Module):
             self.register_parameter("weight", None)
         self.register_parameter("bias", None)
 
-    def forward(
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        g: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        prenorm: bool = False,
+        residual_in_fp32: bool = False,
+    ) -> torch.Tensor:
+        """Decomposed PyTorch ops for torch.compile/inductor fusion."""
+        # TODO(https://github.com/vllm-project/vllm/issues/36175): implement
+        # native residual/prenorm path and unify with RMSNormGated.
+        # For now, fall back to the triton kernel.
+        if residual is not None or prenorm:
+            return self.forward_cuda(x, g, residual, prenorm, residual_in_fp32)
+        x_float = x.float()
+        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
+        x_normed = x_float * torch.rsqrt(variance + self.eps)
+        if self.weight is not None:
+            x_normed = x_normed * self.weight.float()
+        g_float = g.float()
+        if self.activation in ("swish", "silu"):
+            out = x_normed * g_float * torch.sigmoid(g_float)
+        else:  # sigmoid
+            out = x_normed * torch.sigmoid(g_float)
+        return out.to(x.dtype)
+
+    def forward_cuda(
         self,
         x: torch.Tensor,
         g: torch.Tensor,
@@ -504,20 +509,12 @@ class FusedRMSNormGated(nn.Module):
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=(
-        [
-            triton.Config({"BK": BK}, num_warps=num_warps, num_stages=2)
-            for BK in [32, 64]
-            for num_warps in [4]
-        ]
-        if is_sm70
-        else [
-            triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-            for BK in [32, 64]
-            for num_warps in [1, 2, 4, 8]
-            for num_stages in [2, 3, 4]
-        ]
-    ),
+    configs=[
+        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64]
+        for num_warps in [1, 2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
     key=["BC"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -623,11 +620,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=(
-        [triton.Config({}, num_warps=num_warps) for num_warps in [2, 4]]
-        if is_sm70
-        else [triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]]
-    ),
+    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
     key=["BK", "BT"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -727,7 +720,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
     gk: torch.Tensor | None = None,
     beta: torch.Tensor | None = None,
     scale: float | None = None,
-    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     chunk_size: int = 64,
     output_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -741,7 +734,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
             The beta tensor of shape `[B, T, H]`.
         gk (torch.Tensor):
             The cumulative sum of the gate tensor of shape `[B, T, H, K]` applied to the key tensor. Default: `None`.
-        cu_seqlens (torch.LongTensor):
+        cu_seqlens (torch.Tensor):
             The cumulative sequence lengths of the input tensor.
             Default: None
         chunk_size (int):
@@ -813,19 +806,11 @@ def chunk_kda_scaled_dot_kkt_fwd(
     }
 )
 @triton.autotune(
-    configs=(
-        [
-            triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-            for num_warps in _sm70_kda_warps
-            for num_stages in _sm70_kda_stages
-        ]
-        if is_sm70
-        else [
-            triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-            for num_warps in [2, 4, 8]
-            for num_stages in [2, 3, 4]
-        ]
-    ),
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -979,7 +964,7 @@ def recompute_w_u_fwd(
     A: torch.Tensor,
     q: torch.Tensor | None = None,
     gk: torch.Tensor | None = None,
-    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
@@ -1021,21 +1006,13 @@ def recompute_w_u_fwd(
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=(
-        [
-            triton.Config({"BK": BK, "BV": BV}, num_warps=4, num_stages=2)
-            for BK in [32, 64]
-            for BV in [64]
-        ]
-        if is_sm70
-        else [
-            triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-            for BK in [32, 64]
-            for BV in [64, 128]
-            for num_warps in [2, 4, 8]
-            for num_stages in [2, 3, 4]
-        ]
-    ),
+    configs=[
+        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64]
+        for BV in [64, 128]
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
     key=["BT"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -1155,7 +1132,7 @@ def chunk_gla_fwd_o_gk(
     h: torch.Tensor,
     o: torch.Tensor,
     scale: float,
-    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     chunk_size: int = 64,
 ):
     B, T, H, K, V = *q.shape, v.shape[-1]
@@ -1199,7 +1176,7 @@ def chunk_kda_fwd(
     scale: float,
     initial_state: torch.Tensor,
     output_final_state: bool,
-    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
 ):
     chunk_size = 64
     g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
@@ -1259,7 +1236,7 @@ def chunk_kda(
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
-    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     **kwargs,
 ):
     if scale is None:
@@ -1284,20 +1261,12 @@ def chunk_kda(
 
 
 @triton.autotune(
-    configs=(
-        [
-            triton.Config({"BT": bt}, num_warps=nw, num_stages=2)
-            for bt in [32, 64]
-            for nw in [4, 8]
-        ]
-        if is_sm70
-        else [
-            triton.Config({"BT": bt}, num_warps=nw, num_stages=ns)
-            for bt in BT_LIST_AUTOTUNE
-            for nw in NUM_WARPS_AUTOTUNE
-            for ns in [2, 3]
-        ]
-    ),
+    configs=[
+        triton.Config({"BT": bt}, num_warps=nw, num_stages=ns)
+        for bt in BT_LIST_AUTOTUNE
+        for nw in NUM_WARPS_AUTOTUNE
+        for ns in [2, 3]
+    ],
     key=["H", "D"],
 )
 @triton.jit
