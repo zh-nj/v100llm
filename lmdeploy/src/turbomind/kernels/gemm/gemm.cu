@@ -46,6 +46,19 @@ struct Gemm::Impl {
         registry_{props_},
         cache_{registry_.kernels()}
     {
+        if (arch_ == 700) {
+            // V100 decode is dominated by many tiny GEMM/GEMV problems. A
+            // broader search space consistently finds better launch specs than
+            // the generic defaults for these SM70 workloads.
+            tuning_.max_splits = 16;
+            tuning_.max_waves  = 32;
+            tuning_.swizzle    = {0, 1, 2, 3, 4};
+            tuning_.top_k      = 0;
+            tuning_.clusters   = 0;
+            tuning_.min_iter   = 2;
+            tuning_.max_iter   = 20;
+            tuning_.max_time   = 2.f;
+        }
         if (auto str = std::getenv("TM_GEMM_TUNE")) {
             try {
                 ParseTuningParams(tuning_, str);

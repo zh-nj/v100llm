@@ -5,6 +5,7 @@
 #include "src/turbomind/kernels/gemm/kernel.h"
 #include "src/turbomind/kernels/gemm/types.h"
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -23,6 +24,16 @@ static inline bool operator==(const int2& a, const int2& b)
 }
 
 namespace turbomind::gemm {
+
+namespace {
+
+bool dispatch_cache_summary_enabled()
+{
+    const char* raw = std::getenv("TM_GEMM_CACHE_SUMMARY");
+    return raw != nullptr && std::atoi(raw) != 0;
+}
+
+}  // namespace
 
 static inline decltype(auto) as_tuple(const KernelDesc& d)
 {
@@ -287,6 +298,9 @@ struct DispatchCache::Impl {
     // Print a summary of how many cases a kernel is used
     void Summary(const std::vector<std::pair<GemmDesc, LaunchSpec>>& entries) const
     {
+        if (!dispatch_cache_summary_enabled()) {
+            return;
+        }
         std::vector<Kernel*> uses{nullptr};
         std::copy(kernels_.begin(), kernels_.end(), std::back_inserter(uses));
 
