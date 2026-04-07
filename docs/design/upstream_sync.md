@@ -23,7 +23,10 @@
 ```bash
 git fetch vllm-upstream --tags
 git subtree pull --prefix=lmdeploy /mnt/data/apps/lmdeploy v0.12.1 --squash
-git diff final/1cat-vllm^ final/1cat-vllm -- \
+vllm_replay_commit=$(git log \
+  --grep='^1cat(vllm): SM70/Qwen3.5/AWQ/runtime/build customizations$' \
+  --format=%H -n 1)
+git diff "${vllm_replay_commit}^" "${vllm_replay_commit}" -- \
   . ':(exclude)lmdeploy' | git apply --3way
 ```
 
