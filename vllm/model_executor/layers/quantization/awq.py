@@ -8,7 +8,10 @@ from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import (
+    FusedMoE,
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -116,6 +119,12 @@ class AWQConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if is_layer_skipped(
+                prefix,
+                getattr(self, "modules_to_not_convert", []),
+                skip_with_substr=True,
+            ):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
             # SM70 (V100): use TurboMind GEMM kernels for MoE,
             # since Marlin requires SM75+.
             if self._is_sm70_available():
