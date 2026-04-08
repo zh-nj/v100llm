@@ -23,6 +23,7 @@
 1. 把 `lmdeploy/TurboMind` 对 `MiniMax-M2.5-AWQ` 的量化语义迁移到 1Cat 现有的 vLLM 执行框架。
 2. 让 `SM70` 上可量化的 MiniMax experts 复用 1Cat 已接好的 TurboMind AWQ/MoE kernel。
 3. 避免把本应保留为 `fp16` 的模块错误送入 `int4` 路径。
+4. 把实现收敛在未来单独升级 `vllm` 时最容易重放的最小补丁面上。
 
 ## 2. 问题定义
 
@@ -110,6 +111,7 @@
 5. 其余满足 `SM70` 约束的 experts 走 `AWQSM70MoEMethod`。
 6. 行为与 TurboMind 对该模型的量化语义一致。
 7. 不引入 MiniMax 专属 attention custom op，不复制 TurboMind 的整套 MiniMax runtime。
+8. 对未来单独升级 `vllm` 友好，默认不扩散到 `csrc/`、`CMakeLists.txt`、模型结构文件和全局量化框架重构。
 
 ## 5. 可选方案
 
@@ -129,6 +131,7 @@
 - 与现有 vLLM 量化框架一致
 - 与 `AWQMarlinConfig` 的 MoE skip 语义对齐
 - 不复制 MiniMax 专属执行逻辑
+- 对后续单独升级 `vllm` 最友好，补丁面最小
 
 缺点：
 
@@ -181,6 +184,7 @@
 - `SM70` AWQ/TurboMind kernel 已在仓库内打通，问题不在 kernel 供给层。
 - 真正缺的是 `FusedMoE` 的量化决策与 TurboMind MiniMax 语义不一致。
 - 先把量化决策修正为正确语义，再决定是否有必要抽象成通用 planner，风险和收益比最好。
+- 该方案与未来单独升级 `vllm` 的目标一致：只保留一处核心逻辑补丁，更容易在上游代码变动后重新对齐。
 
 ## 7. 详细设计
 
@@ -214,6 +218,11 @@
 2. 对命中 `modules_to_not_convert` 的 `FusedMoE`，返回 `UnquantizedFusedMoEMethod`。
 3. 对未命中的 `FusedMoE`，继续现有 `SM70 compatibility` 判断，再进入 `AWQSM70MoEMethod` 或 fallback。
 
+实现约束：
+
+- 优先复用 `AWQMarlinConfig` 已有的分支结构与匹配方式，避免在 `AWQConfig` 中引入 MiniMax 专属 helper、planner 或额外抽象层。
+- 默认把核心代码改动限制在 `awq.py`，使未来 `vllm` 单独升级时只需重放一小段 hunk。
+
 重点是支持以下匹配语义：
 
 - `self_attn`
@@ -240,6 +249,14 @@
 只在必要时补小型辅助逻辑，例如：
 
 - 如果 prefix 命名与 `modules_to_not_convert` 的匹配粒度不一致，则在最小范围内补 prefix 规范化
+
+当出现这类命名不一致时，优先级如下：
+
+1. 优先使用 MiniMax 模型局部的 `hf_to_vllm_mapper`
+2. 其次在 MiniMax 模型文件内做局部映射
+3. 最后才考虑扩大通用量化层的匹配规则
+
+这样做的原因是：命名适配本质上是模型局部问题，放回模型层对未来升级 `vllm` 的冲突最小。
 
 但设计上默认不把模型类作为主改动点。
 
@@ -285,6 +302,13 @@
 
 - `vllm/model_executor/models/minimax_m2.py`
 - `vllm/model_executor/warmup/awq_sm70_warmup.py`
+
+### 默认不改
+
+- `csrc/`
+- `CMakeLists.txt`
+- `vllm/model_executor/layers/quantization/awq_sm70_moe.py`
+- `vllm/model_executor/models/minimax_m2.py` 的主结构
 
 ## 9. 验证策略
 
@@ -333,6 +357,14 @@
 ### 风险 2：按层 mixed expert type 的语义只做了 skip，没有抽象成通用计划
 
 对 `MiniMax-M2.5-AWQ` 来说足够，但后续如果引入更多 “部分层 experts 为 fp16” 的模型，通用性会不足。
+
+### 风险 2.1：为了快速落地而把 MiniMax 特殊性写进通用 AWQ 路径过多
+
+这会直接提高后续单独升级 `vllm` 的成本。规避方式是：
+
+- 尽量复用上游已有分支结构
+- 默认只保留一处通用逻辑补丁
+- 遇到名称映射问题优先放回 MiniMax 模型局部
 
 ### 风险 3：config 字段与实际 runtime 语义不完全一致
 
