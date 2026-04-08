@@ -13,6 +13,11 @@
 - 已验证机型：`Tesla V100 16GB`
 - 当前发布默认走 `TRITON_ATTN` 路径
 
+如果你是 `Tesla V100 / SM70` 用户，并且希望把
+`flash-attention-v100` 作为推荐默认 attention 路径，而不是沿用本指南
+里的保守公开默认值，请改看
+[docs/open_source_sm70_flash_attn_install_upgrade_zh.md](docs/open_source_sm70_flash_attn_install_upgrade_zh.md)。
+
 ## 推荐安装方式：预编译 wheel
 
 ### 1. 创建环境

@@ -14,8 +14,13 @@ try:
     FA2_UNAVAILABLE_REASON = None
     FA2_AVAILABLE = True
 except ImportError as e:
-    FA2_UNAVAILABLE_REASON = str(e)
-    FA2_AVAILABLE = False
+    try:
+        import vllm_flash_attn._vllm_fa2_C as _vllm_fa2_C  # type: ignore[import-not-found]  # noqa: F401
+        FA2_UNAVAILABLE_REASON = None
+        FA2_AVAILABLE = True
+    except ImportError as fallback_e:
+        FA2_UNAVAILABLE_REASON = f"{e}; fallback import failed: {fallback_e}"
+        FA2_AVAILABLE = False
 
 try:
     from . import _vllm_fa3_C  # noqa: F401
@@ -40,9 +45,9 @@ DEFAULT_FA_VERSION = 2
 def _is_fa2_supported(device = None) -> Tuple[bool, Optional[str]]:
     if not FA2_AVAILABLE:
         return False, f"FA2 is unavaible due to: {FA2_UNAVAILABLE_REASON}"
-    if torch.cuda.get_device_capability(device)[0] < 8:
+    if torch.cuda.get_device_capability(device)[0] < 7:
         return False, \
-            "FA2 is only supported on devices with compute capability >= 8"
+            "FA2 is only supported on devices with compute capability >= 7"
     return True, None
     
 def _is_fa3_supported(device = None) -> Tuple[bool, Optional[str]]:
@@ -89,6 +94,129 @@ def fa_version_unsupported_reason(fa_version: int, device = None) \
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _get_fa2_varlen_func():
+    if not FA2_AVAILABLE:
+        raise ImportError(FA2_UNAVAILABLE_REASON)
+    return flash_attn_varlen_func
+
+
+def _get_fa2_kvcache_op():
+    if not FA2_AVAILABLE:
+        raise ImportError(FA2_UNAVAILABLE_REASON)
+    return torch.ops._vllm_fa2_C.fwd_kvcache
+
+
+def flash_attn_func(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size: Optional[List[int]] = None,
+    softcap=0.0,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+):
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("flash_attn_func expects q, k, v with shape [B, S, H, D]")
+
+    batch_size, seqlen_q, num_heads, head_dim = q.shape
+    batch_size_k, seqlen_k, num_kv_heads, head_dim_k = k.shape
+    if v.shape != (batch_size_k, seqlen_k, num_kv_heads, head_dim_k):
+        raise ValueError("k and v must have matching shapes")
+    if batch_size != batch_size_k or head_dim != head_dim_k:
+        raise ValueError("q, k, v batch/head_dim must match")
+
+    q_flat = q.reshape(batch_size * seqlen_q, num_heads, head_dim)
+    k_flat = k.reshape(batch_size * seqlen_k, num_kv_heads, head_dim)
+    v_flat = v.reshape(batch_size * seqlen_k, num_kv_heads, head_dim)
+    cu_seqlens_q = torch.arange(
+        0,
+        (batch_size + 1) * seqlen_q,
+        step=seqlen_q,
+        device=q.device,
+        dtype=torch.int32,
+    )
+    cu_seqlens_k = torch.arange(
+        0,
+        (batch_size + 1) * seqlen_k,
+        step=seqlen_k,
+        device=q.device,
+        dtype=torch.int32,
+    )
+
+    out = _get_fa2_varlen_func()(
+        q=q_flat,
+        k=k_flat,
+        v=v_flat,
+        max_seqlen_q=seqlen_q,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_k=seqlen_k,
+        cu_seqlens_k=cu_seqlens_k,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+    )
+    if isinstance(out, tuple):
+        out = out[0]
+    return out.reshape(batch_size, seqlen_q, num_heads, head_dim)
+
+
+def flash_attn_decode_paged(
+    q,
+    kcache,
+    vcache,
+    block_table,
+    seqlens_k,
+    softmax_scale=None,
+    out=None,
+):
+    if q.ndim != 3:
+        raise ValueError("flash_attn_decode_paged expects q with shape [B, H, D]")
+
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    q_batched = q.unsqueeze(1).contiguous()
+    out_batched = None if out is None else out.unsqueeze(1).contiguous()
+    result = _get_fa2_kvcache_op()(
+        q_batched,
+        maybe_contiguous(kcache),
+        maybe_contiguous(vcache),
+        None,
+        None,
+        maybe_contiguous(seqlens_k),
+        None,
+        None,
+        None,
+        None,
+        maybe_contiguous(block_table),
+        None,
+        out_batched,
+        float(softmax_scale),
+        True,
+        -1,
+        -1,
+        0.0,
+        True,
+        0,
+    )
+    if isinstance(result, (tuple, list)):
+        result = result[0]
+    result = result.squeeze(1)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 
 # NOTE only used in FA3
 def get_scheduler_metadata(

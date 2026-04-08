@@ -26,6 +26,11 @@ Compared with the earlier `0.0.1` line, `0.0.2` is a major practical upgrade:
 the install path is simpler, the public runtime defaults are more stable, and
 the validated V100 coverage is much broader for real Qwen3.5 deployments.
 
+If you are a `Tesla V100 / SM70` user and want the current recommended
+`flash-attention-v100` install + upgrade path instead of the conservative
+public release defaults, see
+[`docs/open_source_sm70_flash_attn_install_upgrade_zh.md`](docs/open_source_sm70_flash_attn_install_upgrade_zh.md).
+
 ## Recommended model providers
 
 - `tclf90/Qwen3.5-27B-AWQ`

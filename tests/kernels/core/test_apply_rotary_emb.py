@@ -11,7 +11,10 @@ ApplyRotaryEmb methods based on the calling context:
 3. RotaryEmbedding.forward_hip() -> ApplyRotaryEmb.forward() (auto-dispatch)
 """
 
+import builtins
+import logging
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -22,9 +25,39 @@ from vllm.config import (
     get_cached_compilation_config,
     set_current_vllm_config,
 )
+from vllm.model_executor.layers.rotary_embedding import common as rotary_common
 from vllm.platforms import current_platform
 
 CUDA_DEVICES = ["cuda:0"]
+
+
+def test_apply_rotary_emb_skips_flash_attn_probe_on_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog_vllm: pytest.LogCaptureFixture,
+    default_vllm_config,
+):
+    monkeypatch.setattr(
+        rotary_common,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: False),
+        raising=False,
+    )
+    monkeypatch.setattr(rotary_common, "find_spec", lambda name: object())
+
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("flash_attn"):
+            raise ImportError("boom")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    with caplog_vllm.at_level(logging.WARNING, logger="vllm"):
+        op = rotary_common.ApplyRotaryEmb()
+
+    assert op.apply_rotary_emb_flash_attn is None
+    assert "flash_attn rotary import failed" not in caplog_vllm.text
 
 
 @dataclass
