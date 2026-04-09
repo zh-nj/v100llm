@@ -313,34 +313,72 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         num_experts = layer.w13_qweight.shape[0]
         device = layer.w13_qweight.device
 
-        # --- Prepare TurboMind weights per expert ---
-        w13_tm_weights, w13_tm_scales, w13_meta = [], [], []
-        w2_tm_weights, w2_tm_scales, w2_meta = [], [], []
+        def _prepare_tm_weights(
+            qweight: torch.Tensor,
+            scales: torch.Tensor,
+            qzeros: torch.Tensor,
+            *,
+            interleave_gated_silu: bool,
+        ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+            tm_weight = None
+            tm_scales = None
+            meta = []
 
-        for e in range(num_experts):
-            r13 = ops.awq_sm70_prepare(
-                layer.w13_qweight[e], layer.w13_scales[e],
-                layer.w13_qzeros[e], self.group_size,
-                interleave_gated_silu=True)
-            w13_tm_weights.append(r13[0])
-            w13_tm_scales.append(r13[1])
-            w13_meta.append(r13[2])
+            for e in range(num_experts):
+                result = ops.awq_sm70_prepare(
+                    qweight[e],
+                    scales[e],
+                    qzeros[e],
+                    self.group_size,
+                    interleave_gated_silu=interleave_gated_silu,
+                )
+                meta.append(result[2])
 
-            r2 = ops.awq_sm70_prepare(
-                layer.w2_qweight[e], layer.w2_scales[e],
-                layer.w2_qzeros[e], self.group_size)
-            w2_tm_weights.append(r2[0])
-            w2_tm_scales.append(r2[1])
-            w2_meta.append(r2[2])
+                if e == 0:
+                    tm_weight = torch.empty(
+                        (num_experts, *result[0].shape),
+                        dtype=result[0].dtype,
+                        device=result[0].device,
+                    )
+                    tm_scales = torch.empty(
+                        (num_experts, *result[1].shape),
+                        dtype=result[1].dtype,
+                        device=result[1].device,
+                    )
+                else:
+                    assert tm_weight is not None
+                    assert tm_scales is not None
+                    assert result[0].shape == tm_weight.shape[1:]
+                    assert result[1].shape == tm_scales.shape[1:]
 
-        layer.w13_tm_weight = Parameter(
-            torch.stack(w13_tm_weights), requires_grad=False)
-        layer.w13_tm_scales = Parameter(
-            torch.stack(w13_tm_scales), requires_grad=False)
-        layer.w2_tm_weight = Parameter(
-            torch.stack(w2_tm_weights), requires_grad=False)
-        layer.w2_tm_scales = Parameter(
-            torch.stack(w2_tm_scales), requires_grad=False)
+                assert tm_weight is not None
+                assert tm_scales is not None
+                tm_weight[e].copy_(result[0])
+                tm_scales[e].copy_(result[1])
+
+            assert tm_weight is not None
+            assert tm_scales is not None
+            return tm_weight, tm_scales, meta
+
+        w13_tm_weight, w13_tm_scales, w13_meta = _prepare_tm_weights(
+            layer.w13_qweight,
+            layer.w13_scales,
+            layer.w13_qzeros,
+            interleave_gated_silu=True,
+        )
+        layer.w13_tm_weight = Parameter(w13_tm_weight, requires_grad=False)
+        layer.w13_tm_scales = Parameter(w13_tm_scales, requires_grad=False)
+        del layer.w13_qweight, layer.w13_scales, layer.w13_qzeros
+
+        w2_tm_weight, w2_tm_scales, w2_meta = _prepare_tm_weights(
+            layer.w2_qweight,
+            layer.w2_scales,
+            layer.w2_qzeros,
+            interleave_gated_silu=False,
+        )
+        layer.w2_tm_weight = Parameter(w2_tm_weight, requires_grad=False)
+        layer.w2_tm_scales = Parameter(w2_tm_scales, requires_grad=False)
+        del layer.w2_qweight, layer.w2_scales, layer.w2_qzeros
 
         # Cache meta as CPU ints (zero-cost at inference)
         layer.w13_meta_list = [
@@ -448,10 +486,6 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             top_k + 1, dtype=torch.int64, device=device)
         layer._buf_single_inv_permuted_idx = torch.arange(
             top_k, dtype=torch.int32, device=device).view(1, top_k)
-
-        # Free original weights
-        del layer.w13_qweight, layer.w13_scales, layer.w13_qzeros
-        del layer.w2_qweight, layer.w2_scales, layer.w2_qzeros
 
     def _get_buffers(self, layer: torch.nn.Module, total_slots: int,
                      num_tokens: int):
