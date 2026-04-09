@@ -43,8 +43,17 @@ def _get_flash_ops():
             _flash_attn_func = flash_attn_func
             _flash_attn_decode_paged = flash_attn_decode_paged
         except ImportError:
-            _flash_attn_func = None
-            _flash_attn_decode_paged = None
+            try:
+                from vllm.vllm_flash_attn import (
+                    flash_attn_decode_paged,
+                    flash_attn_func,
+                )
+
+                _flash_attn_func = flash_attn_func
+                _flash_attn_decode_paged = flash_attn_decode_paged
+            except ImportError:
+                _flash_attn_func = None
+                _flash_attn_decode_paged = None
     return _flash_attn_func, _flash_attn_decode_paged
 
 

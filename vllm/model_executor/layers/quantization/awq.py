@@ -8,7 +8,10 @@ from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import (
+    FusedMoE,
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -86,6 +89,34 @@ class AWQConfig(QuantizationConfig):
         return cap[0] == 7 and cap[1] == 0
 
     @staticmethod
+    def _get_sm70_moe_group_size(
+        hidden_size: int,
+        intermediate_size: int,
+        checkpoint_group_size: int,
+    ) -> int | None:
+        """Return the effective group size for SM70 MoE kernels.
+
+        AWQ checkpoints may be written with group_size=128 while TP sharding
+        produces per-rank expert shards that are only divisible by 64 or 32.
+        Repeating the checkpoint scales/zero-points lets the SM70 path use a
+        smaller effective group size without changing the quantized weights.
+        """
+        if hidden_size % 8 != 0 or intermediate_size % 8 != 0:
+            return None
+
+        group_size = checkpoint_group_size
+        while group_size >= 32:
+            if (
+                group_size in (32, 64, 128)
+                and hidden_size % group_size == 0
+                and intermediate_size % group_size == 0
+            ):
+                return group_size
+            group_size //= 2
+
+        return None
+
+    @staticmethod
     def get_config_filenames() -> list[str]:
         return [
             "quant_config.json",  # E.g., casperhansen/vicuna-7b-v1.5-awq
@@ -116,29 +147,44 @@ class AWQConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if is_layer_skipped(
+                prefix,
+                getattr(self, "modules_to_not_convert", []),
+                skip_with_substr=True,
+            ):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+
             # SM70 (V100): use TurboMind GEMM kernels for MoE,
             # since Marlin requires SM75+.
             if self._is_sm70_available():
                 # SM70 (V100): TurboMind s884h kernels require:
                 #   K % 8 == 0, N % 8 == 0, K % group_size == 0
-                # No requirement on (K/group_size) % 8.
+                # No requirement on (K/group_size) % 8. If TP sharding breaks
+                # the checkpoint group size, we can still use the kernel with a
+                # smaller effective group size by repeating scales/zps.
                 moe_cfg = layer.moe_config
                 hidden = moe_cfg.hidden_dim
                 inter = moe_cfg.intermediate_size_per_partition
-                gs = self.group_size
-                sm70_compatible = (
-                    gs in (32, 64, 128)
-                    and hidden % gs == 0
-                    and inter % gs == 0
-                    and hidden % 8 == 0
-                    and inter % 8 == 0
+                sm70_group_size = self._get_sm70_moe_group_size(
+                    hidden,
+                    inter,
+                    self.group_size,
                 )
-                if sm70_compatible:
+                if sm70_group_size is not None:
                     from .awq_sm70_moe import AWQSM70MoEMethod
 
+                    if sm70_group_size != self.group_size:
+                        logger.info_once(
+                            "Layer '%s' uses SM70 AWQ MoE with effective "
+                            "group_size=%d (checkpoint group_size=%d).",
+                            prefix,
+                            sm70_group_size,
+                            self.group_size,
+                        )
                     return AWQSM70MoEMethod(
                         weight_bits=self.weight_bits,
-                        group_size=self.group_size,
+                        group_size=sm70_group_size,
+                        checkpoint_group_size=self.group_size,
                         zero_point=self.zero_point,
                         moe=moe_cfg,
                     )
@@ -147,7 +193,7 @@ class AWQConfig(QuantizationConfig):
                         f"Layer '{prefix}' MoE dimensions incompatible "
                         "with SM70 TurboMind kernels "
                         f"(hidden={hidden}, inter={inter}, "
-                        f"group_size={gs}). "
+                        f"group_size={self.group_size}). "
                         "Falling back to MoeWNA16 kernels."
                     )
                     from .moe_wna16 import MoeWNA16Config
