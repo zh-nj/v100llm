@@ -114,6 +114,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         group_size: int,
         zero_point: bool,
         moe: FusedMoEConfig,
+        checkpoint_group_size: int | None = None,
     ):
         super().__init__(moe)
         if weight_bits != 4:
@@ -126,8 +127,53 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             )
         self.weight_bits = weight_bits
         self.group_size = group_size
+        self.checkpoint_group_size = checkpoint_group_size or group_size
+        if self.checkpoint_group_size not in (32, 64, 128):
+            raise ValueError(
+                "AWQSM70MoEMethod checkpoint_group_size must be 32/64/128, "
+                f"got {self.checkpoint_group_size}."
+            )
+        if self.checkpoint_group_size % self.group_size != 0:
+            raise ValueError(
+                "AWQSM70MoEMethod requires checkpoint_group_size to be a "
+                "multiple of the effective group_size. "
+                f"Got checkpoint_group_size={self.checkpoint_group_size}, "
+                f"group_size={self.group_size}."
+            )
+        self.group_size_div_factor = self.checkpoint_group_size // self.group_size
         self.zero_point = zero_point
         self.pack_factor = 32 // weight_bits  # 8
+
+    @staticmethod
+    def get_weight_loader(layer, weight_loader):
+        def awq_sm70_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: int,
+            return_success: bool = False,
+        ):
+            group_size_div_factor = getattr(layer, "sm70_group_size_div_factor", 1)
+            if group_size_div_factor > 1 and (
+                "qzeros" in weight_name or "scales" in weight_name
+            ):
+                group_dim = 1 if loaded_weight.ndim == 3 else 0
+                loaded_weight = loaded_weight.repeat_interleave(
+                    group_size_div_factor,
+                    dim=group_dim,
+                )
+
+            return weight_loader(
+                param,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+                return_success=return_success,
+            )
+
+        return awq_sm70_weight_loader
 
     def create_weights(
         self,
@@ -138,6 +184,8 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        layer.sm70_checkpoint_group_size = self.checkpoint_group_size
+        layer.sm70_group_size_div_factor = self.group_size_div_factor
         extra_weight_attrs.update(
             {
                 "is_transposed": True,
@@ -145,6 +193,13 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             }
         )
         extra_weight_attrs.pop("intermediate_size_full", None)
+        if self.group_size_div_factor > 1:
+            assert "weight_loader" in extra_weight_attrs
+            weight_loader = extra_weight_attrs["weight_loader"]
+            extra_weight_attrs["weight_loader"] = self.get_weight_loader(
+                layer,
+                weight_loader,
+            )
 
         w13_qweight = Parameter(
             torch.empty(num_experts, hidden_size,
