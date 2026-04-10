@@ -2174,9 +2174,8 @@ class CompressedTensorsSM70WNA16MoEMethod(CompressedTensorsMoEMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Convert CT weights to AWQ format, then run TurboMind prepare."""
-        from vllm import _custom_ops as ops
         from vllm.model_executor.layers.quantization.awq_sm70_moe import (
-            _DEFAULT_MAX_TOKENS,
+            AWQSM70MoEMethod,
         )
 
         gs = self.group_size
@@ -2207,92 +2206,23 @@ class CompressedTensorsSM70WNA16MoEMethod(CompressedTensorsMoEMethod):
             (E_w2, N_gs_w2, K_w2 // pf),
             _zp, dtype=torch.int32, device=device)
 
-        # --- TurboMind prepare per expert ---
-        w13_tm_w, w13_tm_s, w13_meta = [], [], []
-        w2_tm_w, w2_tm_s, w2_meta = [], [], []
+        # Reuse the canonical AWQ SM70 post-load path so CT→AWQ conversion
+        # cannot drift from the runtime metadata and buffer contract.
+        layer.w13_qweight = torch.nn.Parameter(w13_qweight, requires_grad=False)
+        layer.w13_scales = torch.nn.Parameter(w13_scales, requires_grad=False)
+        layer.w13_qzeros = torch.nn.Parameter(w13_qzeros, requires_grad=False)
+        layer.w2_qweight = torch.nn.Parameter(w2_qweight, requires_grad=False)
+        layer.w2_scales = torch.nn.Parameter(w2_scales, requires_grad=False)
+        layer.w2_qzeros = torch.nn.Parameter(w2_qzeros, requires_grad=False)
 
-        for e in range(num_experts):
-            r13 = ops.awq_sm70_prepare(
-                w13_qweight[e], w13_scales[e], w13_qzeros[e], gs)
-            w13_tm_w.append(r13[0])
-            w13_tm_s.append(r13[1])
-            w13_meta.append(r13[2])
-
-            r2 = ops.awq_sm70_prepare(
-                w2_qweight[e], w2_scales[e], w2_qzeros[e], gs)
-            w2_tm_w.append(r2[0])
-            w2_tm_s.append(r2[1])
-            w2_meta.append(r2[2])
-
-        # --- Store TurboMind weights as parameters ---
-        layer.w13_tm_weight = torch.nn.Parameter(
-            torch.stack(w13_tm_w), requires_grad=False)
-        layer.w13_tm_scales = torch.nn.Parameter(
-            torch.stack(w13_tm_s), requires_grad=False)
-        layer.w2_tm_weight = torch.nn.Parameter(
-            torch.stack(w2_tm_w), requires_grad=False)
-        layer.w2_tm_scales = torch.nn.Parameter(
-            torch.stack(w2_tm_s), requires_grad=False)
-
-        layer.w13_meta_list = [
-            (int(w13_meta[i][0].item()), int(w13_meta[i][1].item()))
-            for i in range(num_experts)]
-        layer.w2_meta_list = [
-            (int(w2_meta[i][0].item()), int(w2_meta[i][1].item()))
-            for i in range(num_experts)]
-        layer.sm70_num_experts = num_experts
-
-        # Dimensions for batched GEMM
-        layer.sm70_w13_k_dim = layer.w13_tm_weight.shape[1]
-        layer.sm70_w13_n_dim = layer.w13_tm_weight.shape[2] * 8
-        layer.sm70_w2_k_dim = layer.w2_tm_weight.shape[1]
-        layer.sm70_w2_n_dim = layer.w2_tm_weight.shape[2] * 8
-        intermediate_size = layer.sm70_w2_k_dim
-        layer.sm70_intermediate_size = intermediate_size
-
-        # --- Build StridedPtr arrays for batched GEMM ---
-        w13_k_ld, w13_q_ld = layer.w13_meta_list[0]
-        w2_k_ld, w2_q_ld = layer.w2_meta_list[0]
-        try:
-            w13_ptrs = ops.awq_moe_build_strided_ptrs(
-                layer.w13_tm_weight, layer.w13_tm_scales,
-                w13_k_ld, w13_q_ld, num_experts)
-            w2_ptrs = ops.awq_moe_build_strided_ptrs(
-                layer.w2_tm_weight, layer.w2_tm_scales,
-                w2_k_ld, w2_q_ld, num_experts)
-            layer.w13_strided_ptrs_w = torch.nn.Parameter(
-                w13_ptrs[0], requires_grad=False)
-            layer.w13_strided_ptrs_s = torch.nn.Parameter(
-                w13_ptrs[1], requires_grad=False)
-            layer.w2_strided_ptrs_w = torch.nn.Parameter(
-                w2_ptrs[0], requires_grad=False)
-            layer.w2_strided_ptrs_s = torch.nn.Parameter(
-                w2_ptrs[1], requires_grad=False)
-            layer.sm70_batched_ready = True
-            logger.info("SM70 CT MoE: batched GEMM enabled (%d experts)",
-                        num_experts)
-        except Exception as e:
-            layer.sm70_batched_ready = False
-            logger.warning("SM70 CT MoE: batched GEMM unavailable (%s)", e)
-
-        # --- Pre-allocate buffers (CUDA graph safe) ---
-        top_k = self.moe.experts_per_token
-        max_slots = _DEFAULT_MAX_TOKENS * top_k
-        layer._buf_max_slots = max_slots
-        layer._buf_top_k = top_k
-        layer._buf_expert_counts = torch.zeros(
-            num_experts, dtype=torch.int32, device=device)
-        layer._buf_expert_offsets = torch.zeros(
-            num_experts + 1, dtype=torch.int32, device=device)
-        layer._buf_intermediate = torch.empty(
-            max_slots, intermediate_size,
-            dtype=torch.float16, device=device)
-        layer._buf_ones = torch.ones(
-            max_slots, dtype=torch.int32, device=device)
-        hidden_size = layer.sm70_w13_k_dim
-        layer._buf_output = torch.empty(
-            _DEFAULT_MAX_TOKENS, hidden_size,
-            dtype=torch.float16, device=device)
+        if self._awq_moe is None:
+            self._awq_moe = AWQSM70MoEMethod(
+                weight_bits=self.num_bits,
+                group_size=self.group_size,
+                zero_point=False,
+                moe=self.moe,
+            )
+        self._awq_moe.process_weights_after_loading(layer)
 
         # Free original CT weights
         for attr in ("w13_weight_packed", "w13_weight_scale",

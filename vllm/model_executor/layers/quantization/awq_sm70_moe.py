@@ -28,6 +28,8 @@ logger = init_logger(__name__)
 # Larger MoE batches allocate temporary workspaces on demand so we do not
 # permanently reserve hundreds of MiB per layer.
 _DEFAULT_PERSISTENT_MAX_TOKENS = 32
+# Backward-compatible alias for older SM70 MoE import sites.
+_DEFAULT_MAX_TOKENS = _DEFAULT_PERSISTENT_MAX_TOKENS
 
 
 def _single_token_compact_enabled() -> bool:
