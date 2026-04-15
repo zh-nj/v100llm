@@ -1,0 +1,105 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+import functools
+from typing import Iterable, List, Optional, Tuple
+
+import torch
+
+from lmdeploy.pytorch.config import QuantizationConfig
+from lmdeploy.pytorch.engine.input_process import BaseModelInputProcessor
+from lmdeploy.pytorch.model_inputs import StepContext
+
+
+class DeployModelMixin:
+
+    def forward(self, *args, **kwargs):
+        """Forward of model."""
+        raise NotImplementedError('Not Implemented')
+
+    def prepare_inputs_for_generation(
+        self,
+        past_key_values: List[List[torch.Tensor]],
+        inputs_embeds: Optional[torch.Tensor] = None,
+        context: StepContext = None,
+    ):
+        """Prepare input."""
+        raise NotImplementedError('Not Implemented')
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """Load weights."""
+        raise NotImplementedError('Not Implemented')
+
+    def get_logits(self, hidden_states: torch.Tensor):
+        """Compute logits of the model output."""
+        return hidden_states
+
+    @classmethod
+    def rename_weight(cls, name: str) -> str:
+        """Rename weight."""
+        return name
+
+    def update_weights(self):
+        """Update weights."""
+        pass
+
+    def update_model_metas(self,
+                           past_key_values: List[List[torch.Tensor]],
+                           inputs_embeds: Optional[torch.Tensor] = None,
+                           context: StepContext = None):
+        """Update model meta."""
+        return None
+
+    def get_input_processor(self) -> BaseModelInputProcessor:
+        """Get input processor."""
+        return None
+
+    @classmethod
+    def update_quant_config(cls, quant_config: QuantizationConfig):
+        """Update quant config."""
+        if quant_config is None:
+            return
+        ignored_layers = [cls.rename_weight(name) for name in quant_config.ignored_layers]
+
+        added_ignore_layers = set()
+
+        for layer_name in ignored_layers:
+            if '.q_proj' in layer_name:
+                added_ignore_layers.add(layer_name.replace(
+                    '.q_proj',
+                    '.qkv_proj',
+                ))
+            elif '.gate_proj' in layer_name:
+                if '.experts' in layer_name:
+                    added_ignore_layers.add(layer_name.split('.experts', 1)[0] + '.experts')
+                else:
+                    added_ignore_layers.add(layer_name.replace('.gate_proj', '.gate_up_proj'))
+            elif '.down_proj' in layer_name:
+                if '.experts' in layer_name:
+                    added_ignore_layers.add(layer_name.split('.experts', 1)[0] + '.experts')
+                else:
+                    added_ignore_layers.add(layer_name.replace('.down_proj', '.down_proj'))
+
+        added_ignore_layers = list(added_ignore_layers)
+
+        ignored_layers.extend(added_ignore_layers)
+        quant_config.ignored_layers = ignored_layers
+
+        return quant_config
+
+
+def vlm_model(vlm_cls):
+    if not issubclass(vlm_cls, torch.nn.Module):
+        raise ValueError('Only subclasses of nn.Module can be decorated with @vlm_model.')
+
+    @functools.wraps(vlm_cls)
+    def wrapper(*args, **kwargs):
+        from lmdeploy.pytorch.models.patch import get_build_model_context
+        bm_ctx = get_build_model_context()
+        disable_vision_encoder = bm_ctx.disable_vision_encoder
+        if disable_vision_encoder:
+            mod = torch.nn.Identity()
+            mod._is_dummy_mod = True
+            return mod
+        else:
+            return vlm_cls(*args, **kwargs)
+
+    return wrapper

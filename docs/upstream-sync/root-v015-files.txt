@@ -1,0 +1,1057 @@
+- 只在 ./.buildkite 中存在：.pipeline_gen_v2
+- 文件 /tmp/1cat-vllm-v015/.buildkite/ci_config.yaml 和 ./.buildkite/ci_config.yaml 不同
+- 只在 ./.buildkite 中存在：hardware_tests
+- 文件 /tmp/1cat-vllm-v015/.buildkite/image_build/image_build.sh 和 ./.buildkite/image_build/image_build.sh 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/image_build/image_build.yaml 和 ./.buildkite/image_build/image_build.yaml 不同
+- 只在 ./.buildkite/lm-eval-harness/configs 中存在：NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.yaml
+- 只在 ./.buildkite/lm-eval-harness/configs 中存在：NVIDIA-Nemotron-3-Nano-30B-A3B-FP8.yaml
+- 文件 /tmp/1cat-vllm-v015/.buildkite/lm-eval-harness/configs/models-large-hopper.txt 和 ./.buildkite/lm-eval-harness/configs/models-large-hopper.txt 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/lm-eval-harness/configs/models-large.txt 和 ./.buildkite/lm-eval-harness/configs/models-large.txt 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/performance-benchmarks/scripts/convert-results-json-to-markdown.py 和 ./.buildkite/performance-benchmarks/scripts/convert-results-json-to-markdown.py 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/performance-benchmarks/scripts/run-performance-benchmarks.sh 和 ./.buildkite/performance-benchmarks/scripts/run-performance-benchmarks.sh 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/release-pipeline.yaml 和 ./.buildkite/release-pipeline.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/scripts/annotate-release.sh 和 ./.buildkite/scripts/annotate-release.sh 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/scripts/generate-nightly-index.py 和 ./.buildkite/scripts/generate-nightly-index.py 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/scripts/hardware_ci/run-amd-test.sh 和 ./.buildkite/scripts/hardware_ci/run-amd-test.sh 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/scripts/hardware_ci/run-hpu-test.sh 和 ./.buildkite/scripts/hardware_ci/run-hpu-test.sh 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/scripts/hardware_ci/run-xpu-test.sh 和 ./.buildkite/scripts/hardware_ci/run-xpu-test.sh 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/scripts/scheduled_integration_test/deepseek_v2_lite_ep_eplb.sh 和 ./.buildkite/scripts/scheduled_integration_test/deepseek_v2_lite_ep_eplb.sh 不同
+- 只在 ./.buildkite/scripts 中存在：upload-release-wheels-pypi.sh
+- 只在 /tmp/1cat-vllm-v015/.buildkite/scripts 中存在：upload-release-wheels.sh
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test-amd.yaml 和 ./.buildkite/test-amd.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test-pipeline.yaml 和 ./.buildkite/test-pipeline.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/attention.yaml 和 ./.buildkite/test_areas/attention.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/compile.yaml 和 ./.buildkite/test_areas/compile.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/distributed.yaml 和 ./.buildkite/test_areas/distributed.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/e2e_integration.yaml 和 ./.buildkite/test_areas/e2e_integration.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/engine.yaml 和 ./.buildkite/test_areas/engine.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/expert_parallelism.yaml 和 ./.buildkite/test_areas/expert_parallelism.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/kernels.yaml 和 ./.buildkite/test_areas/kernels.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/lm_eval.yaml 和 ./.buildkite/test_areas/lm_eval.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/lora.yaml 和 ./.buildkite/test_areas/lora.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/misc.yaml 和 ./.buildkite/test_areas/misc.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/models_basic.yaml 和 ./.buildkite/test_areas/models_basic.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/models_distributed.yaml 和 ./.buildkite/test_areas/models_distributed.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/models_multimodal.yaml 和 ./.buildkite/test_areas/models_multimodal.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/plugins.yaml 和 ./.buildkite/test_areas/plugins.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/pytorch.yaml 和 ./.buildkite/test_areas/pytorch.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/quantization.yaml 和 ./.buildkite/test_areas/quantization.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.buildkite/test_areas/weight_loading.yaml 和 ./.buildkite/test_areas/weight_loading.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/.dockerignore 和 ./.dockerignore 不同
+- 文件 /tmp/1cat-vllm-v015/.github/CODEOWNERS 和 ./.github/CODEOWNERS 不同
+- 文件 /tmp/1cat-vllm-v015/.gitignore 和 ./.gitignore 不同
+- 文件 /tmp/1cat-vllm-v015/.pre-commit-config.yaml 和 ./.pre-commit-config.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/CMakeLists.txt 和 ./CMakeLists.txt 不同
+- 只在 . 中存在：OPEN_SOURCE_SM70_GUIDE.md
+- 文件 /tmp/1cat-vllm-v015/README.md 和 ./README.md 不同
+- 只在 ./benchmarks 中存在：attention_benchmarks
+- 只在 /tmp/1cat-vllm-v015/benchmarks/kernels 中存在：benchmark_bitblas.py
+- 文件 /tmp/1cat-vllm-v015/benchmarks/kernels/benchmark_cutlass_moe_nvfp4.py 和 ./benchmarks/kernels/benchmark_cutlass_moe_nvfp4.py 不同
+- 文件 /tmp/1cat-vllm-v015/benchmarks/kernels/benchmark_lora.py 和 ./benchmarks/kernels/benchmark_lora.py 不同
+- 文件 /tmp/1cat-vllm-v015/benchmarks/kernels/benchmark_marlin.py 和 ./benchmarks/kernels/benchmark_marlin.py 不同
+- 文件 /tmp/1cat-vllm-v015/benchmarks/kernels/benchmark_moe.py 和 ./benchmarks/kernels/benchmark_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/benchmarks/kernels/benchmark_moe_permute_unpermute.py 和 ./benchmarks/kernels/benchmark_moe_permute_unpermute.py 不同
+- 文件 /tmp/1cat-vllm-v015/benchmarks/kernels/benchmark_w8a8_block_fp8.py 和 ./benchmarks/kernels/benchmark_w8a8_block_fp8.py 不同
+- 文件 /tmp/1cat-vllm-v015/benchmarks/kernels/cpu/benchmark_cpu_attn.py 和 ./benchmarks/kernels/cpu/benchmark_cpu_attn.py 不同
+- 文件 /tmp/1cat-vllm-v015/benchmarks/kernels/cpu/benchmark_cpu_fused_moe.py 和 ./benchmarks/kernels/cpu/benchmark_cpu_fused_moe.py 不同
+- 只在 /tmp/1cat-vllm-v015/benchmarks/multi_turn 中存在：generate_multi_turn.json
+- 只在 /tmp/1cat-vllm-v015/benchmarks 中存在：structured_schemas
+- 文件 /tmp/1cat-vllm-v015/cmake/cpu_extension.cmake 和 ./cmake/cpu_extension.cmake 不同
+- 文件 /tmp/1cat-vllm-v015/cmake/external_projects/vllm_flash_attn.cmake 和 ./cmake/external_projects/vllm_flash_attn.cmake 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cache_kernels.cu 和 ./csrc/cache_kernels.cu 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/cpu_attn.cpp 和 ./csrc/cpu/cpu_attn.cpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/cpu_attn_amx.hpp 和 ./csrc/cpu/cpu_attn_amx.hpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/cpu_attn_impl.hpp 和 ./csrc/cpu/cpu_attn_impl.hpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/cpu_attn_neon.hpp 和 ./csrc/cpu/cpu_attn_neon.hpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/cpu_types_arm.hpp 和 ./csrc/cpu/cpu_types_arm.hpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/cpu_wna16.cpp 和 ./csrc/cpu/cpu_wna16.cpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/dnnl_kernels.cpp 和 ./csrc/cpu/dnnl_kernels.cpp 不同
+- 只在 ./csrc/cpu 中存在：generate_cpu_attn_dispatch.py
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/mla_decode.cpp 和 ./csrc/cpu/mla_decode.cpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/sgl-kernels/gemm.cpp 和 ./csrc/cpu/sgl-kernels/gemm.cpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/sgl-kernels/gemm_fp8.cpp 和 ./csrc/cpu/sgl-kernels/gemm_fp8.cpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/sgl-kernels/gemm_int8.cpp 和 ./csrc/cpu/sgl-kernels/gemm_int8.cpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/sgl-kernels/moe.cpp 和 ./csrc/cpu/sgl-kernels/moe.cpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/sgl-kernels/moe_int8.cpp 和 ./csrc/cpu/sgl-kernels/moe_int8.cpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/shm.cpp 和 ./csrc/cpu/shm.cpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/torch_bindings.cpp 和 ./csrc/cpu/torch_bindings.cpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cpu/utils.hpp 和 ./csrc/cpu/utils.hpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cumem_allocator.cpp 和 ./csrc/cumem_allocator.cpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/cutlass_extensions/common.hpp 和 ./csrc/cutlass_extensions/common.hpp 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/moe/marlin_moe_wna16/ops.cu 和 ./csrc/moe/marlin_moe_wna16/ops.cu 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/moe/moe_permute_unpermute_op.cu 和 ./csrc/moe/moe_permute_unpermute_op.cu 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.cu 和 ./csrc/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.cu 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.h 和 ./csrc/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.h 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.inl 和 ./csrc/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.inl 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/ops.h 和 ./csrc/ops.h 不同
+- 只在 ./csrc/quantization/awq 中存在：awq_sm70_gemm.cu
+- 文件 /tmp/1cat-vllm-v015/csrc/quantization/awq/gemm_kernels.cu 和 ./csrc/quantization/awq/gemm_kernels.cu 不同
+- 只在 ./csrc/quantization/awq 中存在：tm_registry_sm70.cu
+- 文件 /tmp/1cat-vllm-v015/csrc/quantization/machete/generate.py 和 ./csrc/quantization/machete/generate.py 不同
+- 只在 /tmp/1cat-vllm-v015/csrc/quantization/marlin 中存在：sparse
+- 文件 /tmp/1cat-vllm-v015/csrc/quantization/w8a8/cutlass/c3x/scaled_mm.cuh 和 ./csrc/quantization/w8a8/cutlass/c3x/scaled_mm.cuh 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm100_fp8_dispatch.cuh 和 ./csrc/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm100_fp8_dispatch.cuh 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/quantization/w8a8/cutlass/c3x/scaled_mm_sm100_fp8_dispatch.cuh 和 ./csrc/quantization/w8a8/cutlass/c3x/scaled_mm_sm100_fp8_dispatch.cuh 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/quantization/w8a8/cutlass/scaled_mm_c2x.cuh 和 ./csrc/quantization/w8a8/cutlass/scaled_mm_c2x.cuh 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/quantization/w8a8/cutlass/scaled_mm_c2x_sm89_fp8_dispatch.cuh 和 ./csrc/quantization/w8a8/cutlass/scaled_mm_c2x_sm89_fp8_dispatch.cuh 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/quantization/w8a8/cutlass/scaled_mm_c2x_sm89_int8_dispatch.cuh 和 ./csrc/quantization/w8a8/cutlass/scaled_mm_c2x_sm89_int8_dispatch.cuh 不同
+- 文件 /tmp/1cat-vllm-v015/csrc/torch_bindings.cpp 和 ./csrc/torch_bindings.cpp 不同
+- 文件 /tmp/1cat-vllm-v015/docker/Dockerfile 和 ./docker/Dockerfile 不同
+- 文件 /tmp/1cat-vllm-v015/docker/Dockerfile.cpu 和 ./docker/Dockerfile.cpu 不同
+- 文件 /tmp/1cat-vllm-v015/docker/Dockerfile.nightly_torch 和 ./docker/Dockerfile.nightly_torch 不同
+- 文件 /tmp/1cat-vllm-v015/docker/Dockerfile.rocm 和 ./docker/Dockerfile.rocm 不同
+- 文件 /tmp/1cat-vllm-v015/docker/Dockerfile.s390x 和 ./docker/Dockerfile.s390x 不同
+- 只在 ./docker 中存在：Dockerfile.sm70-wheel
+- 文件 /tmp/1cat-vllm-v015/docker/Dockerfile.xpu 和 ./docker/Dockerfile.xpu 不同
+- 只在 ./docker 中存在：entrypoint.sm70.sh
+- 文件 /tmp/1cat-vllm-v015/docker/versions.json 和 ./docker/versions.json 不同
+- 文件 /tmp/1cat-vllm-v015/docs/benchmarking/cli.md 和 ./docs/benchmarking/cli.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/benchmarking/sweeps.md 和 ./docs/benchmarking/sweeps.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/configuration/optimization.md 和 ./docs/configuration/optimization.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/contributing/model/basic.md 和 ./docs/contributing/model/basic.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/contributing/model/multimodal.md 和 ./docs/contributing/model/multimodal.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/contributing/model/transcription.md 和 ./docs/contributing/model/transcription.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/deployment/k8s.md 和 ./docs/deployment/k8s.md 不同
+- 只在 ./docs/design 中存在：attention_backends.md
+- 文件 /tmp/1cat-vllm-v015/docs/design/custom_op.md 和 ./docs/design/custom_op.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/design/debug_vllm_compile.md 和 ./docs/design/debug_vllm_compile.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/design/lora_resolver_plugins.md 和 ./docs/design/lora_resolver_plugins.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/design/moe_kernel_features.md 和 ./docs/design/moe_kernel_features.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/design/plugin_system.md 和 ./docs/design/plugin_system.md 不同
+- 只在 ./docs/design 中存在：upstream_sync.md
+- 文件 /tmp/1cat-vllm-v015/docs/examples/README.md 和 ./docs/examples/README.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/features/README.md 和 ./docs/features/README.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/features/batch_invariance.md 和 ./docs/features/batch_invariance.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/features/disagg_prefill.md 和 ./docs/features/disagg_prefill.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/features/lora.md 和 ./docs/features/lora.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/features/mooncake_connector_usage.md 和 ./docs/features/mooncake_connector_usage.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/features/nixl_connector_usage.md 和 ./docs/features/nixl_connector_usage.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/features/quantization/README.md 和 ./docs/features/quantization/README.md 不同
+- 只在 /tmp/1cat-vllm-v015/docs/features/quantization 中存在：bitblas.md
+- 文件 /tmp/1cat-vllm-v015/docs/features/quantization/gguf.md 和 ./docs/features/quantization/gguf.md 不同
+- 只在 ./docs/features/quantization 中存在：llm_compressor.md
+- 只在 ./docs/features 中存在：spec_decode
+- 只在 /tmp/1cat-vllm-v015/docs/features 中存在：spec_decode.md
+- 文件 /tmp/1cat-vllm-v015/docs/getting_started/installation/cpu.arm.inc.md 和 ./docs/getting_started/installation/cpu.arm.inc.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/getting_started/installation/cpu.x86.inc.md 和 ./docs/getting_started/installation/cpu.x86.inc.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/getting_started/installation/gpu.rocm.inc.md 和 ./docs/getting_started/installation/gpu.rocm.inc.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/mkdocs/hooks/generate_argparse.py 和 ./docs/mkdocs/hooks/generate_argparse.py 不同
+- 文件 /tmp/1cat-vllm-v015/docs/models/pooling_models.md 和 ./docs/models/pooling_models.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/models/supported_models.md 和 ./docs/models/supported_models.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/serving/context_parallel_deployment.md 和 ./docs/serving/context_parallel_deployment.md 不同
+- 文件 /tmp/1cat-vllm-v015/docs/serving/openai_compatible_server.md 和 ./docs/serving/openai_compatible_server.md 不同
+- 只在 ./docs 中存在：superpowers
+- 只在 ./docs 中存在：upstream-sync
+- 文件 /tmp/1cat-vllm-v015/docs/usage/security.md 和 ./docs/usage/security.md 不同
+- 只在 ./docs 中存在：微信图片_20260321113510_18_9.png
+- 只在 ./docs 中存在：微信图片_20260321113511_19_9.png
+- 只在 ./docs 中存在：微信图片_20260321115313_20_9.png
+- 文件 /tmp/1cat-vllm-v015/examples/offline_inference/audio_language.py 和 ./examples/offline_inference/audio_language.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/offline_inference/automatic_prefix_caching.py 和 ./examples/offline_inference/automatic_prefix_caching.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/offline_inference/basic/README.md 和 ./examples/offline_inference/basic/README.md 不同
+- 文件 /tmp/1cat-vllm-v015/examples/offline_inference/prompt_embed_inference.py 和 ./examples/offline_inference/prompt_embed_inference.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/offline_inference/qwen3_omni/only_thinker.py 和 ./examples/offline_inference/qwen3_omni/only_thinker.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/offline_inference/rlhf_colocate.py 和 ./examples/offline_inference/rlhf_colocate.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/offline_inference/spec_decode.py 和 ./examples/offline_inference/spec_decode.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/offline_inference/vision_language.py 和 ./examples/offline_inference/vision_language.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/offline_inference/vision_language_multi_image.py 和 ./examples/offline_inference/vision_language_multi_image.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/online_serving/disaggregated_serving/README.md 和 ./examples/online_serving/disaggregated_serving/README.md 不同
+- 只在 ./examples/online_serving/disaggregated_serving 中存在：mooncake_connector
+- 只在 ./examples/online_serving 中存在：openai_realtime_client.py
+- 只在 ./examples/online_serving 中存在：openai_realtime_microphone_client.py
+- 文件 /tmp/1cat-vllm-v015/examples/online_serving/prompt_embed_inference_with_openai_client.py 和 ./examples/online_serving/prompt_embed_inference_with_openai_client.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/online_serving/token_generation_client.py 和 ./examples/online_serving/token_generation_client.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/others/lmcache/disagg_prefill_lmcache_v1/disagg_proxy_server.py 和 ./examples/others/lmcache/disagg_prefill_lmcache_v1/disagg_proxy_server.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/others/logging_configuration.md 和 ./examples/others/logging_configuration.md 不同
+- 文件 /tmp/1cat-vllm-v015/examples/pooling/embed/embedding_requests_base64_online.py 和 ./examples/pooling/embed/embedding_requests_base64_online.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/pooling/embed/embedding_requests_bytes_online.py 和 ./examples/pooling/embed/embedding_requests_bytes_online.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/pooling/embed/vision_embedding_offline.py 和 ./examples/pooling/embed/vision_embedding_offline.py 不同
+- 只在 ./examples/pooling/score 中存在：colbert_rerank_online.py
+- 文件 /tmp/1cat-vllm-v015/examples/pooling/score/vision_rerank_api_online.py 和 ./examples/pooling/score/vision_rerank_api_online.py 不同
+- 文件 /tmp/1cat-vllm-v015/examples/pooling/score/vision_score_api_online.py 和 ./examples/pooling/score/vision_score_api_online.py 不同
+- 文件 /tmp/1cat-vllm-v015/mkdocs.yaml 和 ./mkdocs.yaml 不同
+- 文件 /tmp/1cat-vllm-v015/pyproject.toml 和 ./pyproject.toml 不同
+- 文件 /tmp/1cat-vllm-v015/requirements/common.txt 和 ./requirements/common.txt 不同
+- 文件 /tmp/1cat-vllm-v015/requirements/cuda.txt 和 ./requirements/cuda.txt 不同
+- 文件 /tmp/1cat-vllm-v015/requirements/kv_connectors.txt 和 ./requirements/kv_connectors.txt 不同
+- 文件 /tmp/1cat-vllm-v015/requirements/nightly_torch_test.txt 和 ./requirements/nightly_torch_test.txt 不同
+- 文件 /tmp/1cat-vllm-v015/requirements/rocm-test.txt 和 ./requirements/rocm-test.txt 不同
+- 文件 /tmp/1cat-vllm-v015/requirements/rocm.txt 和 ./requirements/rocm.txt 不同
+- 文件 /tmp/1cat-vllm-v015/requirements/test.in 和 ./requirements/test.in 不同
+- 文件 /tmp/1cat-vllm-v015/requirements/test.txt 和 ./requirements/test.txt 不同
+- 文件 /tmp/1cat-vllm-v015/requirements/xpu.txt 和 ./requirements/xpu.txt 不同
+- 文件 /tmp/1cat-vllm-v015/setup.py 和 ./setup.py 不同
+- 只在 ./tests 中存在：__pycache__
+- 只在 /tmp/1cat-vllm-v015/tests/compile/distributed 中存在：test_fusions_e2e.py
+- 文件 /tmp/1cat-vllm-v015/tests/compile/fullgraph/test_full_graph.py 和 ./tests/compile/fullgraph/test_full_graph.py 不同
+- 只在 /tmp/1cat-vllm-v015/tests/compile 中存在：fusion_test_utils.py
+- 只在 ./tests/compile 中存在：fusions_e2e
+- 只在 ./tests/compile 中存在：test_cold_start.py
+- 只在 ./tests/compile 中存在：test_fuse_act_padding.py
+- 文件 /tmp/1cat-vllm-v015/tests/compile/test_fusion.py 和 ./tests/compile/test_fusion.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/compile/test_fusion_attn.py 和 ./tests/compile/test_fusion_attn.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/compile/test_graph_partition.py 和 ./tests/compile/test_graph_partition.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/compile/test_qk_norm_rope_fusion.py 和 ./tests/compile/test_qk_norm_rope_fusion.py 不同
+- 只在 ./tests/compile 中存在：test_rotary_embedding_compile.py
+- 只在 ./tests/compile 中存在：test_structured_logging.py
+- 文件 /tmp/1cat-vllm-v015/tests/config/base_model_arch_groundtruth.json 和 ./tests/config/base_model_arch_groundtruth.json 不同
+- 文件 /tmp/1cat-vllm-v015/tests/config/test_config_generation.py 和 ./tests/config/test_config_generation.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/config/test_model_arch_config.py 和 ./tests/config/test_model_arch_config.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/conftest.py 和 ./tests/conftest.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/distributed/test_shm_storage.py 和 ./tests/distributed/test_shm_storage.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/distributed/test_utils.py 和 ./tests/distributed/test_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/engine/test_arg_utils.py 和 ./tests/engine/test_arg_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/engine/test_short_mm_context.py 和 ./tests/engine/test_short_mm_context.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/instrumentator/test_metrics.py 和 ./tests/entrypoints/instrumentator/test_metrics.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/llm/test_chat.py 和 ./tests/entrypoints/llm/test_chat.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/offline_mode/test_offline_mode.py 和 ./tests/entrypoints/offline_mode/test_offline_mode.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/responses/test_mcp_tools.py 和 ./tests/entrypoints/openai/responses/test_mcp_tools.py 不同
+- 只在 ./tests/entrypoints/openai/responses 中存在：test_sampling_params.py
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/responses/test_simple.py 和 ./tests/entrypoints/openai/responses/test_simple.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/test_chat_error.py 和 ./tests/entrypoints/openai/test_chat_error.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/test_completion_error.py 和 ./tests/entrypoints/openai/test_completion_error.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/test_completion_with_prompt_embeds.py 和 ./tests/entrypoints/openai/test_completion_with_prompt_embeds.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/test_embedding_shape_validation.py 和 ./tests/entrypoints/openai/test_embedding_shape_validation.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/test_lora_resolvers.py 和 ./tests/entrypoints/openai/test_lora_resolvers.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/test_prompt_validation.py 和 ./tests/entrypoints/openai/test_prompt_validation.py 不同
+- 只在 ./tests/entrypoints/openai 中存在：test_realtime_validation.py
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/test_return_tokens_as_ids.py 和 ./tests/entrypoints/openai/test_return_tokens_as_ids.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/test_serving_chat.py 和 ./tests/entrypoints/openai/test_serving_chat.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/test_serving_tokens.py 和 ./tests/entrypoints/openai/test_serving_tokens.py 不同
+- 只在 /tmp/1cat-vllm-v015/tests/entrypoints/openai 中存在：test_sparse_tensor_validation.py
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/test_tokenization.py 和 ./tests/entrypoints/openai/test_tokenization.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/test_transcription_validation.py 和 ./tests/entrypoints/openai/test_transcription_validation.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/test_transcription_validation_whisper.py 和 ./tests/entrypoints/openai/test_transcription_validation_whisper.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/test_translation_validation.py 和 ./tests/entrypoints/openai/test_translation_validation.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/tool_parsers/test_llama4_pythonic_tool_parser.py 和 ./tests/entrypoints/openai/tool_parsers/test_llama4_pythonic_tool_parser.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/openai/tool_parsers/test_openai_tool_parser.py 和 ./tests/entrypoints/openai/tool_parsers/test_openai_tool_parser.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/pooling/basic/test_truncation.py 和 ./tests/entrypoints/pooling/basic/test_truncation.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/pooling/classify/test_online.py 和 ./tests/entrypoints/pooling/classify/test_online.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/pooling/classify/test_online_vision.py 和 ./tests/entrypoints/pooling/classify/test_online_vision.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/pooling/embed/test_online.py 和 ./tests/entrypoints/pooling/embed/test_online.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/pooling/pooling/test_online.py 和 ./tests/entrypoints/pooling/pooling/test_online.py 不同
+- 只在 ./tests/entrypoints/pooling/score 中存在：test_online_colbert.py
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/pooling/score/test_online_score.py 和 ./tests/entrypoints/pooling/score/test_online_score.py 不同
+- 只在 ./tests/entrypoints/pooling/score 中存在：test_online_score_vision.py
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/test_chat_utils.py 和 ./tests/entrypoints/test_chat_utils.py 不同
+- 只在 /tmp/1cat-vllm-v015/tests/entrypoints 中存在：test_renderer.py
+- 文件 /tmp/1cat-vllm-v015/tests/entrypoints/test_utils.py 和 ./tests/entrypoints/test_utils.py 不同
+- 只在 ./tests/evals/gsm8k/configs 中存在：DeepSeek-V3.2-DP.yaml
+- 只在 ./tests/evals/gsm8k/configs 中存在：DeepSeek-V3.2-TP.yaml
+- 文件 /tmp/1cat-vllm-v015/tests/evals/gsm8k/configs/models-h200.txt 和 ./tests/evals/gsm8k/configs/models-h200.txt 不同
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/attention/test_attention.py 和 ./tests/kernels/attention/test_attention.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/attention/test_cpu_attn.py 和 ./tests/kernels/attention/test_cpu_attn.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/attention/test_mha_attn.py 和 ./tests/kernels/attention/test_mha_attn.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/core/test_activation.py 和 ./tests/kernels/core/test_activation.py 不同
+- 只在 ./tests/kernels/helion 中存在：test_config_manager.py
+- 只在 ./tests/kernels/helion 中存在：test_register.py
+- 只在 ./tests/kernels/helion 中存在：test_utils.py
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/moe/modular_kernel_tools/common.py 和 ./tests/kernels/moe/modular_kernel_tools/common.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/moe/modular_kernel_tools/mk_objects.py 和 ./tests/kernels/moe/modular_kernel_tools/mk_objects.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/moe/test_flashinfer.py 和 ./tests/kernels/moe/test_flashinfer.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/moe/test_flashinfer_moe.py 和 ./tests/kernels/moe/test_flashinfer_moe.py 不同
+- 只在 ./tests/kernels/moe 中存在：test_marlin_vs_trtllm_mxint4.py
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/moe/test_moe.py 和 ./tests/kernels/moe/test_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/moe/test_nvfp4_moe.py 和 ./tests/kernels/moe/test_nvfp4_moe.py 不同
+- 只在 ./tests/kernels/moe 中存在：test_shared_fused_moe_routed_transform.py
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py 和 ./tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/quantization/test_fp8_quant.py 和 ./tests/kernels/quantization/test_fp8_quant.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/quantization/test_marlin_gemm.py 和 ./tests/kernels/quantization/test_marlin_gemm.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/kernels/quantization/test_rocm_skinny_gemms.py 和 ./tests/kernels/quantization/test_rocm_skinny_gemms.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/lora/test_fused_moe_lora_kernel.py 和 ./tests/lora/test_fused_moe_lora_kernel.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/lora/test_punica_ops.py 和 ./tests/lora/test_punica_ops.py 不同
+- 只在 ./tests/model_executor/model_loader 中存在：test_reload.py
+- 文件 /tmp/1cat-vllm-v015/tests/model_executor/model_loader/test_sharded_state_loader.py 和 ./tests/model_executor/model_loader/test_sharded_state_loader.py 不同
+- 只在 ./tests/model_executor 中存在：test_attention_fp8_kv_cache.py
+- 文件 /tmp/1cat-vllm-v015/tests/model_executor/test_qwen3_omni.py 和 ./tests/model_executor/test_qwen3_omni.py 不同
+- 只在 ./tests/model_executor 中存在：test_routed_experts_capture.py
+- 只在 ./tests/models 中存在：__pycache__
+- 只在 ./tests/models/language/pooling 中存在：test_colbert.py
+- 文件 /tmp/1cat-vllm-v015/tests/models/language/pooling/test_embedding.py 和 ./tests/models/language/pooling/test_embedding.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/language/pooling/test_mm_classifier_conversion.py 和 ./tests/models/language/pooling/test_mm_classifier_conversion.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/language/pooling/test_token_classification.py 和 ./tests/models/language/pooling/test_token_classification.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/language/pooling/test_truncation_control.py 和 ./tests/models/language/pooling/test_truncation_control.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/language/pooling_mteb_test/mteb_embed_utils.py 和 ./tests/models/language/pooling_mteb_test/mteb_embed_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/language/pooling_mteb_test/mteb_score_utils.py 和 ./tests/models/language/pooling_mteb_test/mteb_score_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/generation/test_common.py 和 ./tests/models/multimodal/generation/test_common.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/generation/test_ultravox.py 和 ./tests/models/multimodal/generation/test_ultravox.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/generation/test_vit_backend_functionality.py 和 ./tests/models/multimodal/generation/test_vit_backend_functionality.py 不同
+- 只在 ./tests/models/multimodal/generation 中存在：test_voxtral_realtime.py
+- 只在 /tmp/1cat-vllm-v015/tests/models/multimodal/generation 中存在：test_voxtral_streaming.py
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_common.py 和 ./tests/models/multimodal/processing/test_common.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_gemma3.py 和 ./tests/models/multimodal/processing/test_gemma3.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_glm4_1v.py 和 ./tests/models/multimodal/processing/test_glm4_1v.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_h2ovl.py 和 ./tests/models/multimodal/processing/test_h2ovl.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_idefics3.py 和 ./tests/models/multimodal/processing/test_idefics3.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_internvl.py 和 ./tests/models/multimodal/processing/test_internvl.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_llama4.py 和 ./tests/models/multimodal/processing/test_llama4.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_llava_next.py 和 ./tests/models/multimodal/processing/test_llava_next.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_llava_onevision.py 和 ./tests/models/multimodal/processing/test_llava_onevision.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_minimax_vl_01.py 和 ./tests/models/multimodal/processing/test_minimax_vl_01.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_nemotron_vl.py 和 ./tests/models/multimodal/processing/test_nemotron_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_phi3v.py 和 ./tests/models/multimodal/processing/test_phi3v.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_phi4mm.py 和 ./tests/models/multimodal/processing/test_phi4mm.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_qwen2_vl.py 和 ./tests/models/multimodal/processing/test_qwen2_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_qwen3_omni.py 和 ./tests/models/multimodal/processing/test_qwen3_omni.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_smolvlm.py 和 ./tests/models/multimodal/processing/test_smolvlm.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_tensor_schema.py 和 ./tests/models/multimodal/processing/test_tensor_schema.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/processing/test_transformers.py 和 ./tests/models/multimodal/processing/test_transformers.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/multimodal/test_mapping.py 和 ./tests/models/multimodal/test_mapping.py 不同
+- 只在 /tmp/1cat-vllm-v015/tests/models/quantization 中存在：test_bitblas.py
+- 只在 /tmp/1cat-vllm-v015/tests/models/quantization 中存在：test_gptq_bitblas.py
+- 只在 /tmp/1cat-vllm-v015/tests/models/quantization 中存在：test_gptq_marlin_24.py
+- 文件 /tmp/1cat-vllm-v015/tests/models/registry.py 和 ./tests/models/registry.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/models/test_transformers.py 和 ./tests/models/test_transformers.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/multimodal/test_cache.py 和 ./tests/multimodal/test_cache.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/multimodal/test_processing.py 和 ./tests/multimodal/test_processing.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/multimodal/test_utils.py 和 ./tests/multimodal/test_utils.py 不同
+- 只在 ./tests/plugins/lora_resolvers 中存在：test_hf_hub_resolver.py
+- 文件 /tmp/1cat-vllm-v015/tests/plugins/vllm_add_dummy_model/vllm_add_dummy_model/my_gemma_embedding.py 和 ./tests/plugins/vllm_add_dummy_model/vllm_add_dummy_model/my_gemma_embedding.py 不同
+- 只在 ./tests/quantization 中存在：test_awq_sm70.py
+- 文件 /tmp/1cat-vllm-v015/tests/quantization/test_compressed_tensors.py 和 ./tests/quantization/test_compressed_tensors.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/quantization/test_fp8.py 和 ./tests/quantization/test_fp8.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/quantization/test_torchao.py 和 ./tests/quantization/test_torchao.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/reasoning/test_holo2_reasoning_parser.py 和 ./tests/reasoning/test_holo2_reasoning_parser.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/reasoning/utils.py 和 ./tests/reasoning/utils.py 不同
+- 只在 ./tests/renderers 中存在：test_completions.py
+- 文件 /tmp/1cat-vllm-v015/tests/renderers/test_mistral.py 和 ./tests/renderers/test_mistral.py 不同
+- 只在 ./tests/renderers 中存在：test_sparse_tensor_validation.py
+- 只在 ./tests 中存在：test_access_log_filter.py
+- 文件 /tmp/1cat-vllm-v015/tests/test_config.py 和 ./tests/test_config.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/test_inputs.py 和 ./tests/test_inputs.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/tool_parsers/test_deepseekv31_tool_parser.py 和 ./tests/tool_parsers/test_deepseekv31_tool_parser.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/tool_parsers/test_glm4_moe_tool_parser.py 和 ./tests/tool_parsers/test_glm4_moe_tool_parser.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/tools/test_config_validator.py 和 ./tests/tools/test_config_validator.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/transformers_utils/test_repo_utils.py 和 ./tests/transformers_utils/test_repo_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/transformers_utils/test_utils.py 和 ./tests/transformers_utils/test_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/utils.py 和 ./tests/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/utils_/test_argparse_utils.py 和 ./tests/utils_/test_argparse_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/utils_/test_serial_utils.py 和 ./tests/utils_/test_serial_utils.py 不同
+- 只在 ./tests/v1 中存在：__pycache__
+- 文件 /tmp/1cat-vllm-v015/tests/v1/attention/test_mla_backends.py 和 ./tests/v1/attention/test_mla_backends.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/attention/test_sparse_mla_backends.py 和 ./tests/v1/attention/test_sparse_mla_backends.py 不同
+- 只在 ./tests/v1/attention 中存在：test_triton_attn_fp8_dtype.py
+- 只在 ./tests/v1/attention 中存在：test_triton_attn_sm70_tuning.py
+- 文件 /tmp/1cat-vllm-v015/tests/v1/core/test_encoder_cache_manager.py 和 ./tests/v1/core/test_encoder_cache_manager.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/core/test_kv_cache_utils.py 和 ./tests/v1/core/test_kv_cache_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/core/test_prefix_caching.py 和 ./tests/v1/core/test_prefix_caching.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/core/test_priority_scheduler_random.py 和 ./tests/v1/core/test_priority_scheduler_random.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/core/test_scheduler.py 和 ./tests/v1/core/test_scheduler.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/core/utils.py 和 ./tests/v1/core/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/cudagraph/test_cudagraph_dispatch.py 和 ./tests/v1/cudagraph/test_cudagraph_dispatch.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/determinism/test_batch_invariance.py 和 ./tests/v1/determinism/test_batch_invariance.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/determinism/utils.py 和 ./tests/v1/determinism/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/e2e/test_spec_decode.py 和 ./tests/v1/e2e/test_spec_decode.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/e2e/test_streaming_input.py 和 ./tests/v1/e2e/test_streaming_input.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/engine/test_output_processor.py 和 ./tests/v1/engine/test_output_processor.py 不同
+- 只在 ./tests/v1/entrypoints 中存在：__pycache__
+- 文件 /tmp/1cat-vllm-v015/tests/v1/kv_connector/unit/test_multi_connector.py 和 ./tests/v1/kv_connector/unit/test_multi_connector.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/kv_connector/unit/test_offloading_connector.py 和 ./tests/v1/kv_connector/unit/test_offloading_connector.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/kv_offload/test_cpu_gpu.py 和 ./tests/v1/kv_offload/test_cpu_gpu.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/metrics/test_stats.py 和 ./tests/v1/metrics/test_stats.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/spec_decode/test_acceptance_length.py 和 ./tests/v1/spec_decode/test_acceptance_length.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/streaming_input/test_async_llm_streaming.py 和 ./tests/v1/streaming_input/test_async_llm_streaming.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/streaming_input/test_gpu_model_runner_streaming.py 和 ./tests/v1/streaming_input/test_gpu_model_runner_streaming.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/streaming_input/test_scheduler_streaming.py 和 ./tests/v1/streaming_input/test_scheduler_streaming.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/structured_output/test_backend_guidance.py 和 ./tests/v1/structured_output/test_backend_guidance.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/test_serial_utils.py 和 ./tests/v1/test_serial_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/worker/test_gpu_model_runner.py 和 ./tests/v1/worker/test_gpu_model_runner.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/v1/worker/test_utils.py 和 ./tests/v1/worker/test_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/tests/weight_loading/models.txt 和 ./tests/weight_loading/models.txt 不同
+- 只在 ./tools/pre_commit 中存在：generate_attention_backend_docs.py
+- 文件 /tmp/1cat-vllm-v015/tools/pre_commit/mypy.py 和 ./tools/pre_commit/mypy.py 不同
+- 文件 /tmp/1cat-vllm-v015/tools/pre_commit/validate_config.py 和 ./tools/pre_commit/validate_config.py 不同
+- 只在 ./vllm 中存在：__pycache__
+- 文件 /tmp/1cat-vllm-v015/vllm/_aiter_ops.py 和 ./vllm/_aiter_ops.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/_custom_ops.py 和 ./vllm/_custom_ops.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/_ipex_ops.py 和 ./vllm/_ipex_ops.py 不同
+- 只在 /tmp/1cat-vllm-v015/vllm 中存在：attention
+- 文件 /tmp/1cat-vllm-v015/vllm/beam_search.py 和 ./vllm/beam_search.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/benchmarks/datasets.py 和 ./vllm/benchmarks/datasets.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/benchmarks/latency.py 和 ./vllm/benchmarks/latency.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/benchmarks/lib/endpoint_request_func.py 和 ./vllm/benchmarks/lib/endpoint_request_func.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/benchmarks/lib/utils.py 和 ./vllm/benchmarks/lib/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/benchmarks/startup.py 和 ./vllm/benchmarks/startup.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/benchmarks/sweep/server.py 和 ./vllm/benchmarks/sweep/server.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/collect_env.py 和 ./vllm/collect_env.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/compilation/backends.py 和 ./vllm/compilation/backends.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/compilation/compiler_interface.py 和 ./vllm/compilation/compiler_interface.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/compilation/decorators.py 和 ./vllm/compilation/decorators.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/compilation/fusion_attn.py 和 ./vllm/compilation/fusion_attn.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/compilation/fx_utils.py 和 ./vllm/compilation/fx_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/compilation/inductor_pass.py 和 ./vllm/compilation/inductor_pass.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/compilation/pass_manager.py 和 ./vllm/compilation/pass_manager.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/compilation/piecewise_backend.py 和 ./vllm/compilation/piecewise_backend.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/compilation/qk_norm_rope_fusion.py 和 ./vllm/compilation/qk_norm_rope_fusion.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/compilation/rocm_aiter_fusion.py 和 ./vllm/compilation/rocm_aiter_fusion.py 不同
+- 只在 /tmp/1cat-vllm-v015/vllm/compilation 中存在：torch25_custom_graph_pass.py
+- 文件 /tmp/1cat-vllm-v015/vllm/compilation/wrapper.py 和 ./vllm/compilation/wrapper.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/__init__.py 和 ./vllm/config/__init__.py 不同
+- 只在 ./vllm/config 中存在：__pycache__
+- 文件 /tmp/1cat-vllm-v015/vllm/config/attention.py 和 ./vllm/config/attention.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/cache.py 和 ./vllm/config/cache.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/compilation.py 和 ./vllm/config/compilation.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/device.py 和 ./vllm/config/device.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/ec_transfer.py 和 ./vllm/config/ec_transfer.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/kv_events.py 和 ./vllm/config/kv_events.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/kv_transfer.py 和 ./vllm/config/kv_transfer.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/load.py 和 ./vllm/config/load.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/lora.py 和 ./vllm/config/lora.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/model.py 和 ./vllm/config/model.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/multimodal.py 和 ./vllm/config/multimodal.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/observability.py 和 ./vllm/config/observability.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/parallel.py 和 ./vllm/config/parallel.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/pooler.py 和 ./vllm/config/pooler.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/profiler.py 和 ./vllm/config/profiler.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/scheduler.py 和 ./vllm/config/scheduler.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/speculative.py 和 ./vllm/config/speculative.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/speech_to_text.py 和 ./vllm/config/speech_to_text.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/structured_outputs.py 和 ./vllm/config/structured_outputs.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/utils.py 和 ./vllm/config/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/config/vllm.py 和 ./vllm/config/vllm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/device_communicators/all2all.py 和 ./vllm/distributed/device_communicators/all2all.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/device_communicators/base_device_communicator.py 和 ./vllm/distributed/device_communicators/base_device_communicator.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/device_communicators/cpu_communicator.py 和 ./vllm/distributed/device_communicators/cpu_communicator.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/device_communicators/cuda_communicator.py 和 ./vllm/distributed/device_communicators/cuda_communicator.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/device_communicators/mnnvl_compat.py 和 ./vllm/distributed/device_communicators/mnnvl_compat.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/device_communicators/pynccl_wrapper.py 和 ./vllm/distributed/device_communicators/pynccl_wrapper.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/device_communicators/xpu_communicator.py 和 ./vllm/distributed/device_communicators/xpu_communicator.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/eplb/async_worker.py 和 ./vllm/distributed/eplb/async_worker.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/eplb/eplb_state.py 和 ./vllm/distributed/eplb/eplb_state.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/eplb/rebalance_execute.py 和 ./vllm/distributed/eplb/rebalance_execute.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/factory.py 和 ./vllm/distributed/kv_transfer/kv_connector/factory.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/v1/base.py 和 ./vllm/distributed/kv_transfer/kv_connector/v1/base.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py 和 ./vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py 和 ./vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py 和 ./vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py 和 ./vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/v1/metrics.py 和 ./vllm/distributed/kv_transfer/kv_connector/v1/metrics.py 不同
+- 只在 ./vllm/distributed/kv_transfer/kv_connector/v1 中存在：mooncake
+- 只在 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/v1 中存在：mooncake_connector.py
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py 和 ./vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py 和 ./vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py 和 ./vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py 和 ./vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py 和 ./vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py 和 ./vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/kv_transfer/kv_transfer_state.py 和 ./vllm/distributed/kv_transfer/kv_transfer_state.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/parallel_state.py 和 ./vllm/distributed/parallel_state.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/distributed/utils.py 和 ./vllm/distributed/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/engine/arg_utils.py 和 ./vllm/engine/arg_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/engine/protocol.py 和 ./vllm/engine/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/anthropic/protocol.py 和 ./vllm/entrypoints/anthropic/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/chat_utils.py 和 ./vllm/entrypoints/chat_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/launcher.py 和 ./vllm/entrypoints/launcher.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/llm.py 和 ./vllm/entrypoints/llm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/api_server.py 和 ./vllm/entrypoints/openai/api_server.py 不同
+- 只在 ./vllm/entrypoints/openai 中存在：basic
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/chat_completion/protocol.py 和 ./vllm/entrypoints/openai/chat_completion/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/chat_completion/serving.py 和 ./vllm/entrypoints/openai/chat_completion/serving.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/cli_args.py 和 ./vllm/entrypoints/openai/cli_args.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/completion/protocol.py 和 ./vllm/entrypoints/openai/completion/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/completion/serving.py 和 ./vllm/entrypoints/openai/completion/serving.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/engine/protocol.py 和 ./vllm/entrypoints/openai/engine/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/engine/serving.py 和 ./vllm/entrypoints/openai/engine/serving.py 不同
+- 只在 ./vllm/entrypoints/openai 中存在：generate
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/parser/harmony_utils.py 和 ./vllm/entrypoints/openai/parser/harmony_utils.py 不同
+- 只在 ./vllm/entrypoints/openai 中存在：realtime
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/responses/context.py 和 ./vllm/entrypoints/openai/responses/context.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/responses/protocol.py 和 ./vllm/entrypoints/openai/responses/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/responses/serving.py 和 ./vllm/entrypoints/openai/responses/serving.py 不同
+- 只在 ./vllm/entrypoints/openai 中存在：server_utils.py
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/translations/api_router.py 和 ./vllm/entrypoints/openai/translations/api_router.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/openai/translations/speech_to_text.py 和 ./vllm/entrypoints/openai/translations/speech_to_text.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/pooling/__init__.py 和 ./vllm/entrypoints/pooling/__init__.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/pooling/base/protocol.py 和 ./vllm/entrypoints/pooling/base/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/pooling/classify/protocol.py 和 ./vllm/entrypoints/pooling/classify/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/pooling/classify/serving.py 和 ./vllm/entrypoints/pooling/classify/serving.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/pooling/embed/api_router.py 和 ./vllm/entrypoints/pooling/embed/api_router.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/pooling/embed/protocol.py 和 ./vllm/entrypoints/pooling/embed/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/pooling/embed/serving.py 和 ./vllm/entrypoints/pooling/embed/serving.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/pooling/pooling/protocol.py 和 ./vllm/entrypoints/pooling/pooling/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/pooling/pooling/serving.py 和 ./vllm/entrypoints/pooling/pooling/serving.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/pooling/score/protocol.py 和 ./vllm/entrypoints/pooling/score/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/pooling/score/serving.py 和 ./vllm/entrypoints/pooling/score/serving.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/pooling/score/utils.py 和 ./vllm/entrypoints/pooling/score/utils.py 不同
+- 只在 ./vllm/entrypoints/pooling 中存在：utils.py
+- 只在 /tmp/1cat-vllm-v015/vllm/entrypoints 中存在：renderer.py
+- 只在 ./vllm/entrypoints/sagemaker 中存在：api_router.py
+- 只在 /tmp/1cat-vllm-v015/vllm/entrypoints/sagemaker 中存在：routes.py
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/serve/cache/api_router.py 和 ./vllm/entrypoints/serve/cache/api_router.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/serve/disagg/protocol.py 和 ./vllm/entrypoints/serve/disagg/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/serve/disagg/serving.py 和 ./vllm/entrypoints/serve/disagg/serving.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/serve/instrumentator/server_info.py 和 ./vllm/entrypoints/serve/instrumentator/server_info.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/serve/tokenize/protocol.py 和 ./vllm/entrypoints/serve/tokenize/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/serve/tokenize/serving.py 和 ./vllm/entrypoints/serve/tokenize/serving.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/entrypoints/utils.py 和 ./vllm/entrypoints/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/env_override.py 和 ./vllm/env_override.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/envs.py 和 ./vllm/envs.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/forward_context.py 和 ./vllm/forward_context.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/inputs/data.py 和 ./vllm/inputs/data.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/inputs/parse.py 和 ./vllm/inputs/parse.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/inputs/preprocess.py 和 ./vllm/inputs/preprocess.py 不同
+- 只在 ./vllm 中存在：kernels
+- 文件 /tmp/1cat-vllm-v015/vllm/logger.py 和 ./vllm/logger.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/logging_utils/__init__.py 和 ./vllm/logging_utils/__init__.py 不同
+- 只在 ./vllm/logging_utils 中存在：__pycache__
+- 只在 ./vllm/logging_utils 中存在：access_log_filter.py
+- 文件 /tmp/1cat-vllm-v015/vllm/logprobs.py 和 ./vllm/logprobs.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/lora/layers/fused_moe.py 和 ./vllm/lora/layers/fused_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/lora/lora_model.py 和 ./vllm/lora/lora_model.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/lora/lora_weights.py 和 ./vllm/lora/lora_weights.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/lora/model_manager.py 和 ./vllm/lora/model_manager.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/lora/ops/triton_ops/fused_moe_lora_op.py 和 ./vllm/lora/ops/triton_ops/fused_moe_lora_op.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/lora/ops/triton_ops/lora_expand_op.py 和 ./vllm/lora/ops/triton_ops/lora_expand_op.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/lora/ops/triton_ops/lora_kernel_metadata.py 和 ./vllm/lora/ops/triton_ops/lora_kernel_metadata.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/lora/ops/triton_ops/lora_shrink_op.py 和 ./vllm/lora/ops/triton_ops/lora_shrink_op.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/lora/punica_wrapper/punica_base.py 和 ./vllm/lora/punica_wrapper/punica_base.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/lora/punica_wrapper/punica_gpu.py 和 ./vllm/lora/punica_wrapper/punica_gpu.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/lora/utils.py 和 ./vllm/lora/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/lora/worker_manager.py 和 ./vllm/lora/worker_manager.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/activation.py 和 ./vllm/model_executor/layers/activation.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/attention/__init__.py 和 ./vllm/model_executor/layers/attention/__init__.py 不同
+- 只在 ./vllm/model_executor/layers/attention 中存在：attention.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/attention/chunked_local_attention.py 和 ./vllm/model_executor/layers/attention/chunked_local_attention.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/attention/cross_attention.py 和 ./vllm/model_executor/layers/attention/cross_attention.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/attention/encoder_only_attention.py 和 ./vllm/model_executor/layers/attention/encoder_only_attention.py 不同
+- 只在 ./vllm/model_executor/layers/attention 中存在：kv_transfer_utils.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/attention/mla_attention.py 和 ./vllm/model_executor/layers/attention/mla_attention.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/attention/mm_encoder_attention.py 和 ./vllm/model_executor/layers/attention/mm_encoder_attention.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/attention/static_sink_attention.py 和 ./vllm/model_executor/layers/attention/static_sink_attention.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/batch_invariant.py 和 ./vllm/model_executor/layers/batch_invariant.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fla/ops/chunk.py 和 ./vllm/model_executor/layers/fla/ops/chunk.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fla/ops/chunk_delta_h.py 和 ./vllm/model_executor/layers/fla/ops/chunk_delta_h.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fla/ops/chunk_o.py 和 ./vllm/model_executor/layers/fla/ops/chunk_o.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py 和 ./vllm/model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fla/ops/cumsum.py 和 ./vllm/model_executor/layers/fla/ops/cumsum.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fla/ops/fused_recurrent.py 和 ./vllm/model_executor/layers/fla/ops/fused_recurrent.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fla/ops/kda.py 和 ./vllm/model_executor/layers/fla/ops/kda.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fla/ops/l2norm.py 和 ./vllm/model_executor/layers/fla/ops/l2norm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fla/ops/solve_tril.py 和 ./vllm/model_executor/layers/fla/ops/solve_tril.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fla/ops/utils.py 和 ./vllm/model_executor/layers/fla/ops/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fla/ops/wy_fast.py 和 ./vllm/model_executor/layers/fla/ops/wy_fast.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/__init__.py 和 ./vllm/model_executor/layers/fused_moe/__init__.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/all2all_utils.py 和 ./vllm/model_executor/layers/fused_moe/all2all_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/config.py 和 ./vllm/model_executor/layers/fused_moe/config.py 不同
+- 只在 ./vllm/model_executor/layers/fused_moe/configs 中存在：E=128,N=1856,device_name=NVIDIA_B200.json
+- 只在 ./vllm/model_executor/layers/fused_moe/configs 中存在：E=128,N=512,device_name=NVIDIA_B200,dtype=fp8_w8a8.json
+- 只在 ./vllm/model_executor/layers/fused_moe/configs 中存在：E=128,N=512,device_name=NVIDIA_B200.json
+- 只在 ./vllm/model_executor/layers/fused_moe/configs 中存在：E=128,N=512,device_name=NVIDIA_GB200,dtype=fp8_w8a8.json
+- 只在 ./vllm/model_executor/layers/fused_moe/configs 中存在：E=128,N=512,device_name=NVIDIA_H200,dtype=fp8_w8a8,block_shape=[128,128].json
+- 只在 ./vllm/model_executor/layers/fused_moe/configs 中存在：E=128,N=512,device_name=NVIDIA_H200.json
+- 只在 ./vllm/model_executor/layers/fused_moe/configs 中存在：E=16,N=4096,device_name=NVIDIA_B200,dtype=fp8_w8a8,block_shape=[128,128].json
+- 只在 ./vllm/model_executor/layers/fused_moe/configs 中存在：E=16,N=4096,device_name=NVIDIA_H200,dtype=fp8_w8a8,block_shape=[128,128].json
+- 只在 ./vllm/model_executor/layers/fused_moe/configs 中存在：E=512,N=1344,device_name=NVIDIA_B200.json
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/cutlass_moe.py 和 ./vllm/model_executor/layers/fused_moe/cutlass_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py 和 ./vllm/model_executor/layers/fused_moe/deep_gemm_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py 和 ./vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/deepep_ll_prepare_finalize.py 和 ./vllm/model_executor/layers/fused_moe/deepep_ll_prepare_finalize.py 不同
+- 只在 ./vllm/model_executor/layers/fused_moe 中存在：flashinfer_a2a_prepare_finalize.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/flashinfer_cutedsl_moe.py 和 ./vllm/model_executor/layers/fused_moe/flashinfer_cutedsl_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/flashinfer_cutlass_moe.py 和 ./vllm/model_executor/layers/fused_moe/flashinfer_cutlass_moe.py 不同
+- 只在 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe 中存在：flashinfer_cutlass_prepare_finalize.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/flashinfer_trtllm_moe.py 和 ./vllm/model_executor/layers/fused_moe/flashinfer_trtllm_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/fused_batched_moe.py 和 ./vllm/model_executor/layers/fused_moe/fused_batched_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/fused_marlin_moe.py 和 ./vllm/model_executor/layers/fused_moe/fused_marlin_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/fused_moe.py 和 ./vllm/model_executor/layers/fused_moe/fused_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py 和 ./vllm/model_executor/layers/fused_moe/fused_moe_method_base.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py 和 ./vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/layer.py 和 ./vllm/model_executor/layers/fused_moe/layer.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/modular_kernel.py 和 ./vllm/model_executor/layers/fused_moe/modular_kernel.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/moe_permute_unpermute.py 和 ./vllm/model_executor/layers/fused_moe/moe_permute_unpermute.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/mori_prepare_finalize.py 和 ./vllm/model_executor/layers/fused_moe/mori_prepare_finalize.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/oracle/fp8.py 和 ./vllm/model_executor/layers/fused_moe/oracle/fp8.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py 和 ./vllm/model_executor/layers/fused_moe/oracle/nvfp4.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/oracle/unquantized.py 和 ./vllm/model_executor/layers/fused_moe/oracle/unquantized.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/pplx_prepare_finalize.py 和 ./vllm/model_executor/layers/fused_moe/pplx_prepare_finalize.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/prepare_finalize.py 和 ./vllm/model_executor/layers/fused_moe/prepare_finalize.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/rocm_aiter_fused_moe.py 和 ./vllm/model_executor/layers/fused_moe/rocm_aiter_fused_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/router/base_router.py 和 ./vllm/model_executor/layers/fused_moe/router/base_router.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/shared_fused_moe.py 和 ./vllm/model_executor/layers/fused_moe/shared_fused_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py 和 ./vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/fused_moe/utils.py 和 ./vllm/model_executor/layers/fused_moe/utils.py 不同
+- 只在 ./vllm/model_executor/layers/fused_moe 中存在：xpu_fused_moe.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/layernorm.py 和 ./vllm/model_executor/layers/layernorm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/linear.py 和 ./vllm/model_executor/layers/linear.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/logits_processor.py 和 ./vllm/model_executor/layers/logits_processor.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/mamba/abstract.py 和 ./vllm/model_executor/layers/mamba/abstract.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/mamba/mamba_mixer2.py 和 ./vllm/model_executor/layers/mamba/mamba_mixer2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/mamba/mamba_utils.py 和 ./vllm/model_executor/layers/mamba/mamba_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/mamba/ops/mamba_ssm.py 和 ./vllm/model_executor/layers/mamba/ops/mamba_ssm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/mla.py 和 ./vllm/model_executor/layers/mla.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/__init__.py 和 ./vllm/model_executor/layers/quantization/__init__.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/awq.py 和 ./vllm/model_executor/layers/quantization/awq.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/awq_marlin.py 和 ./vllm/model_executor/layers/quantization/awq_marlin.py 不同
+- 只在 ./vllm/model_executor/layers/quantization 中存在：awq_sm70_moe.py
+- 只在 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization 中存在：bitblas.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py 和 ./vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py 和 ./vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/compressed_tensors/schemes/__init__.py 和 ./vllm/model_executor/layers/quantization/compressed_tensors/schemes/__init__.py 不同
+- 只在 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/compressed_tensors/schemes 中存在：compressed_tensors_w4a16_24.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_mxfp4.py 和 ./vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_mxfp4.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_nvfp4.py 和 ./vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_nvfp4.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py 和 ./vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py 和 ./vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/cpu_wna16.py 和 ./vllm/model_executor/layers/quantization/cpu_wna16.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/experts_int8.py 和 ./vllm/model_executor/layers/quantization/experts_int8.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/fbgemm_fp8.py 和 ./vllm/model_executor/layers/quantization/fbgemm_fp8.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/fp8.py 和 ./vllm/model_executor/layers/quantization/fp8.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/gguf.py 和 ./vllm/model_executor/layers/quantization/gguf.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/gptq.py 和 ./vllm/model_executor/layers/quantization/gptq.py 不同
+- 只在 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization 中存在：gptq_bitblas.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/gptq_marlin.py 和 ./vllm/model_executor/layers/quantization/gptq_marlin.py 不同
+- 只在 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization 中存在：gptq_marlin_24.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/inc.py 和 ./vllm/model_executor/layers/quantization/inc.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/input_quant_fp8.py 和 ./vllm/model_executor/layers/quantization/input_quant_fp8.py 不同
+- 只在 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization 中存在：ipex_quant.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/kernels/mixed_precision/__init__.py 和 ./vllm/model_executor/layers/quantization/kernels/mixed_precision/__init__.py 不同
+- 只在 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/kernels/mixed_precision 中存在：bitblas.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/kernels/mixed_precision/conch.py 和 ./vllm/model_executor/layers/quantization/kernels/mixed_precision/conch.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/kernels/mixed_precision/cutlass.py 和 ./vllm/model_executor/layers/quantization/kernels/mixed_precision/cutlass.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/kernels/mixed_precision/dynamic_4bit.py 和 ./vllm/model_executor/layers/quantization/kernels/mixed_precision/dynamic_4bit.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/kernels/scaled_mm/ScaledMMLinearKernel.py 和 ./vllm/model_executor/layers/quantization/kernels/scaled_mm/ScaledMMLinearKernel.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/kernels/scaled_mm/__init__.py 和 ./vllm/model_executor/layers/quantization/kernels/scaled_mm/__init__.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/kernels/scaled_mm/aiter.py 和 ./vllm/model_executor/layers/quantization/kernels/scaled_mm/aiter.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/kernels/scaled_mm/pytorch.py 和 ./vllm/model_executor/layers/quantization/kernels/scaled_mm/pytorch.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/kernels/scaled_mm/rocm.py 和 ./vllm/model_executor/layers/quantization/kernels/scaled_mm/rocm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/modelopt.py 和 ./vllm/model_executor/layers/quantization/modelopt.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/moe_wna16.py 和 ./vllm/model_executor/layers/quantization/moe_wna16.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/mxfp4.py 和 ./vllm/model_executor/layers/quantization/mxfp4.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/petit.py 和 ./vllm/model_executor/layers/quantization/petit.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/ptpc_fp8.py 和 ./vllm/model_executor/layers/quantization/ptpc_fp8.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/quark/quark.py 和 ./vllm/model_executor/layers/quantization/quark/quark.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/torchao.py 和 ./vllm/model_executor/layers/quantization/torchao.py 不同
+- 只在 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/utils 中存在：bitblas_utils.py
+- 只在 ./vllm/model_executor/layers/quantization/utils/configs 中存在：N=1024,K=2048,device_name=AMD_Instinct_MI300X,dtype=fp8_w8a8,block_shape=[128,128].json
+- 只在 ./vllm/model_executor/layers/quantization/utils/configs 中存在：N=12288,K=2048,device_name=AMD_Instinct_MI300X,dtype=fp8_w8a8,block_shape=[128,128].json
+- 只在 ./vllm/model_executor/layers/quantization/utils/configs 中存在：N=2048,K=4096,device_name=AMD_Instinct_MI300X,dtype=fp8_w8a8,block_shape=[128,128].json
+- 只在 ./vllm/model_executor/layers/quantization/utils/configs 中存在：N=9216,K=2048,device_name=AMD_Instinct_MI300X,dtype=fp8_w8a8,block_shape=[128,128].json
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py 和 ./vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py 不同
+- 只在 ./vllm/model_executor/layers/quantization/utils 中存在：flashinfer_mxint4_moe.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/utils/flashinfer_utils.py 和 ./vllm/model_executor/layers/quantization/utils/flashinfer_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/utils/fp8_utils.py 和 ./vllm/model_executor/layers/quantization/utils/fp8_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py 和 ./vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py 不同
+- 只在 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/utils 中存在：marlin_utils_test_24.py
+- 只在 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/utils 中存在：nvfp4_moe_support.py
+- 只在 ./vllm/model_executor/layers/quantization/utils 中存在：nvfp4_utils.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/utils/petit_utils.py 和 ./vllm/model_executor/layers/quantization/utils/petit_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/quantization/utils/quant_utils.py 和 ./vllm/model_executor/layers/quantization/utils/quant_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/rotary_embedding/__init__.py 和 ./vllm/model_executor/layers/rotary_embedding/__init__.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/rotary_embedding/base.py 和 ./vllm/model_executor/layers/rotary_embedding/base.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/rotary_embedding/common.py 和 ./vllm/model_executor/layers/rotary_embedding/common.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/rotary_embedding/deepseek_scaling_rope.py 和 ./vllm/model_executor/layers/rotary_embedding/deepseek_scaling_rope.py 不同
+- 只在 ./vllm/model_executor/layers/rotary_embedding 中存在：fope.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/rotary_embedding/mrope.py 和 ./vllm/model_executor/layers/rotary_embedding/mrope.py 不同
+- 只在 ./vllm/model_executor/layers/rotary_embedding 中存在：mrope_interleaved.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/utils.py 和 ./vllm/model_executor/layers/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/layers/vocab_parallel_embedding.py 和 ./vllm/model_executor/layers/vocab_parallel_embedding.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/model_loader/base_loader.py 和 ./vllm/model_executor/model_loader/base_loader.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/model_loader/dummy_loader.py 和 ./vllm/model_executor/model_loader/dummy_loader.py 不同
+- 只在 /tmp/1cat-vllm-v015/vllm/model_executor/model_loader 中存在：online_quantization.py
+- 只在 ./vllm/model_executor/model_loader 中存在：reload
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/model_loader/tensorizer.py 和 ./vllm/model_executor/model_loader/tensorizer.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/model_loader/utils.py 和 ./vllm/model_executor/model_loader/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/model_loader/weight_utils.py 和 ./vllm/model_executor/model_loader/weight_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/adapters.py 和 ./vllm/model_executor/models/adapters.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/afmoe.py 和 ./vllm/model_executor/models/afmoe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/aimv2.py 和 ./vllm/model_executor/models/aimv2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/apertus.py 和 ./vllm/model_executor/models/apertus.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/arcee.py 和 ./vllm/model_executor/models/arcee.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/arctic.py 和 ./vllm/model_executor/models/arctic.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/aria.py 和 ./vllm/model_executor/models/aria.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/audioflamingo3.py 和 ./vllm/model_executor/models/audioflamingo3.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/aya_vision.py 和 ./vllm/model_executor/models/aya_vision.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/bagel.py 和 ./vllm/model_executor/models/bagel.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/baichuan.py 和 ./vllm/model_executor/models/baichuan.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/bailing_moe.py 和 ./vllm/model_executor/models/bailing_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/bamba.py 和 ./vllm/model_executor/models/bamba.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/bert.py 和 ./vllm/model_executor/models/bert.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/bert_with_rope.py 和 ./vllm/model_executor/models/bert_with_rope.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/blip.py 和 ./vllm/model_executor/models/blip.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/blip2.py 和 ./vllm/model_executor/models/blip2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/bloom.py 和 ./vllm/model_executor/models/bloom.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/chameleon.py 和 ./vllm/model_executor/models/chameleon.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/chatglm.py 和 ./vllm/model_executor/models/chatglm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/clip.py 和 ./vllm/model_executor/models/clip.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/cohere2_vision.py 和 ./vllm/model_executor/models/cohere2_vision.py 不同
+- 只在 ./vllm/model_executor/models 中存在：colbert.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/commandr.py 和 ./vllm/model_executor/models/commandr.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/config.py 和 ./vllm/model_executor/models/config.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/dbrx.py 和 ./vllm/model_executor/models/dbrx.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/deepencoder.py 和 ./vllm/model_executor/models/deepencoder.py 不同
+- 只在 ./vllm/model_executor/models 中存在：deepencoder2.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/deepseek_mtp.py 和 ./vllm/model_executor/models/deepseek_mtp.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/deepseek_ocr.py 和 ./vllm/model_executor/models/deepseek_ocr.py 不同
+- 只在 ./vllm/model_executor/models 中存在：deepseek_ocr2.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/deepseek_v2.py 和 ./vllm/model_executor/models/deepseek_v2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/deepseek_vl2.py 和 ./vllm/model_executor/models/deepseek_vl2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/dots1.py 和 ./vllm/model_executor/models/dots1.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/dots_ocr.py 和 ./vllm/model_executor/models/dots_ocr.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/eagle2_5_vl.py 和 ./vllm/model_executor/models/eagle2_5_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/ernie45_moe.py 和 ./vllm/model_executor/models/ernie45_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/ernie45_vl.py 和 ./vllm/model_executor/models/ernie45_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/ernie45_vl_moe.py 和 ./vllm/model_executor/models/ernie45_vl_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/ernie_mtp.py 和 ./vllm/model_executor/models/ernie_mtp.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/exaone.py 和 ./vllm/model_executor/models/exaone.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/exaone4.py 和 ./vllm/model_executor/models/exaone4.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/exaone_moe.py 和 ./vllm/model_executor/models/exaone_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/falcon.py 和 ./vllm/model_executor/models/falcon.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/falcon_h1.py 和 ./vllm/model_executor/models/falcon_h1.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/flex_olmo.py 和 ./vllm/model_executor/models/flex_olmo.py 不同
+- 只在 ./vllm/model_executor/models 中存在：funaudiochat.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/fuyu.py 和 ./vllm/model_executor/models/fuyu.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/gemma.py 和 ./vllm/model_executor/models/gemma.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/gemma2.py 和 ./vllm/model_executor/models/gemma2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/gemma3.py 和 ./vllm/model_executor/models/gemma3.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/gemma3_mm.py 和 ./vllm/model_executor/models/gemma3_mm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/gemma3n.py 和 ./vllm/model_executor/models/gemma3n.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/gemma3n_mm.py 和 ./vllm/model_executor/models/gemma3n_mm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/glm4.py 和 ./vllm/model_executor/models/glm4.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/glm4_1v.py 和 ./vllm/model_executor/models/glm4_1v.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/glm4_moe.py 和 ./vllm/model_executor/models/glm4_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/glm4_moe_lite.py 和 ./vllm/model_executor/models/glm4_moe_lite.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/glm4_moe_lite_mtp.py 和 ./vllm/model_executor/models/glm4_moe_lite_mtp.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/glm4_moe_mtp.py 和 ./vllm/model_executor/models/glm4_moe_mtp.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/glm4v.py 和 ./vllm/model_executor/models/glm4v.py 不同
+- 只在 ./vllm/model_executor/models 中存在：glm_ocr.py
+- 只在 ./vllm/model_executor/models 中存在：glm_ocr_mtp.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/glmasr.py 和 ./vllm/model_executor/models/glmasr.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/gpt2.py 和 ./vllm/model_executor/models/gpt2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/gpt_bigcode.py 和 ./vllm/model_executor/models/gpt_bigcode.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/gpt_j.py 和 ./vllm/model_executor/models/gpt_j.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/gpt_neox.py 和 ./vllm/model_executor/models/gpt_neox.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/gpt_oss.py 和 ./vllm/model_executor/models/gpt_oss.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/granite.py 和 ./vllm/model_executor/models/granite.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/granite_speech.py 和 ./vllm/model_executor/models/granite_speech.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/granitemoe.py 和 ./vllm/model_executor/models/granitemoe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/granitemoehybrid.py 和 ./vllm/model_executor/models/granitemoehybrid.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/granitemoeshared.py 和 ./vllm/model_executor/models/granitemoeshared.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/grok1.py 和 ./vllm/model_executor/models/grok1.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/hunyuan_v1.py 和 ./vllm/model_executor/models/hunyuan_v1.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/hunyuan_vision.py 和 ./vllm/model_executor/models/hunyuan_vision.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/hyperclovax_vision.py 和 ./vllm/model_executor/models/hyperclovax_vision.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/idefics2_vision_model.py 和 ./vllm/model_executor/models/idefics2_vision_model.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/idefics3.py 和 ./vllm/model_executor/models/idefics3.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/interfaces.py 和 ./vllm/model_executor/models/interfaces.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/intern_vit.py 和 ./vllm/model_executor/models/intern_vit.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/internlm2.py 和 ./vllm/model_executor/models/internlm2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/internlm2_ve.py 和 ./vllm/model_executor/models/internlm2_ve.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/interns1.py 和 ./vllm/model_executor/models/interns1.py 不同
+- 只在 ./vllm/model_executor/models 中存在：interns1_pro.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/interns1_vit.py 和 ./vllm/model_executor/models/interns1_vit.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/internvl.py 和 ./vllm/model_executor/models/internvl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/iquest_loopcoder.py 和 ./vllm/model_executor/models/iquest_loopcoder.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/isaac.py 和 ./vllm/model_executor/models/isaac.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/jais.py 和 ./vllm/model_executor/models/jais.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/jais2.py 和 ./vllm/model_executor/models/jais2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/jamba.py 和 ./vllm/model_executor/models/jamba.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/jina_vl.py 和 ./vllm/model_executor/models/jina_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/kanana_v.py 和 ./vllm/model_executor/models/kanana_v.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/keye.py 和 ./vllm/model_executor/models/keye.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/keye_vl1_5.py 和 ./vllm/model_executor/models/keye_vl1_5.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/kimi_k25.py 和 ./vllm/model_executor/models/kimi_k25.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/kimi_k25_vit.py 和 ./vllm/model_executor/models/kimi_k25_vit.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/kimi_linear.py 和 ./vllm/model_executor/models/kimi_linear.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/kimi_vl.py 和 ./vllm/model_executor/models/kimi_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/lfm2.py 和 ./vllm/model_executor/models/lfm2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/lfm2_moe.py 和 ./vllm/model_executor/models/lfm2_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/lfm2_siglip2.py 和 ./vllm/model_executor/models/lfm2_siglip2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/lfm2_vl.py 和 ./vllm/model_executor/models/lfm2_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/llama.py 和 ./vllm/model_executor/models/llama.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/llama4.py 和 ./vllm/model_executor/models/llama4.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/llava.py 和 ./vllm/model_executor/models/llava.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/llava_next.py 和 ./vllm/model_executor/models/llava_next.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/llava_next_video.py 和 ./vllm/model_executor/models/llava_next_video.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/llava_onevision.py 和 ./vllm/model_executor/models/llava_onevision.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/longcat_flash.py 和 ./vllm/model_executor/models/longcat_flash.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/longcat_flash_mtp.py 和 ./vllm/model_executor/models/longcat_flash_mtp.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/mamba.py 和 ./vllm/model_executor/models/mamba.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/mamba2.py 和 ./vllm/model_executor/models/mamba2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/midashenglm.py 和 ./vllm/model_executor/models/midashenglm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/mimo.py 和 ./vllm/model_executor/models/mimo.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/mimo_mtp.py 和 ./vllm/model_executor/models/mimo_mtp.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/mimo_v2_flash.py 和 ./vllm/model_executor/models/mimo_v2_flash.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/minicpm.py 和 ./vllm/model_executor/models/minicpm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/minicpm3.py 和 ./vllm/model_executor/models/minicpm3.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/minicpmo.py 和 ./vllm/model_executor/models/minicpmo.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/minicpmv.py 和 ./vllm/model_executor/models/minicpmv.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/minimax_m2.py 和 ./vllm/model_executor/models/minimax_m2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/minimax_text_01.py 和 ./vllm/model_executor/models/minimax_text_01.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/minimax_vl_01.py 和 ./vllm/model_executor/models/minimax_vl_01.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/mistral.py 和 ./vllm/model_executor/models/mistral.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/mistral3.py 和 ./vllm/model_executor/models/mistral3.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/mixtral.py 和 ./vllm/model_executor/models/mixtral.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/mllama4.py 和 ./vllm/model_executor/models/mllama4.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/modernbert.py 和 ./vllm/model_executor/models/modernbert.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/molmo.py 和 ./vllm/model_executor/models/molmo.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/molmo2.py 和 ./vllm/model_executor/models/molmo2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/moonvit.py 和 ./vllm/model_executor/models/moonvit.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/mpt.py 和 ./vllm/model_executor/models/mpt.py 不同
+- 只在 ./vllm/model_executor/models 中存在：musicflamingo.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/nano_nemotron_vl.py 和 ./vllm/model_executor/models/nano_nemotron_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/nemotron.py 和 ./vllm/model_executor/models/nemotron.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/nemotron_h.py 和 ./vllm/model_executor/models/nemotron_h.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/nemotron_nas.py 和 ./vllm/model_executor/models/nemotron_nas.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/nemotron_parse.py 和 ./vllm/model_executor/models/nemotron_parse.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/nemotron_vl.py 和 ./vllm/model_executor/models/nemotron_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/olmo.py 和 ./vllm/model_executor/models/olmo.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/olmo2.py 和 ./vllm/model_executor/models/olmo2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/olmoe.py 和 ./vllm/model_executor/models/olmoe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/opencua.py 和 ./vllm/model_executor/models/opencua.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/openpangu.py 和 ./vllm/model_executor/models/openpangu.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/openpangu_mtp.py 和 ./vllm/model_executor/models/openpangu_mtp.py 不同
+- 只在 ./vllm/model_executor/models 中存在：openpangu_vl.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/opt.py 和 ./vllm/model_executor/models/opt.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/orion.py 和 ./vllm/model_executor/models/orion.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/ouro.py 和 ./vllm/model_executor/models/ouro.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/ovis.py 和 ./vllm/model_executor/models/ovis.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/ovis2_5.py 和 ./vllm/model_executor/models/ovis2_5.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/paddleocr_vl.py 和 ./vllm/model_executor/models/paddleocr_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/paligemma.py 和 ./vllm/model_executor/models/paligemma.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/persimmon.py 和 ./vllm/model_executor/models/persimmon.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/phi.py 和 ./vllm/model_executor/models/phi.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/phi3v.py 和 ./vllm/model_executor/models/phi3v.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/phi4mm.py 和 ./vllm/model_executor/models/phi4mm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/phimoe.py 和 ./vllm/model_executor/models/phimoe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/pixtral.py 和 ./vllm/model_executor/models/pixtral.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/plamo2.py 和 ./vllm/model_executor/models/plamo2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/plamo3.py 和 ./vllm/model_executor/models/plamo3.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen.py 和 ./vllm/model_executor/models/qwen.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen2.py 和 ./vllm/model_executor/models/qwen2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen2_5_omni_thinker.py 和 ./vllm/model_executor/models/qwen2_5_omni_thinker.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen2_5_vl.py 和 ./vllm/model_executor/models/qwen2_5_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen2_audio.py 和 ./vllm/model_executor/models/qwen2_audio.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen2_moe.py 和 ./vllm/model_executor/models/qwen2_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen2_rm.py 和 ./vllm/model_executor/models/qwen2_rm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen2_vl.py 和 ./vllm/model_executor/models/qwen2_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen3.py 和 ./vllm/model_executor/models/qwen3.py 不同
+- 只在 ./vllm/model_executor/models 中存在：qwen3_5.py
+- 只在 ./vllm/model_executor/models 中存在：qwen3_5_mtp.py
+- 只在 ./vllm/model_executor/models 中存在：qwen3_asr.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen3_moe.py 和 ./vllm/model_executor/models/qwen3_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen3_next.py 和 ./vllm/model_executor/models/qwen3_next.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen3_next_mtp.py 和 ./vllm/model_executor/models/qwen3_next_mtp.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen3_omni_moe_thinker.py 和 ./vllm/model_executor/models/qwen3_omni_moe_thinker.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen3_vl.py 和 ./vllm/model_executor/models/qwen3_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen3_vl_moe.py 和 ./vllm/model_executor/models/qwen3_vl_moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/qwen_vl.py 和 ./vllm/model_executor/models/qwen_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/registry.py 和 ./vllm/model_executor/models/registry.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/seed_oss.py 和 ./vllm/model_executor/models/seed_oss.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/siglip.py 和 ./vllm/model_executor/models/siglip.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/siglip2navit.py 和 ./vllm/model_executor/models/siglip2navit.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/skyworkr1v.py 和 ./vllm/model_executor/models/skyworkr1v.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/solar.py 和 ./vllm/model_executor/models/solar.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/stablelm.py 和 ./vllm/model_executor/models/stablelm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/starcoder2.py 和 ./vllm/model_executor/models/starcoder2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/step1.py 和 ./vllm/model_executor/models/step1.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/step3_text.py 和 ./vllm/model_executor/models/step3_text.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/step3_vl.py 和 ./vllm/model_executor/models/step3_vl.py 不同
+- 只在 ./vllm/model_executor/models 中存在：step3p5.py
+- 只在 ./vllm/model_executor/models 中存在：step3p5_mtp.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/step_vl.py 和 ./vllm/model_executor/models/step_vl.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/tarsier.py 和 ./vllm/model_executor/models/tarsier.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/terratorch.py 和 ./vllm/model_executor/models/terratorch.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/transformers/base.py 和 ./vllm/model_executor/models/transformers/base.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/transformers/causal.py 和 ./vllm/model_executor/models/transformers/causal.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/transformers/moe.py 和 ./vllm/model_executor/models/transformers/moe.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/transformers/multimodal.py 和 ./vllm/model_executor/models/transformers/multimodal.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/ultravox.py 和 ./vllm/model_executor/models/ultravox.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/utils.py 和 ./vllm/model_executor/models/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/voxtral.py 和 ./vllm/model_executor/models/voxtral.py 不同
+- 只在 ./vllm/model_executor/models 中存在：voxtral_realtime.py
+- 只在 /tmp/1cat-vllm-v015/vllm/model_executor/models 中存在：voxtral_streaming.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/whisper.py 和 ./vllm/model_executor/models/whisper.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/whisper_causal.py 和 ./vllm/model_executor/models/whisper_causal.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/models/zamba2.py 和 ./vllm/model_executor/models/zamba2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/parameter.py 和 ./vllm/model_executor/parameter.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/utils.py 和 ./vllm/model_executor/utils.py 不同
+- 只在 ./vllm/model_executor/warmup 中存在：awq_sm70_warmup.py
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/warmup/deep_gemm_warmup.py 和 ./vllm/model_executor/warmup/deep_gemm_warmup.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/model_executor/warmup/kernel_warmup.py 和 ./vllm/model_executor/warmup/kernel_warmup.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/multimodal/audio.py 和 ./vllm/multimodal/audio.py 不同
+- 只在 ./vllm/multimodal 中存在：budget.py
+- 文件 /tmp/1cat-vllm-v015/vllm/multimodal/cache.py 和 ./vllm/multimodal/cache.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/multimodal/inputs.py 和 ./vllm/multimodal/inputs.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/multimodal/media/__init__.py 和 ./vllm/multimodal/media/__init__.py 不同
+- 只在 ./vllm/multimodal/media 中存在：connector.py
+- 文件 /tmp/1cat-vllm-v015/vllm/multimodal/media/image.py 和 ./vllm/multimodal/media/image.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/multimodal/parse.py 和 ./vllm/multimodal/parse.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/multimodal/processing/context.py 和 ./vllm/multimodal/processing/context.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/multimodal/processing/dummy_inputs.py 和 ./vllm/multimodal/processing/dummy_inputs.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/multimodal/processing/processor.py 和 ./vllm/multimodal/processing/processor.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/multimodal/registry.py 和 ./vllm/multimodal/registry.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/multimodal/utils.py 和 ./vllm/multimodal/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/multimodal/video.py 和 ./vllm/multimodal/video.py 不同
+- 只在 ./vllm 中存在：parser
+- 文件 /tmp/1cat-vllm-v015/vllm/platforms/__init__.py 和 ./vllm/platforms/__init__.py 不同
+- 只在 ./vllm/platforms 中存在：__pycache__
+- 文件 /tmp/1cat-vllm-v015/vllm/platforms/cuda.py 和 ./vllm/platforms/cuda.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/platforms/interface.py 和 ./vllm/platforms/interface.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/platforms/rocm.py 和 ./vllm/platforms/rocm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/platforms/xpu.py 和 ./vllm/platforms/xpu.py 不同
+- 只在 ./vllm/plugins 中存在：__pycache__
+- 文件 /tmp/1cat-vllm-v015/vllm/plugins/lora_resolvers/filesystem_resolver.py 和 ./vllm/plugins/lora_resolvers/filesystem_resolver.py 不同
+- 只在 ./vllm/plugins/lora_resolvers 中存在：hf_hub_resolver.py
+- 文件 /tmp/1cat-vllm-v015/vllm/pooling_params.py 和 ./vllm/pooling_params.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/profiler/layerwise_profile.py 和 ./vllm/profiler/layerwise_profile.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/profiler/utils.py 和 ./vllm/profiler/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/reasoning/__init__.py 和 ./vllm/reasoning/__init__.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/reasoning/deepseek_v3_reasoning_parser.py 和 ./vllm/reasoning/deepseek_v3_reasoning_parser.py 不同
+- 只在 /tmp/1cat-vllm-v015/vllm/reasoning 中存在：glm4_moe_reasoning_parser.py
+- 只在 /tmp/1cat-vllm-v015/vllm/reasoning 中存在：holo2_reasoning_parser.py
+- 只在 /tmp/1cat-vllm-v015/vllm/reasoning 中存在：kimi_k2_reasoning_parser.py
+- 文件 /tmp/1cat-vllm-v015/vllm/reasoning/olmo3_reasoning_parser.py 和 ./vllm/reasoning/olmo3_reasoning_parser.py 不同
+- 只在 ./vllm/reasoning 中存在：step3p5_reasoning_parser.py
+- 文件 /tmp/1cat-vllm-v015/vllm/renderers/__init__.py 和 ./vllm/renderers/__init__.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/renderers/deepseek_v32.py 和 ./vllm/renderers/deepseek_v32.py 不同
+- 只在 ./vllm/renderers 中存在：embed_utils.py
+- 文件 /tmp/1cat-vllm-v015/vllm/renderers/grok2.py 和 ./vllm/renderers/grok2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/renderers/hf.py 和 ./vllm/renderers/hf.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/renderers/mistral.py 和 ./vllm/renderers/mistral.py 不同
+- 只在 ./vllm/renderers 中存在：params.py
+- 文件 /tmp/1cat-vllm-v015/vllm/renderers/protocol.py 和 ./vllm/renderers/protocol.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/renderers/registry.py 和 ./vllm/renderers/registry.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/renderers/terratorch.py 和 ./vllm/renderers/terratorch.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/tasks.py 和 ./vllm/tasks.py 不同
+- 只在 ./vllm/third_party 中存在：__pycache__
+- 只在 ./vllm/third_party/flashmla 中存在：flash_mla_interface.py
+- 只在 ./vllm/third_party 中存在：triton_kernels
+- 文件 /tmp/1cat-vllm-v015/vllm/tokenizers/deepseek_v32_encoding.py 和 ./vllm/tokenizers/deepseek_v32_encoding.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/tokenizers/grok2.py 和 ./vllm/tokenizers/grok2.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/tokenizers/registry.py 和 ./vllm/tokenizers/registry.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/tool_parsers/__init__.py 和 ./vllm/tool_parsers/__init__.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/tool_parsers/glm4_moe_tool_parser.py 和 ./vllm/tool_parsers/glm4_moe_tool_parser.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/tool_parsers/kimi_k2_tool_parser.py 和 ./vllm/tool_parsers/kimi_k2_tool_parser.py 不同
+- 只在 ./vllm/tool_parsers 中存在：step3p5_tool_parser.py
+- 文件 /tmp/1cat-vllm-v015/vllm/transformers_utils/chat_templates/registry.py 和 ./vllm/transformers_utils/chat_templates/registry.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/transformers_utils/config.py 和 ./vllm/transformers_utils/config.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/transformers_utils/configs/__init__.py 和 ./vllm/transformers_utils/configs/__init__.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/transformers_utils/configs/deepseek_vl2.py 和 ./vllm/transformers_utils/configs/deepseek_vl2.py 不同
+- 只在 ./vllm/transformers_utils/configs 中存在：funaudiochat.py
+- 文件 /tmp/1cat-vllm-v015/vllm/transformers_utils/configs/mistral.py 和 ./vllm/transformers_utils/configs/mistral.py 不同
+- 只在 ./vllm/transformers_utils/configs 中存在：qwen3_5.py
+- 只在 ./vllm/transformers_utils/configs 中存在：qwen3_5_moe.py
+- 只在 ./vllm/transformers_utils/configs 中存在：qwen3_asr.py
+- 文件 /tmp/1cat-vllm-v015/vllm/transformers_utils/configs/speculators/algos.py 和 ./vllm/transformers_utils/configs/speculators/algos.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/transformers_utils/configs/speculators/base.py 和 ./vllm/transformers_utils/configs/speculators/base.py 不同
+- 只在 ./vllm/transformers_utils/configs 中存在：step3p5.py
+- 文件 /tmp/1cat-vllm-v015/vllm/transformers_utils/gguf_utils.py 和 ./vllm/transformers_utils/gguf_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/transformers_utils/model_arch_config_convertor.py 和 ./vllm/transformers_utils/model_arch_config_convertor.py 不同
+- 只在 ./vllm/transformers_utils/processors 中存在：deepseek_ocr2.py
+- 文件 /tmp/1cat-vllm-v015/vllm/transformers_utils/processors/hunyuan_vl.py 和 ./vllm/transformers_utils/processors/hunyuan_vl.py 不同
+- 只在 ./vllm/transformers_utils/processors 中存在：qwen3_asr.py
+- 文件 /tmp/1cat-vllm-v015/vllm/transformers_utils/repo_utils.py 和 ./vllm/transformers_utils/repo_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/transformers_utils/s3_utils.py 和 ./vllm/transformers_utils/s3_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/transformers_utils/tokenizer.py 和 ./vllm/transformers_utils/tokenizer.py 不同
+- 只在 ./vllm/utils 中存在：__pycache__
+- 文件 /tmp/1cat-vllm-v015/vllm/utils/argparse_utils.py 和 ./vllm/utils/argparse_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/utils/async_utils.py 和 ./vllm/utils/async_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/utils/flashinfer.py 和 ./vllm/utils/flashinfer.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/utils/serial_utils.py 和 ./vllm/utils/serial_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/utils/system_utils.py 和 ./vllm/utils/system_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/utils/torch_utils.py 和 ./vllm/utils/torch_utils.py 不同
+- 只在 ./vllm/v1 中存在：__pycache__
+- 只在 ./vllm/v1/attention 中存在：__pycache__
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backend.py 和 ./vllm/v1/attention/backend.py 不同
+- 只在 ./vllm/v1/attention/backends 中存在：__pycache__
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/cpu_attn.py 和 ./vllm/v1/attention/backends/cpu_attn.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/fa_utils.py 和 ./vllm/v1/attention/backends/fa_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/flash_attn.py 和 ./vllm/v1/attention/backends/flash_attn.py 不同
+- 只在 ./vllm/v1/attention/backends 中存在：flash_attn_v100.py
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/flashinfer.py 和 ./vllm/v1/attention/backends/flashinfer.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/flex_attention.py 和 ./vllm/v1/attention/backends/flex_attention.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/mamba2_attn.py 和 ./vllm/v1/attention/backends/mamba2_attn.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/mla/cutlass_mla.py 和 ./vllm/v1/attention/backends/mla/cutlass_mla.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/mla/flashattn_mla.py 和 ./vllm/v1/attention/backends/mla/flashattn_mla.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/mla/flashinfer_mla.py 和 ./vllm/v1/attention/backends/mla/flashinfer_mla.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/mla/flashmla.py 和 ./vllm/v1/attention/backends/mla/flashmla.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/mla/flashmla_sparse.py 和 ./vllm/v1/attention/backends/mla/flashmla_sparse.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/mla/rocm_aiter_mla.py 和 ./vllm/v1/attention/backends/mla/rocm_aiter_mla.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py 和 ./vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/mla/triton_mla.py 和 ./vllm/v1/attention/backends/mla/triton_mla.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/registry.py 和 ./vllm/v1/attention/backends/registry.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/rocm_aiter_fa.py 和 ./vllm/v1/attention/backends/rocm_aiter_fa.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/rocm_aiter_unified_attn.py 和 ./vllm/v1/attention/backends/rocm_aiter_unified_attn.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/rocm_attn.py 和 ./vllm/v1/attention/backends/rocm_attn.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/tree_attn.py 和 ./vllm/v1/attention/backends/tree_attn.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/backends/triton_attn.py 和 ./vllm/v1/attention/backends/triton_attn.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/ops/chunked_prefill_paged_decode.py 和 ./vllm/v1/attention/ops/chunked_prefill_paged_decode.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/ops/common.py 和 ./vllm/v1/attention/ops/common.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/ops/triton_decode_attention.py 和 ./vllm/v1/attention/ops/triton_decode_attention.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py 和 ./vllm/v1/attention/ops/triton_reshape_and_cache_flash.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/ops/triton_unified_attention.py 和 ./vllm/v1/attention/ops/triton_unified_attention.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/attention/ops/vit_attn_wrappers.py 和 ./vllm/v1/attention/ops/vit_attn_wrappers.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/core/encoder_cache_manager.py 和 ./vllm/v1/core/encoder_cache_manager.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/core/kv_cache_coordinator.py 和 ./vllm/v1/core/kv_cache_coordinator.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/core/sched/async_scheduler.py 和 ./vllm/v1/core/sched/async_scheduler.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/core/sched/interface.py 和 ./vllm/v1/core/sched/interface.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/core/sched/scheduler.py 和 ./vllm/v1/core/sched/scheduler.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/core/single_type_kv_cache_manager.py 和 ./vllm/v1/core/single_type_kv_cache_manager.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/cudagraph_dispatcher.py 和 ./vllm/v1/cudagraph_dispatcher.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/engine/__init__.py 和 ./vllm/v1/engine/__init__.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/engine/async_llm.py 和 ./vllm/v1/engine/async_llm.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/engine/core.py 和 ./vllm/v1/engine/core.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/engine/core_client.py 和 ./vllm/v1/engine/core_client.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/engine/detokenizer.py 和 ./vllm/v1/engine/detokenizer.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/engine/input_processor.py 和 ./vllm/v1/engine/input_processor.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/engine/llm_engine.py 和 ./vllm/v1/engine/llm_engine.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/engine/logprobs.py 和 ./vllm/v1/engine/logprobs.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/engine/parallel_sampling.py 和 ./vllm/v1/engine/parallel_sampling.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/engine/utils.py 和 ./vllm/v1/engine/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/executor/abstract.py 和 ./vllm/v1/executor/abstract.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/executor/ray_executor.py 和 ./vllm/v1/executor/ray_executor.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/kv_cache_interface.py 和 ./vllm/v1/kv_cache_interface.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/kv_offload/worker/cpu_gpu.py 和 ./vllm/v1/kv_offload/worker/cpu_gpu.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/kv_offload/worker/worker.py 和 ./vllm/v1/kv_offload/worker/worker.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/metrics/loggers.py 和 ./vllm/v1/metrics/loggers.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/metrics/perf.py 和 ./vllm/v1/metrics/perf.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/metrics/stats.py 和 ./vllm/v1/metrics/stats.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/outputs.py 和 ./vllm/v1/outputs.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/request.py 和 ./vllm/v1/request.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/sample/logits_processor/interface.py 和 ./vllm/v1/sample/logits_processor/interface.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/sample/rejection_sampler.py 和 ./vllm/v1/sample/rejection_sampler.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/serial_utils.py 和 ./vllm/v1/serial_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/spec_decode/draft_model.py 和 ./vllm/v1/spec_decode/draft_model.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/spec_decode/eagle.py 和 ./vllm/v1/spec_decode/eagle.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/spec_decode/medusa.py 和 ./vllm/v1/spec_decode/medusa.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/spec_decode/suffix_decoding.py 和 ./vllm/v1/spec_decode/suffix_decoding.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/structured_output/__init__.py 和 ./vllm/v1/structured_output/__init__.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/utils.py 和 ./vllm/v1/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/cpu_worker.py 和 ./vllm/v1/worker/cpu_worker.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/async_utils.py 和 ./vllm/v1/worker/gpu/async_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/attn_utils.py 和 ./vllm/v1/worker/gpu/attn_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/block_table.py 和 ./vllm/v1/worker/gpu/block_table.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/buffer_utils.py 和 ./vllm/v1/worker/gpu/buffer_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/cudagraph_utils.py 和 ./vllm/v1/worker/gpu/cudagraph_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/dp_utils.py 和 ./vllm/v1/worker/gpu/dp_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/input_batch.py 和 ./vllm/v1/worker/gpu/input_batch.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/kv_connector.py 和 ./vllm/v1/worker/gpu/kv_connector.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/lora_utils.py 和 ./vllm/v1/worker/gpu/lora_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/mm/encoder_runner.py 和 ./vllm/v1/worker/gpu/mm/encoder_runner.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/mm/mrope_utils.py 和 ./vllm/v1/worker/gpu/mm/mrope_utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/model_runner.py 和 ./vllm/v1/worker/gpu/model_runner.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/sample/logit_bias.py 和 ./vllm/v1/worker/gpu/sample/logit_bias.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/sample/logprob.py 和 ./vllm/v1/worker/gpu/sample/logprob.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/sample/min_p.py 和 ./vllm/v1/worker/gpu/sample/min_p.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/sample/prompt_logprob.py 和 ./vllm/v1/worker/gpu/sample/prompt_logprob.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/sample/sampler.py 和 ./vllm/v1/worker/gpu/sample/sampler.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/sample/states.py 和 ./vllm/v1/worker/gpu/sample/states.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/spec_decode/__init__.py 和 ./vllm/v1/worker/gpu/spec_decode/__init__.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/spec_decode/eagle.py 和 ./vllm/v1/worker/gpu/spec_decode/eagle.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/spec_decode/eagle_cudagraph.py 和 ./vllm/v1/worker/gpu/spec_decode/eagle_cudagraph.py 不同
+- 只在 ./vllm/v1/worker/gpu/spec_decode 中存在：utils.py
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu/structured_outputs.py 和 ./vllm/v1/worker/gpu/structured_outputs.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu_model_runner.py 和 ./vllm/v1/worker/gpu_model_runner.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu_ubatch_wrapper.py 和 ./vllm/v1/worker/gpu_ubatch_wrapper.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/gpu_worker.py 和 ./vllm/v1/worker/gpu_worker.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/lora_model_runner_mixin.py 和 ./vllm/v1/worker/lora_model_runner_mixin.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/ubatching.py 和 ./vllm/v1/worker/ubatching.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/utils.py 和 ./vllm/v1/worker/utils.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/worker_base.py 和 ./vllm/v1/worker/worker_base.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/workspace.py 和 ./vllm/v1/worker/workspace.py 不同
+- 文件 /tmp/1cat-vllm-v015/vllm/v1/worker/xpu_worker.py 和 ./vllm/v1/worker/xpu_worker.py 不同
+- 只在 /tmp/1cat-vllm-v015/vllm/vllm_flash_attn 中存在：.gitkeep
+- 只在 ./vllm/vllm_flash_attn 中存在：__init__.py
+- 只在 ./vllm/vllm_flash_attn 中存在：flash_attn_interface.py
+- 只在 ./vllm/vllm_flash_attn 中存在：layers
+- 只在 ./vllm/vllm_flash_attn 中存在：ops
