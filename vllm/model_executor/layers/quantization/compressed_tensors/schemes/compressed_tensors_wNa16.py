@@ -77,8 +77,9 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # Turing and up
-        return 75
+        # Exllama covers the lowest CUDA capability currently supported by the
+        # WNA16 kernel chooser, so the scheme gate must not reject SM70 first.
+        return 60
 
     def create_weights(
         self,

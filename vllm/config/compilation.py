@@ -537,6 +537,14 @@ class CompilationConfig:
     """Additional configurations for inductor.
     - None: use default configurations."""
 
+    @property
+    def compile_ranges_split_points(self) -> list[int] | None:
+        return self.compile_ranges_endpoints
+
+    @compile_ranges_split_points.setter
+    def compile_ranges_split_points(self, value: list[int] | None) -> None:
+        self.compile_ranges_endpoints = value
+
     inductor_passes: dict[str, str] = field(default_factory=dict)
     """Additional passes for inductor. It is a dictionary
     from pass name to pass function qualified name. We use function

@@ -17,7 +17,7 @@ from vllm.model_executor.layers.quantization.fp8 import (
     Fp8KVCacheMethod,
     Fp8LinearMethod,
 )
-from vllm.model_executor.layers.quantization.kernels.scaled_mm import (
+from vllm.model_executor.kernels.linear import (
     init_fp8_linear_kernel,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (

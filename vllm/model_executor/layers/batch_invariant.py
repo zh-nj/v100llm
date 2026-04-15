@@ -987,6 +987,10 @@ def enable_batch_invariant_mode():
     torch.backends.cuda.preferred_blas_library(backend="cublaslt")
 
 
+def vllm_is_batch_invariant() -> bool:
+    return getattr(envs, "VLLM_BATCH_INVARIANT", False)
+
+
 def override_envs_for_invariance(
     attention_backend: AttentionBackendEnum | None,
 ):
@@ -1045,7 +1049,7 @@ def init_batch_invariance(
     attention_backend: AttentionBackendEnum | None,
 ):
     # this will hit all the csrc overrides as well
-    if envs.VLLM_BATCH_INVARIANT:
+    if vllm_is_batch_invariant():
         override_envs_for_invariance(attention_backend)
         enable_batch_invariant_mode()
 

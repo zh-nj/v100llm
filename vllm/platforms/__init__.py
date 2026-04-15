@@ -33,6 +33,48 @@ def vllm_version_matches_substr(substr: str) -> bool:
     return substr in vllm_version
 
 
+def _has_nvidia_device_files() -> bool:
+    if os.path.exists("/dev/nvidiactl"):
+        return True
+
+    if os.path.isdir("/proc/driver/nvidia/gpus"):
+        with os.scandir("/proc/driver/nvidia/gpus") as entries:
+            return any(entry.is_dir() for entry in entries)
+
+    return False
+
+
+def _non_nvml_cuda_platform_available() -> bool:
+    if vllm_version_matches_substr("cpu"):
+        logger.debug(
+            "CUDA platform is not available in non-NVML detection path "
+            "because vLLM is built with CPU."
+        )
+        return False
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            logger.debug("Confirmed CUDA platform is available without NVML.")
+            return True
+    except Exception as e:
+        logger.debug(
+            "Torch CUDA probe failed in non-NVML detection path: %s",
+            str(e),
+        )
+
+    if _has_nvidia_device_files():
+        logger.debug(
+            "Confirmed CUDA platform is available from NVIDIA device files "
+            "without NVML."
+        )
+        return True
+
+    logger.debug("CUDA platform is not available in non-NVML detection path.")
+    return False
+
+
 def tpu_platform_plugin() -> str | None:
     logger.debug("Checking if TPU platform is available.")
 
@@ -60,6 +102,9 @@ def tpu_platform_plugin() -> str | None:
 def cuda_platform_plugin() -> str | None:
     is_cuda = False
     logger.debug("Checking if CUDA platform is available.")
+    if os.environ.get("VLLM_DISABLE_NVML") == "1":
+        is_cuda = _non_nvml_cuda_platform_available()
+        return "vllm.platforms.cuda.CudaPlatform" if is_cuda else None
     try:
         from vllm.utils.import_utils import import_pynvml
 
@@ -92,8 +137,6 @@ def cuda_platform_plugin() -> str | None:
             raise e
 
         # CUDA is supported on Jetson, but NVML may not be.
-        import os
-
         def cuda_is_jetson() -> bool:
             return os.path.isfile("/etc/nv_tegra_release") or os.path.exists(
                 "/sys/class/tegra-firmware"
@@ -101,6 +144,12 @@ def cuda_platform_plugin() -> str | None:
 
         if cuda_is_jetson():
             logger.debug("Confirmed CUDA platform is available on Jetson.")
+            is_cuda = True
+        elif not vllm_version_matches_substr("cpu") and _has_nvidia_device_files():
+            logger.debug(
+                "Confirmed CUDA platform is available from NVIDIA device files "
+                "after NVML probe failure."
+            )
             is_cuda = True
         else:
             logger.debug("CUDA platform is not available because: %s", str(e))

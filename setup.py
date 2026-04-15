@@ -213,7 +213,14 @@ class cmake_build_ext(build_ext):
         cmake_args = [
             "-DCMAKE_BUILD_TYPE={}".format(cfg),
             "-DVLLM_TARGET_DEVICE={}".format(VLLM_TARGET_DEVICE),
+            "-DVLLM_BUILD_FLASH_ATTN={}".format(
+                "ON" if _should_build_fa2() or _should_build_fa3() else "OFF"
+            ),
         ]
+        if flash_attn_src_dir := _find_local_flash_attn_src_dir():
+            cmake_args += [f"-DVLLM_FLASH_ATTN_SRC_DIR={flash_attn_src_dir}"]
+        if cutlass_src_dir := _find_local_cutlass_src_dir():
+            cmake_args += [f"-DVLLM_CUTLASS_SRC_DIR={cutlass_src_dir}"]
 
         verbose = envs.VERBOSE
         if verbose:
@@ -817,6 +824,113 @@ def _build_custom_ops() -> bool:
     return _is_cuda() or _is_hip()
 
 
+def _flash_attn_source_has_target(target: str) -> bool:
+    src_dir = _find_local_flash_attn_src_dir()
+    if not src_dir:
+        return True
+
+    cmake_lists = Path(src_dir) / "CMakeLists.txt"
+    if not cmake_lists.is_file():
+        return True
+
+    try:
+        return target in cmake_lists.read_text()
+    except OSError:
+        return True
+
+
+def _find_local_flash_attn_src_dir() -> str | None:
+    env_src_dir = os.getenv("VLLM_FLASH_ATTN_SRC_DIR")
+    candidates = [Path(env_src_dir)] if env_src_dir else []
+
+    shared_root = ROOT_DIR.parent.parent
+    candidates.extend([
+        ROOT_DIR.parent / "fa2" / "flash-attention-v100",
+        ROOT_DIR.parent / "flash-attention-v100",
+        shared_root / "fa2" / "flash-attention-v100",
+        shared_root / "flash-attention-v100",
+        ROOT_DIR / ".deps" / "vllm-flash-attn-src",
+    ])
+
+    for candidate in candidates:
+        if (
+            candidate / "CMakeLists.txt"
+        ).is_file() and (
+            candidate / "vllm_flash_attn" / "flash_attn_interface.py"
+        ).is_file():
+            return str(candidate)
+    return None
+
+
+def _find_local_cutlass_src_dir() -> str | None:
+    shared_root = ROOT_DIR.parent.parent
+    candidates = [
+        ROOT_DIR / ".deps" / "flashmla-src" / "csrc" / "cutlass",
+        ROOT_DIR / ".deps" / "qutlass-src" / "third_party" / "cutlass",
+        shared_root / ".deps" / "flashmla-src" / "csrc" / "cutlass",
+        shared_root / ".deps" / "qutlass-src" / "third_party" / "cutlass",
+    ]
+    for candidate in candidates:
+        if (candidate / "include" / "cutlass" / "cutlass.h").is_file():
+            return str(candidate)
+    return None
+
+
+def _get_torch_cuda_arch_list():
+    raw_arch_list = os.getenv("TORCH_CUDA_ARCH_LIST")
+    if not raw_arch_list:
+        return None
+
+    parsed_arches = []
+    for raw_arch in re.split(r"[;, ]+", raw_arch_list.strip()):
+        if not raw_arch:
+            continue
+
+        token = raw_arch.lower().replace("+ptx", "")
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)([a-z]?)", token)
+        if not match:
+            logger.warning(
+                "Failed to parse TORCH_CUDA_ARCH_LIST entry %r; keeping default "
+                "vllm-flash-attn build behavior.",
+                raw_arch,
+            )
+            return None
+
+        version_token, suffix = match.groups()
+        if "." in version_token:
+            major_str, minor_str = version_token.split(".", 1)
+        else:
+            if len(version_token) < 2:
+                logger.warning(
+                    "Failed to parse TORCH_CUDA_ARCH_LIST entry %r; keeping "
+                    "default vllm-flash-attn build behavior.",
+                    raw_arch,
+                )
+                return None
+            major_str, minor_str = version_token[:-1], version_token[-1]
+
+        parsed_arches.append((int(major_str), int(minor_str), suffix))
+
+    return parsed_arches
+
+
+def _should_build_fa2():
+    arch_list = _get_torch_cuda_arch_list()
+    if arch_list is None:
+        return True
+    return any((major, minor) >= (8, 0) for major, minor, _ in arch_list)
+
+
+def _should_build_fa3():
+    arch_list = _get_torch_cuda_arch_list()
+    if arch_list is None:
+        return True
+    return any(
+        (major, minor, suffix) == (9, 0, "a")
+        for major, minor, suffix in arch_list
+    )
+
+
 def get_rocm_version():
     # Get the Rocm version from the ROCM_HOME/bin/librocm-core.so
     # see https://github.com/ROCm/rocm-core/blob/d11f5c20d500f729c393680a01fa902ebf92094b/rocm_version.cpp#L21
@@ -966,17 +1080,29 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
-    ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    if _should_build_fa2():
+        ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    else:
+        logger.info(
+            "Skipping vllm-flash-attn FA2 build because "
+            "TORCH_CUDA_ARCH_LIST=%r does not target SM80+.",
+            os.getenv("TORCH_CUDA_ARCH_LIST"),
+        )
+
     if envs.VLLM_USE_PRECOMPILED or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
     ):
         # FA3 requires CUDA 12.3 or later
-        ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
-    # FA4 CuteDSL - Python-only component for FA4's cute DSL support
-    # Optional since this doesn't produce a .so file, just copies Python files
-    ext_modules.append(
-        CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa4_cutedsl_C", optional=True)
-    )
+        if _should_build_fa3() and _flash_attn_source_has_target("_vllm_fa3_C"):
+            ext_modules.append(
+                CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C")
+            )
+        elif not _should_build_fa3():
+            logger.info(
+                "Skipping vllm-flash-attn FA3 build because "
+                "TORCH_CUDA_ARCH_LIST=%r does not target SM90a.",
+                os.getenv("TORCH_CUDA_ARCH_LIST"),
+            )
     if envs.VLLM_USE_PRECOMPILED or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.9")
     ):

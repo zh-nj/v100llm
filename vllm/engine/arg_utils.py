@@ -253,12 +253,17 @@ def _maybe_add_docs_url(cls: Any) -> str:
     return f"\n\nAPI docs: https://docs.vllm.ai/en/{version}/api/vllm/config/#vllm.config.{cls.__name__}"
 
 
-@functools.lru_cache(maxsize=30)
-def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
+@functools.lru_cache(maxsize=64)
+def _compute_kwargs(
+    cls: ConfigType,
+    only_fields: tuple[str, ...] | None = None,
+) -> dict[str, dict[str, Any]]:
     # Save time only getting attr docs if we're generating help text
     cls_docs = get_attr_docs(cls) if NEEDS_HELP else {}
     kwargs = {}
     for field in fields(cls):
+        if only_fields is not None and field.name not in only_fields:
+            continue
         # Get the set of possible types for the field
         type_hints: set[TypeHint] = get_type_hints(field.type)
 
@@ -356,7 +361,10 @@ def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     return kwargs
 
 
-def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
+def get_kwargs(
+    cls: ConfigType,
+    only_fields: tuple[str, ...] | None = None,
+) -> dict[str, dict[str, Any]]:
     """Return argparse kwargs for the given Config dataclass.
 
     If `--help` or `mkdocs` are not present in the command line command, the
@@ -366,7 +374,7 @@ def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     is returned so callers can mutate the dictionary without affecting the
     cached version.
     """
-    return copy.deepcopy(_compute_kwargs(cls))
+    return copy.deepcopy(_compute_kwargs(cls, only_fields))
 
 
 @dataclass
@@ -465,6 +473,7 @@ class EngineArgs:
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
+    swap_space: float = 4
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1291,7 +1300,25 @@ class EngineArgs:
         kernel_group.add_argument("--moe-backend", **moe_backend_kwargs)
 
         # vLLM arguments
-        vllm_kwargs = get_kwargs(VllmConfig)
+        vllm_kwargs = get_kwargs(
+            VllmConfig,
+            only_fields=(
+                "speculative_config",
+                "kv_transfer_config",
+                "kv_events_config",
+                "ec_transfer_config",
+                "compilation_config",
+                "attention_config",
+                "reasoning_config",
+                "kernel_config",
+                "additional_config",
+                "structured_outputs_config",
+                "profiler_config",
+                "optimization_level",
+                "performance_mode",
+                "weight_transfer_config",
+            ),
+        )
         vllm_group = parser.add_argument_group(
             title="VllmConfig",
             description=VllmConfig.__doc__,

@@ -115,6 +115,10 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
                           int64_t numRows, int64_t stride0, int64_t stride1,
                           int64_t topK);
 
+void large_context_topk(const torch::Tensor& logits, torch::Tensor& indices,
+                        const torch::Tensor& seq_lens,
+                        std::optional<torch::Tensor> row_starts = std::nullopt);
+
 void rms_norm_static_fp8_quant(torch::Tensor& out, torch::Tensor& input,
                                torch::Tensor& weight, torch::Tensor& scale,
                                double epsilon);
@@ -366,12 +370,21 @@ void get_cutlass_moe_mm_data(
     torch::Tensor& problem_sizes1, torch::Tensor& problem_sizes2,
     torch::Tensor& input_permutation, torch::Tensor& output_permutation,
     const int64_t num_experts, const int64_t n, const int64_t k,
-    const std::optional<torch::Tensor>& blockscale_offsets);
+    const std::optional<torch::Tensor>& blockscale_offsets,
+    const bool is_gated);
 
 void get_cutlass_moe_mm_problem_sizes_from_expert_offsets(
     const torch::Tensor& expert_first_token_offset,
     torch::Tensor& problem_sizes1, torch::Tensor& problem_sizes2,
     const int64_t n, const int64_t k, const bool swap_ab);
+
+void get_cutlass_batched_moe_mm_data(torch::Tensor& expert_offsets,
+                                     torch::Tensor& problem_sizes1,
+                                     torch::Tensor& problem_sizes2,
+                                     const torch::Tensor& expert_num_tokens,
+                                     const int64_t num_local_experts,
+                                     const int64_t padded_m,
+                                     const int64_t n, const int64_t k);
 
 void get_cutlass_pplx_moe_mm_data(torch::Tensor& expert_offsets,
                                   torch::Tensor& problem_sizes1,
@@ -403,6 +416,15 @@ void scaled_fp4_quant(torch::Tensor& output, torch::Tensor const& input,
                       torch::Tensor& output_scale,
                       torch::Tensor const& input_scale,
                       bool is_sf_swizzled_layout);
+
+void scaled_fp4_quant_out(torch::Tensor const& input,
+                          torch::Tensor const& input_sf,
+                          bool is_sf_swizzled_layout, torch::Tensor& output,
+                          torch::Tensor& output_sf);
+
+std::tuple<torch::Tensor, torch::Tensor> scaled_fp4_quant_func(
+    torch::Tensor const& input, torch::Tensor const& input_sf,
+    bool is_sf_swizzled_layout);
 
 void scaled_fp4_experts_quant(
     torch::Tensor& output, torch::Tensor& output_scale,
@@ -473,7 +495,9 @@ void selective_scan_fwd(
     const torch::Tensor& ssm_states, int64_t pad_slot_id, int64_t block_size,
     const std::optional<torch::Tensor>& block_idx_first_scheduled_token,
     const std::optional<torch::Tensor>& block_idx_last_scheduled_token,
-    const std::optional<torch::Tensor>& initial_state_idx);
+    const std::optional<torch::Tensor>& initial_state_idx,
+    const std::optional<torch::Tensor>& cu_chunk_seqlen,
+    const std::optional<torch::Tensor>& last_chunk_indices);
 
 torch::Tensor dynamic_4bit_int_moe_cpu(
     torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,

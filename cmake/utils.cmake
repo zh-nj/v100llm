@@ -576,6 +576,18 @@ function (define_extension_target MOD_NAME)
   # Don't use `TORCH_LIBRARIES` for CUDA since it pulls in a bunch of
   # dependencies that are not necessary and may not be installed.
   if (ARG_LANGUAGE STREQUAL "CUDA")
+    set(_vllm_cuda_link_dirs
+      "${CUDA_TOOLKIT_ROOT_DIR}/lib64"
+      "${CUDA_TOOLKIT_ROOT_DIR}/lib")
+    file(GLOB _vllm_cuda_target_link_dirs LIST_DIRECTORIES true
+      "${CUDA_TOOLKIT_ROOT_DIR}/targets/*/lib")
+    list(APPEND _vllm_cuda_link_dirs ${_vllm_cuda_target_link_dirs})
+    list(REMOVE_DUPLICATES _vllm_cuda_link_dirs)
+    foreach(_vllm_cuda_link_dir ${_vllm_cuda_link_dirs})
+      if (EXISTS "${_vllm_cuda_link_dir}")
+        target_link_directories(${MOD_NAME} PRIVATE "${_vllm_cuda_link_dir}")
+      endif()
+    endforeach()
     target_link_libraries(${MOD_NAME} PRIVATE torch CUDA::cudart CUDA::cuda_driver ${ARG_LIBRARIES})
   else()
     target_link_libraries(${MOD_NAME} PRIVATE torch ${TORCH_LIBRARIES} ${ARG_LIBRARIES})

@@ -1,6 +1,7 @@
 # Install OpenAI triton_kernels from https://github.com/triton-lang/triton/tree/main/python/triton_kernels
 
 set(DEFAULT_TRITON_KERNELS_TAG "v3.6.0")
+set(VENDORED_TRITON_KERNELS_DIR "${CMAKE_SOURCE_DIR}/vllm/third_party/triton_kernels")
 
 # Set TRITON_KERNELS_SRC_DIR for use with local development with vLLM. We expect TRITON_KERNELS_SRC_DIR to
 # be directly set to the triton_kernels python directory.
@@ -24,19 +25,22 @@ else()
   )
 endif()
 
-# Fetch content
-FetchContent_MakeAvailable(triton_kernels)
-
-if (NOT triton_kernels_SOURCE_DIR)
-  message (FATAL_ERROR "[triton_kernels] Cannot resolve triton_kernels_SOURCE_DIR")
-endif()
-
 if (DEFINED ENV{TRITON_KERNELS_SRC_DIR})
+  FetchContent_MakeAvailable(triton_kernels)
+  if (NOT triton_kernels_SOURCE_DIR)
+    message (FATAL_ERROR "[triton_kernels] Cannot resolve triton_kernels_SOURCE_DIR")
+  endif()
   set(TRITON_KERNELS_PYTHON_DIR "${triton_kernels_SOURCE_DIR}/")
+elseif (EXISTS "${VENDORED_TRITON_KERNELS_DIR}/__init__.py")
+  set(TRITON_KERNELS_PYTHON_DIR "${VENDORED_TRITON_KERNELS_DIR}/")
+  message(STATUS "[triton_kernels] Using vendored python sources at ${TRITON_KERNELS_PYTHON_DIR}")
 else()
+  FetchContent_MakeAvailable(triton_kernels)
+  if (NOT triton_kernels_SOURCE_DIR)
+    message (FATAL_ERROR "[triton_kernels] Cannot resolve triton_kernels_SOURCE_DIR")
+  endif()
   set(TRITON_KERNELS_PYTHON_DIR "${triton_kernels_SOURCE_DIR}/python/triton_kernels/triton_kernels/")
 endif()
-
 message (STATUS "[triton_kernels] triton_kernels is available at ${TRITON_KERNELS_PYTHON_DIR}")
 
 add_custom_target(triton_kernels)

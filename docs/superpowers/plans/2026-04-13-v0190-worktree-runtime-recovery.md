@@ -990,7 +990,6 @@ async def main():
     engine = AsyncLLM.from_engine_args(
         AsyncEngineArgs(
             model="/mnt/data6/models/Qwen3.5-122B-A10B-AWQ-4bit",
-            quantization="awq",
             dtype="half",
             tensor_parallel_size=4,
             gpu_memory_utilization=0.90,
@@ -1026,6 +1025,7 @@ PY
 
 Expected:
 
+- This model's `config.json` advertises `quant_method=compressed-tensors`, so the smoke should rely on auto-detection instead of forcing `quantization=awq`
 - Best case: non-empty output plus `finish_reason stop` or `length`
 - If startup fails or time budget is exceeded, stop after the first real failure and record that exact blocker in the verification log instead of iterating blindly
 

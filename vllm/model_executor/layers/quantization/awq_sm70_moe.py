@@ -32,6 +32,13 @@ _DEFAULT_PERSISTENT_MAX_TOKENS = 32
 _DEFAULT_MAX_TOKENS = _DEFAULT_PERSISTENT_MAX_TOKENS
 
 
+def _moe_permute_accepts_scale_and_m_indices() -> bool:
+    schemas = getattr(torch.ops._moe_C.moe_permute, "_schemas", {})
+    if not schemas:
+        return False
+    return any("m_indices" in str(schema) for schema in schemas.values())
+
+
 def _single_token_compact_enabled() -> bool:
     raw = os.getenv("VLLM_SM70_AWQ_ENABLE_SINGLE_TOKEN_COMPACT")
     return raw == "1"
@@ -565,6 +572,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """MoE forward: batched GEMM (preferred) or sorted-loop fallback."""
         if (
@@ -680,21 +688,36 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         token_expert_indices = buffers["token_expert_indices"]
 
         topk_ids_i32.copy_(topk_ids, non_blocking=True)
-        torch.ops._moe_C.moe_permute(
-            x,
-            topk_ids_i32,
-            token_expert_indices,
-            None,
-            num_experts,
-            num_experts,
-            top_k,
-            None,
-            permuted_input,
-            expert_offsets64,
-            inv_permuted_idx,
-            permuted_idx,
-            m_indices,
-        )
+        if _moe_permute_accepts_scale_and_m_indices():
+            torch.ops._moe_C.moe_permute(
+                x,
+                topk_ids_i32,
+                token_expert_indices,
+                None,
+                num_experts,
+                num_experts,
+                top_k,
+                None,
+                permuted_input,
+                expert_offsets64,
+                inv_permuted_idx,
+                permuted_idx,
+                m_indices,
+            )
+        else:
+            torch.ops._moe_C.moe_permute(
+                x,
+                topk_ids_i32,
+                token_expert_indices,
+                None,
+                num_experts,
+                num_experts,
+                top_k,
+                permuted_input,
+                expert_offsets64,
+                inv_permuted_idx,
+                permuted_idx,
+            )
         buffers["expert_offsets"].copy_(expert_offsets64, non_blocking=True)
         return permuted_input, expert_offsets64, inv_permuted_idx
 

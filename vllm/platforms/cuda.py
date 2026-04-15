@@ -35,6 +35,7 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 pynvml = import_pynvml()
+disable_nvml = os.environ.get("VLLM_DISABLE_NVML") == "1"
 
 # pytorch 2.5 uses cudnn sdpa by default, which will cause crash on some models
 # see https://github.com/huggingface/diffusers/issues/9704 for details
@@ -280,6 +281,10 @@ class CudaPlatformBase(Platform):
         return torch.cuda.max_memory_allocated(device)
 
     @classmethod
+    def num_compute_units(cls, device_id: int = 0) -> int:
+        return torch.cuda.get_device_properties(device_id).multi_processor_count
+
+    @classmethod
     def get_valid_backends(
         cls,
         device_capability: DeviceCapability,
@@ -315,6 +320,7 @@ class CudaPlatformBase(Platform):
         cls,
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
+        num_heads: int | None = None,
     ) -> str:
         device_capability = cls.get_device_capability()
         assert device_capability is not None
@@ -499,6 +505,10 @@ class CudaPlatformBase(Platform):
     def support_static_graph_mode(cls) -> bool:
         return True
 
+    @classmethod
+    def use_custom_op_collectives(cls) -> bool:
+        return True
+
 
 # NVML utils
 # Note that NVML is not affected by `CUDA_VISIBLE_DEVICES`,
@@ -626,17 +636,19 @@ class NonNvmlCudaPlatform(CudaPlatformBase):
 # Autodetect either NVML-enabled or non-NVML platform
 # based on whether NVML is available.
 nvml_available = False
-try:
+if not disable_nvml:
     try:
-        pynvml.nvmlInit()
-        nvml_available = True
-    except Exception:
-        # On Jetson, NVML is not supported.
-        nvml_available = False
-finally:
-    if nvml_available:
-        pynvml.nvmlShutdown()
+        try:
+            pynvml.nvmlInit()
+            nvml_available = True
+        except Exception:
+            # On Jetson, NVML is not supported.
+            nvml_available = False
+    finally:
+        if nvml_available:
+            pynvml.nvmlShutdown()
 
 CudaPlatform = NvmlCudaPlatform if nvml_available else NonNvmlCudaPlatform
 
-CudaPlatform.log_warnings()
+if not disable_nvml:
+    CudaPlatform.log_warnings()

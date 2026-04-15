@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
 
-from vllm.utils.collection_utils import common_prefix, swap_dict_values
+from vllm.utils.collection_utils import as_iter, common_prefix, swap_dict_values
 
 
 @pytest.mark.parametrize(
@@ -45,3 +45,16 @@ def test_swap_dict_values(obj, key1, key2):
         assert obj[key1] == original_obj[key2]
     else:
         assert key1 not in obj
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("abc", ["abc"]),
+        (7, [7]),
+        ([1, 2], [1, 2]),
+        ((1, 2), (1, 2)),
+    ],
+)
+def test_as_iter_wraps_scalars_but_keeps_iterables(value, expected):
+    assert list(as_iter(value)) == list(expected)

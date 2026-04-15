@@ -1590,3 +1590,8 @@ class FusedMoEKernel:
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts_input=shared_experts_input,
         )
+
+
+# Backward-compatible aliases for pre-refactor fused MoE modular APIs.
+FusedMoEPermuteExpertsUnpermute = FusedMoEExpertsModular
+FusedMoEModularKernel = FusedMoEKernel

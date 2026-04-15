@@ -24,6 +24,11 @@ def xpu_is_initialized() -> bool:
     return torch.xpu.is_initialized()
 
 
+def get_cu_count(device_id: int = 0) -> int:
+    """Backwards-compatible alias for the device's compute unit count."""
+    return num_compute_units(device_id)
+
+
 def cuda_get_device_properties(
     device, names: Sequence[str], init_cuda=False
 ) -> tuple[Any, ...]:

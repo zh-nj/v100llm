@@ -14,6 +14,9 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
+import vllm.platforms as platforms_module
+import vllm.utils.import_utils as import_utils
 
 SCRIPTS_DIR = Path(__file__).parent / "scripts"
 
@@ -42,6 +45,47 @@ def test_device_count_respects_env_after_platform_import():
         pytest.fail(
             f"device_count does not respect env var after import:\n{result.stderr}"
         )
+
+
+def test_disable_nvml_plugin_uses_non_nvml_fallback(monkeypatch):
+    monkeypatch.setenv("VLLM_DISABLE_NVML", "1")
+    monkeypatch.setattr(platforms_module, "vllm_version_matches_substr", lambda _: False)
+    monkeypatch.setattr(
+        platforms_module,
+        "_non_nvml_cuda_platform_available",
+        lambda: True,
+    )
+
+    assert platforms_module.cuda_platform_plugin() == "vllm.platforms.cuda.CudaPlatform"
+
+
+def test_cuda_plugin_falls_back_to_device_files_on_nvml_error(monkeypatch):
+    class MockNVMLError_Unknown(Exception):
+        pass
+
+    def raise_nvml_error():
+        raise MockNVMLError_Unknown("Unknown Error")
+
+    monkeypatch.delenv("VLLM_DISABLE_NVML", raising=False)
+    monkeypatch.setattr(platforms_module, "vllm_version_matches_substr", lambda _: False)
+    monkeypatch.setattr(import_utils, "import_pynvml", raise_nvml_error)
+    monkeypatch.setattr(platforms_module, "_has_nvidia_device_files", lambda: True)
+
+    assert platforms_module.cuda_platform_plugin() == "vllm.platforms.cuda.CudaPlatform"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA host")
+def test_disable_nvml_still_detects_cuda_platform():
+    result = run_script("check_disable_nvml_cuda_platform.py")
+    if result.returncode != 0:
+        pytest.fail(f"disable-nvml CUDA detection failed:\n{result.stderr}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA host")
+def test_cuda_platform_uses_custom_op_collectives():
+    from vllm.platforms import current_platform
+
+    assert current_platform.use_custom_op_collectives()
 
 
 if __name__ == "__main__":

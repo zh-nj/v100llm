@@ -104,12 +104,16 @@ from vllm.platforms import CpuArchEnum, current_platform
 logger = init_logger(__name__)
 
 
-def _is_sm70_available() -> bool:
-    """Check if current CUDA device is SM70 (V100)."""
+def _is_sm70_available(device: torch.device | str | None = None) -> bool:
+    """Check if the target CUDA device is SM70 (V100)."""
     if not torch.cuda.is_available():
         return False
     try:
-        cap = torch.cuda.get_device_capability()
+        cap = (
+            torch.cuda.get_device_capability(torch.device(device))
+            if device is not None
+            else torch.cuda.get_device_capability()
+        )
         return cap == (7, 0)
     except Exception:
         return False
@@ -191,7 +195,10 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
 
             # SM70 (V100): use TurboMind GEMM kernels,
             # Marlin requires SM75+.
-            if _is_sm70_available() and weight_quant.num_bits == 4:
+            if (
+                _is_sm70_available(layer.moe_config.device)
+                and weight_quant.num_bits == 4
+            ):
                 gs = weight_quant.group_size
                 moe_cfg = layer.moe_config
                 hidden = moe_cfg.hidden_dim
@@ -2251,6 +2258,7 @@ class CompressedTensorsSM70WNA16MoEMethod(CompressedTensorsMoEMethod):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Lazy-import and delegate to AWQSM70MoEMethod
         if self._awq_moe is None:
@@ -2263,7 +2271,13 @@ class CompressedTensorsSM70WNA16MoEMethod(CompressedTensorsMoEMethod):
                 zero_point=False,
                 moe=self.moe,
             )
-        return self._awq_moe.apply(layer, x, topk_weights, topk_ids)
+        return self._awq_moe.apply(
+            layer,
+            x,
+            topk_weights,
+            topk_ids,
+            shared_experts_input=shared_experts_input,
+        )
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module

@@ -226,7 +226,19 @@ class TokenizeParams:
                 value=truncate_prompt_tokens,
             )
 
-    def with_kwargs(self, **tokenization_kwargs: Any):
+    def with_kwargs(
+        self,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        /,
+        **extra_tokenization_kwargs: Any,
+    ):
+        if tokenization_kwargs is None:
+            tokenization_kwargs = {}
+        else:
+            tokenization_kwargs = dict(tokenization_kwargs)
+
+        tokenization_kwargs.update(extra_tokenization_kwargs)
+
         max_length = tokenization_kwargs.pop("max_length", self.max_input_tokens)
         pad_prompt_tokens = tokenization_kwargs.pop(
             "pad_prompt_tokens", self.pad_prompt_tokens

@@ -1833,6 +1833,7 @@ class LLM:
             request_id,
             prompt,
             params,
+            supported_tasks=self.supported_tasks,
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,

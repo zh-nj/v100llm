@@ -1,5 +1,27 @@
 include(FetchContent)
 
+set(VENDORED_FLASHMLA_INTERFACE
+    "${CMAKE_SOURCE_DIR}/vllm/third_party/flashmla/flash_mla_interface.py")
+
+set(SUPPORT_ARCHS)
+if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
+    list(APPEND SUPPORT_ARCHS "9.0a")
+endif()
+if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
+    # CUDA 12.9 has introduced "Family-Specific Architecture Features"
+    # this supports all compute_10x family
+    list(APPEND SUPPORT_ARCHS "10.0f")
+elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+    list(APPEND SUPPORT_ARCHS "10.0a")
+endif()
+
+cuda_archs_loose_intersection(FLASH_MLA_ARCHS "${SUPPORT_ARCHS}" "${CUDA_ARCHS}")
+
+if(NOT FLASH_MLA_ARCHS AND EXISTS "${VENDORED_FLASHMLA_INTERFACE}")
+  message(STATUS "FlashMLA build skipped for CUDA_ARCHS='${CUDA_ARCHS}'; using vendored interface only.")
+  return()
+endif()
+
 # If FLASH_MLA_SRC_DIR is set, flash-mla is installed from that directory 
 # instead of downloading.
 # It can be set as an environment variable or passed as a cmake argument.
@@ -51,21 +73,6 @@ install(FILES "${FLASHMLA_VENDOR_DIR}/flash_mla_interface.py"
 # The FlashMLA kernels only work on hopper and require CUDA 12.3 or later.
 # Only build FlashMLA kernels if we are building for something compatible with 
 # sm90a
-
-set(SUPPORT_ARCHS)
-if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
-    list(APPEND SUPPORT_ARCHS "9.0a")
-endif()
-if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
-    # CUDA 12.9 has introduced "Family-Specific Architecture Features"
-    # this supports all compute_10x family
-    list(APPEND SUPPORT_ARCHS "10.0f")
-elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
-    list(APPEND SUPPORT_ARCHS "10.0a")
-endif()
-
-
-cuda_archs_loose_intersection(FLASH_MLA_ARCHS "${SUPPORT_ARCHS}" "${CUDA_ARCHS}")
 if(FLASH_MLA_ARCHS)
     message(STATUS "FlashMLA CUDA architectures: ${FLASH_MLA_ARCHS}")
     set(VLLM_FLASHMLA_GPU_FLAGS ${VLLM_GPU_FLAGS})
@@ -183,4 +190,3 @@ else()
     add_custom_target(_flashmla_C)
     add_custom_target(_flashmla_extension_C)
 endif()
-

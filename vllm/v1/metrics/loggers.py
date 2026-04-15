@@ -632,41 +632,6 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_prompt_tokens_recomputed, per_engine_labelvalues
         )
 
-        # Labeled prompt token counters by source
-        counter_prompt_tokens_by_source = self._counter_cls(
-            name="vllm:prompt_tokens_by_source",
-            documentation="Number of prompt tokens by source.",
-            labelnames=labelnames + ["source"],
-        )
-        self.counter_prompt_tokens_by_source: dict[str, dict[int, Counter]] = {}
-        for source in PromptTokenStats.ALL_SOURCES:
-            self.counter_prompt_tokens_by_source[source] = {
-                idx: counter_prompt_tokens_by_source.labels(
-                    model_name, str(idx), source
-                )
-                for idx in engine_indexes
-            }
-
-        # Cached prompt tokens counter
-        counter_prompt_tokens_cached = self._counter_cls(
-            name="vllm:prompt_tokens_cached",
-            documentation="Number of cached prompt tokens (local + external).",
-            labelnames=labelnames,
-        )
-        self.counter_prompt_tokens_cached = make_per_engine(
-            counter_prompt_tokens_cached, engine_indexes, model_name
-        )
-
-        # Recomputed tokens (last token recomputed when entire prompt is cached)
-        counter_prompt_tokens_recomputed = self._counter_cls(
-            name="vllm:prompt_tokens_recomputed",
-            documentation="Number of cached tokens recomputed for forward pass.",
-            labelnames=labelnames,
-        )
-        self.counter_prompt_tokens_recomputed = make_per_engine(
-            counter_prompt_tokens_recomputed, engine_indexes, model_name
-        )
-
         counter_generation_tokens = self._counter_cls(
             name="vllm:generation_tokens",
             documentation="Number of generation tokens processed.",

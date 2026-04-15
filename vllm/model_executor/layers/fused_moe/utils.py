@@ -6,6 +6,10 @@ from math import prod
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.fused_moe.activation import (
+    activation_without_mul,
+    apply_moe_activation,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )

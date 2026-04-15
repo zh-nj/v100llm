@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING
 import torch
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     align_fp4_moe_weights_for_fi,
 )
@@ -29,6 +31,8 @@ logger = init_logger(__name__)
 
 
 __all__ = [
+    "flashinfer_trtllm_fp4_moe",
+    "flashinfer_trtllm_fp4_routed_moe",
     "reorder_w1w3_to_w3w1",
 ]
 
@@ -286,3 +290,141 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         w2_scale = swizzle_blockscale(w2_scale)
 
     return w13, w13_scale, w13_scale_2, a13_scale, w2, w2_scale, w2_scale_2, a2_scale
+
+
+def flashinfer_trtllm_fp4_moe(
+    layer: torch.nn.Module,
+    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    router_logits: torch.Tensor,
+    top_k: int,
+    activation: str,
+    global_num_experts: int,
+    num_expert_group: int | None,
+    topk_group: int | None,
+    custom_routing_function: object | None,
+    e_score_correction_bias: torch.Tensor | None,
+) -> torch.Tensor:
+    import flashinfer
+
+    from vllm.model_executor.models.llama4 import Llama4MoE
+
+    assert activation == "silu", (
+        "Only SiLU activation is supported for FlashInfer TRTLLM FP4 MoE. "
+        f"{activation} found instead."
+    )
+
+    if isinstance(x, tuple):
+        hidden_states_fp4, hidden_states_scale_linear_fp4 = x
+    else:
+        hidden_states_fp4, hidden_states_scale_linear_fp4 = ops.scaled_fp4_quant(
+            x, layer.a1_gscale, is_sf_swizzled_layout=False
+        )
+
+    use_llama4_routing = custom_routing_function is Llama4MoE.custom_routing_function
+    routing_method_type = layer.routing_method_type
+    if use_llama4_routing:
+        routing_method_type = flashinfer.RoutingMethodType.Llama4
+
+    routing_bias = e_score_correction_bias
+    if routing_bias is not None:
+        routing_bias = routing_bias.to(torch.bfloat16)
+
+    router_logits = (
+        router_logits.to(torch.float32)
+        if routing_method_type == RoutingMethodType.DeepSeekV3
+        else router_logits
+    )
+
+    out = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+        routing_logits=router_logits,
+        routing_bias=routing_bias,
+        hidden_states=hidden_states_fp4,
+        hidden_states_scale=hidden_states_scale_linear_fp4.view(
+            torch.float8_e4m3fn
+        ).flatten(),
+        gemm1_weights=layer.w13_weight.data,
+        gemm1_weights_scale=layer.w13_weight_scale.data.view(torch.float8_e4m3fn),
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=layer.w2_weight.data,
+        gemm2_weights_scale=layer.w2_weight_scale.data.view(torch.float8_e4m3fn),
+        gemm2_bias=None,
+        output1_scale_scalar=layer.g1_scale_c.data,
+        output1_scale_gate_scalar=layer.g1_alphas.data,
+        output2_scale_scalar=layer.g2_alphas.data,
+        num_experts=global_num_experts,
+        top_k=top_k,
+        n_group=num_expert_group if num_expert_group is not None else 0,
+        topk_group=topk_group if topk_group is not None else 0,
+        intermediate_size=layer.intermediate_size_per_partition,
+        local_expert_offset=layer.ep_rank * layer.local_num_experts,
+        local_num_experts=layer.local_num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=routing_method_type,
+        do_finalize=True,
+    )[0]
+
+    return out
+
+
+def flashinfer_trtllm_fp4_routed_moe(
+    layer: torch.nn.Module,
+    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    top_k: int,
+    activation: str,
+    global_num_experts: int,
+) -> torch.Tensor:
+    import flashinfer
+
+    assert activation == "silu", (
+        "Only SiLU activation is supported for FlashInfer TRTLLM FP4 Routed MoE. "
+        f"{activation} found instead."
+    )
+
+    packed_tensor = (topk_ids.to(torch.int32) << 16) | topk_weights.to(
+        torch.bfloat16
+    ).view(torch.int16)
+
+    if isinstance(x, tuple):
+        hidden_states_fp4, hidden_states_scale_linear_fp4 = x
+    else:
+        hidden_states_fp4, hidden_states_scale_linear_fp4 = ops.scaled_fp4_quant(
+            x, layer.a1_gscale, is_sf_swizzled_layout=False
+        )
+
+    out = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
+        topk_ids=packed_tensor,
+        routing_bias=None,
+        hidden_states=hidden_states_fp4,
+        hidden_states_scale=hidden_states_scale_linear_fp4.view(
+            torch.float8_e4m3fn
+        ).flatten(),
+        gemm1_weights=layer.w13_weight.data,
+        gemm1_weights_scale=layer.w13_weight_scale.data.view(torch.float8_e4m3fn),
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=layer.w2_weight.data,
+        gemm2_weights_scale=layer.w2_weight_scale.data.view(torch.float8_e4m3fn),
+        gemm2_bias=None,
+        output1_scale_scalar=layer.g1_scale_c.data,
+        output1_scale_gate_scalar=layer.g1_alphas.data,
+        output2_scale_scalar=layer.g2_alphas.data,
+        num_experts=global_num_experts,
+        top_k=top_k,
+        n_group=0,
+        topk_group=0,
+        intermediate_size=layer.intermediate_size_per_partition,
+        local_expert_offset=layer.ep_rank * layer.local_num_experts,
+        local_num_experts=layer.local_num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=1,
+        do_finalize=True,
+    )[0]
+
+    return out

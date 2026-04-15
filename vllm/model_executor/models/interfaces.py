@@ -348,6 +348,7 @@ class SupportsMultiModal(Protocol):
         multimodal_embeddings: MultiModalEmbeddings,
         *,
         is_multimodal: torch.Tensor,
+        handle_oov_mm_token: bool = False,
     ) -> Tensor: ...
 
     def _embed_text_input_ids(
@@ -356,7 +357,18 @@ class SupportsMultiModal(Protocol):
         embed_input_ids: Callable[[Tensor], Tensor],
         *,
         is_multimodal: Tensor | None,
+        handle_oov_mm_token: bool = False,
     ) -> Tensor:
+        if handle_oov_mm_token and is_multimodal is not None:
+            is_text = ~is_multimodal
+            text_embeds = embed_input_ids(input_ids[is_text])
+
+            return torch.empty(
+                (input_ids.shape[0], text_embeds.shape[1]),
+                dtype=text_embeds.dtype,
+                device=text_embeds.device,
+            ).masked_scatter_(is_text.unsqueeze_(-1), text_embeds)
+
         if is_multimodal is not None and self._has_oov_mm_tokens:
             # Force all input IDs to be in vocab; we do this instead of squeezing
             # to ensure that any external configuration requiring offset tracking,
@@ -373,6 +385,7 @@ class SupportsMultiModal(Protocol):
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: Tensor | None = None,
+        handle_oov_mm_token: bool = False,
     ) -> Tensor:
         """
         Apply token embeddings to `input_ids`.
@@ -393,6 +406,7 @@ class SupportsMultiModal(Protocol):
             input_ids,
             self.get_language_model().embed_input_ids,
             is_multimodal=is_multimodal,
+            handle_oov_mm_token=handle_oov_mm_token,
         )
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:

@@ -2,12 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import field
-from typing import ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
 
 from vllm.config.utils import config
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.config.parallel import ParallelConfig
+else:
+    ParallelConfig = Any
 
 logger = init_logger(__name__)
 
@@ -191,6 +196,14 @@ class CacheConfig:
         # convert cache_config to dict(key: str, value: str) for prometheus
         # metrics info
         return {key: str(value) for key, value in self.__dict__.items()}
+
+    def verify_with_parallel_config(
+        self,
+        parallel_config: ParallelConfig,
+    ) -> None:
+        # Cache/offload validation moved out of CacheConfig in this branch,
+        # but VllmConfig still calls the legacy hook during construction.
+        return None
 
     _block_size_resolved: bool = field(default=False, init=False)
     """Guard against pydantic re-running _apply_block_size_default."""
