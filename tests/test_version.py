@@ -16,6 +16,11 @@ def test_version_tuple():
     assert len(version.__version_tuple__) in (3, 4, 5)
 
 
+def test_release_version_matches_v0190():
+    assert version.__version__ == "0.19.0"
+    assert version.__version_tuple__[:3] == (0, 19, 0)
+
+
 @pytest.mark.parametrize(
     "version_tuple, version_str, expected",
     [
