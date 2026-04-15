@@ -116,4 +116,6 @@ python -m vllm.entrypoints.cli.main --version
 ## Acknowledgements / 致谢
 
 - [vLLM](https://github.com/vllm-project/vllm)
+- [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)
 - [lmdeploy / TurboMind](https://github.com/InternLM/lmdeploy)
+- [flash-attention-v100](https://github.com/zhinianqin/flash-attention-v100)
