@@ -980,7 +980,7 @@ def get_nvcc_cuda_version() -> Version:
     return nvcc_cuda_version
 
 
-DEFAULT_VLLM_RELEASE_VERSION = "0.19.0"
+DEFAULT_VLLM_RELEASE_VERSION = "0.19.1"
 
 
 def get_vllm_version() -> str:
