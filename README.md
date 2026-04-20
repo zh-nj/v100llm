@@ -1,19 +1,20 @@
-# v100llm (vLLM 0.19.0 for V100/SM70)
+# v100llm (vLLM 0.19.1 for V100/SM70)
 
-`v100llm` 是一个面向 `Tesla V100 / SM70` 的 `vLLM 0.19.0` 定向分支。这个仓库的重点不是重新定义
+`v100llm` 是一个面向 `Tesla V100 / SM70` 的 `vLLM 0.19.1` 定向分支。这个仓库的重点不是重新定义
 `vllm` 的 Python API，而是在保持现有 `vllm` 包和 CLI 习惯不变的前提下，恢复并验证 V100 上真实需要的
 推理路径，包括 `FLASH_ATTN`、`AWQ`、`compressed-tensors MoE` 和 MiniMax/Qwen3.5 相关运行时链路。
 
-`v100llm` is a `vLLM 0.19.0` fork focused on `Tesla V100 / SM70`. The repository keeps the existing
+`v100llm` is a `vLLM 0.19.1` fork focused on `Tesla V100 / SM70`. The repository keeps the existing
 `vllm` package and CLI interface for compatibility, while restoring and validating the inference paths
 that matter on V100, including `FLASH_ATTN`, `AWQ`, `compressed-tensors MoE`, and the runtime paths
 used by recent Qwen3.5 and MiniMax models.
 
 ## Highlights / 项目亮点
 
-- 基于 upstream `vLLM 0.19.0`，但面向 `V100 / SM70` 做了运行时恢复与兼容性补充。
+- 基于 upstream `vLLM 0.19.1`，但面向 `V100 / SM70` 做了运行时恢复与兼容性补充。
 - 仓库名称是 `v100llm`，但安装后的 Python 包名和 CLI 仍然是 `vllm`，便于兼容现有脚本与调用方式。
-- 当前默认对外打包版本固定为 `0.19.0`；`python setup.py --version`、`vllm.__version__` 和 CLI `--version` 已对齐。
+- 当前默认对外打包版本固定为 `0.19.1`；`python setup.py --version`、`vllm.__version__` 和 CLI `--version` 已对齐。
+- 当前 `Gemma4` 相关验证基线使用 `transformers 5.5.4`。
 - 已在实际 V100 环境验证 `Qwen3.5-27B-AWQ`、`Qwen3.5-122B-A10B-AWQ-4bit`、`MiniMax-M2.5-AWQ`、
   `MiniMax-M2.7-AWQ-4bit` 的关键推理路径。
 
@@ -31,6 +32,7 @@ python -m pip install torch torchvision torchaudio --index-url https://download.
 # Recommended on V100 when you have a local flash-attention-v100 source tree.
 export VLLM_FLASH_ATTN_SRC_DIR=/path/to/flash-attention-v100
 
+python -m pip install --upgrade "transformers==5.5.4" "tokenizers==0.22.2" "huggingface_hub>=1.5,<2"
 python -m pip install -e . --no-build-isolation
 python -m vllm.entrypoints.cli.main --version
 ```
@@ -38,7 +40,7 @@ python -m vllm.entrypoints.cli.main --version
 期望版本输出：
 
 ```text
-0.19.0
+0.19.1
 ```
 
 Additional notes:
@@ -65,7 +67,7 @@ Additional notes:
 
 ## What Changed vs Upstream vLLM / 与上游差异
 
-这个仓库仍然以 upstream `vLLM 0.19.0` 为基础，但当前分支额外收敛了几类与 `V100 / SM70` 直接相关的内容：
+这个仓库仍然以 upstream `vLLM 0.19.1` 为基础，但当前分支额外收敛了几类与 `V100 / SM70` 直接相关的内容：
 
 - `SM70` 上的 attention/backend 选择与 `FLASH_ATTN` 路径恢复
 - `AWQ` 和 `compressed-tensors MoE` 在 `SM70` 上的运行时兼容
@@ -92,7 +94,7 @@ Additional notes:
 
 ## Build and Release Notes / 构建与发布说明
 
-- 当前默认对外打包版本固定为 `0.19.0`
+- 当前默认对外打包版本固定为 `0.19.1`
 - 仓库品牌名为 `v100llm`
 - 安装后的包名和 CLI 仍为 `vllm`
 - 常用检查命令：
@@ -106,7 +108,7 @@ python -m vllm.entrypoints.cli.main --version
 以上三条当前都应输出：
 
 ```text
-0.19.0
+0.19.1
 ```
 
 ## License / 许可证

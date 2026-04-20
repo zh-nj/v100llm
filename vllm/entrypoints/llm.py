@@ -72,6 +72,7 @@ from vllm.outputs import (
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
+from vllm.renderers.inputs.preprocess import parse_model_prompt
 from vllm.sampling_params import BeamSearchParams, RequestOutputKind, SamplingParams
 from vllm.tasks import PoolingTask
 from vllm.tokenizers import TokenizerLike
@@ -839,7 +840,7 @@ class LLM:
         self,
         prompts: PromptType | Sequence[PromptType],
         tokenization_kwargs: dict[str, Any] | None = None,
-    ) -> list[EnginePrompt | EngineEncDecPrompt]:
+    ):
         """
         Convert prompt inputs from LLM APIs (other than [LLM.chat][]) into
         a format that can be passed to `_add_request`.
@@ -850,24 +851,17 @@ class LLM:
             A list of `TokensPrompts` objects containing the tokenized prompt
             after chat template interpolation, and the raw multi-modal inputs.
         """
-        tok_params = self._get_cmpl_tok_params(tokenization_kwargs)
+        renderer = self.llm_engine.renderer
 
-        engine_prompts = list[EnginePrompt | EngineEncDecPrompt]()
-        for prompt in self._normalize_prompts(prompts):
-            if is_explicit_encoder_decoder_prompt(prompt):
-                engine_prompts.append(self._preprocess_cmpl_enc_dec(prompt, tok_params))
-            else:
-                # Some MM models have non-default `add_special_tokens`
-                # TODO: Move multi-modal processor into tokenization
-                engine_prompts.append(
-                    self._preprocess_cmpl_singleton(
-                        prompt,
-                        tok_params,
-                        tokenize=not self.model_config.is_multimodal_model,
-                    )
-                )
+        parsed_prompts = [
+            parse_model_prompt(self.model_config, prompt)
+            for prompt in self._normalize_prompts(prompts)
+        ]
+        tok_params = renderer.default_cmpl_tok_params.with_kwargs(
+            **(tokenization_kwargs or {})
+        )
 
-        return engine_prompts
+        return renderer.render_cmpl(parsed_prompts, tok_params)
 
     def _normalize_conversations(
         self,

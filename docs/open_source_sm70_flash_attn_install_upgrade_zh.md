@@ -41,6 +41,8 @@
 
 - Python：`3.13`
 - PyTorch：`2.10.0+cu128`
+- Transformers：`5.5.4`
+- Tokenizers：`0.22.2`
 - Triton：`3.6.0`
 - CUDA toolkit：`12.8`
 
@@ -112,6 +114,7 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
 
 ```bash
 cd /path/to/1Cat-vLLM
+python -m pip install --upgrade "transformers==5.5.4" "tokenizers==0.22.2" "huggingface_hub>=1.5,<2"
 python -m pip install -e . --no-build-isolation
 ```
 
