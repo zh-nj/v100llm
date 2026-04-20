@@ -178,6 +178,48 @@
 
 ## Qwen3.5-122B-A10B-AWQ-4bit Extended Validation
 
+- 2026-04-20:
+  - Command parameters:
+    - `CUDA_DEVICE_ORDER=PCI_BUS_ID`
+    - `CUDA_VISIBLE_DEVICES=2,3,4,5`
+    - `model=/mnt/data6/models/Qwen3.5-122B-A10B-AWQ-4bit`
+    - `quantization=compressed-tensors`
+    - `dtype=float16`
+    - `tensor_parallel_size=4`
+    - `gpu_memory_utilization=0.86`
+    - `max_model_len=33024`
+    - `attention_backend=FLASH_ATTN`
+    - `generation_config=vllm`
+    - default cudagraph sizing was used; no explicit `compilation_config` and no `enforce_eager`
+  - Effective runtime behavior:
+    - `quant_method=compressed-tensors` was handled correctly and selected `CompressedTensorsSM70WNA16MoEMethod (TurboMind SM70 kernels)`
+    - The worktree completed load-time `compressed-tensors -> AWQ` conversion for the MoE experts and then ran SM70 AWQ warmup
+    - vLLM kept the default cudagraph profile, estimated `2.68 GiB` graph memory, and automatically capped the effective max capture size from `512` to `416`
+  - Result:
+    - OpenAI API server startup completed successfully
+    - `GET /health`: `200 OK`
+    - `GET /v1/models`: success
+    - `1k` benchmark:
+      - `prompt_tokens=1013`
+      - `TTFT=11.59 s`
+      - `prefill tokens/s=87.39`
+      - `decode tokens/s=52.46`
+      - `finish_reason=stop`
+      - semantic quality: pass
+    - `32k` benchmark:
+      - `prompt_tokens=32765`
+      - `TTFT=16.89 s`
+      - `prefill tokens/s=1939.47`
+      - `decode tokens/s=53.78`
+      - `finish_reason=stop`
+      - semantic quality: pass
+  - Evidence:
+    - Results JSON: `/tmp/vllm_sm70_api_bench/results_1776677565.json`
+    - Server log: `/tmp/vllm_sm70_api_bench/qwen35_122b_a10b_awq.gpu086_defaultcg.server.log`
+  - Notes:
+    - On the same `4x V100` setup, `gpu_memory_utilization=0.90` still failed during CUDA graph capture and `0.88` still failed during sampler warmup
+    - `gpu_memory_utilization=0.86` was sufficient to keep the default cudagraph path and finish both startup and `1k/32k` API benchmark runs
+
 - 2026-04-15:
   - Command parameters:
     - `CUDA_DEVICE_ORDER=PCI_BUS_ID`

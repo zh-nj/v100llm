@@ -454,6 +454,30 @@ python -m vllm.entrypoints.openai.api_server \
   --port 8000
 ```
 
+### 122B-A10B：四卡 V100 默认 cudagraph 推荐
+
+```bash
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+python -m vllm.entrypoints.openai.api_server \
+  --model Qwen3.5-122B-A10B-AWQ-4bit \
+  --quantization compressed-tensors \
+  --dtype float16 \
+  --tensor-parallel-size 4 \
+  --gpu-memory-utilization 0.86 \
+  --max-model-len 33024 \
+  --attention-backend FLASH_ATTN \
+  --generation-config vllm \
+  --no-enable-prefix-caching \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+这条命令对应当前实测可用的 `4x V100 / SM70` 启动口径。保持默认
+CUDA graph 策略即可，不再额外传 `--compilation-config` 去固定
+`cudagraph_capture_sizes=[1]`。
+
 ## 可选实验项
 
 ### FP8 KV cache
