@@ -10,6 +10,7 @@ from .compressed_tensors_w4a16_nvfp4 import CompressedTensorsW4A16Fp4
 from .compressed_tensors_w8a8_fp8 import CompressedTensorsW8A8Fp8
 from .compressed_tensors_w8a8_int8 import CompressedTensorsW8A8Int8
 from .compressed_tensors_w8a16_fp8 import CompressedTensorsW8A16Fp8
+from .compressed_tensors_wNa16_sm70 import CompressedTensorsSM70WNA16
 from .compressed_tensors_wNa16 import WNA16_SUPPORTED_BITS, CompressedTensorsWNA16
 
 # This avoids circular import error
@@ -18,6 +19,7 @@ from .compressed_tensors_24 import CompressedTensors24  # isort: skip
 __all__ = [
     "CompressedTensorsScheme",
     "CompressedTensorsWNA16",
+    "CompressedTensorsSM70WNA16",
     "CompressedTensorsW8A16Fp8",
     "CompressedTensorsW8A8Int8",
     "CompressedTensorsW8A8Fp8",

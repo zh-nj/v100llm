@@ -12,6 +12,7 @@ from compressed_tensors.config import (
     SparsityStructure,
 )
 from compressed_tensors.quantization import (
+    ActivationOrdering,
     QuantizationArgs,
     QuantizationStrategy,
     QuantizationType,
@@ -50,6 +51,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
+    CompressedTensorsSM70WNA16,
     CompressedTensorsWNA16,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.transform.linear import (  # noqa: E501
@@ -610,6 +612,23 @@ class CompressedTensorsConfig(QuantizationConfig):
             and (format == CompressionFormat.pack_quantized.value)
             and (weight_quant.num_bits in WNA16_SUPPORTED_BITS)
         ):
+            capability = current_platform.get_device_capability()
+            if (
+                capability is not None
+                and capability.to_int() == 70
+                and weight_quant.num_bits == 4
+                and weight_quant.symmetric
+                and weight_quant.group_size in (32, 64, 128)
+                and weight_quant.actorder != ActivationOrdering.GROUP
+            ):
+                return CompressedTensorsSM70WNA16(
+                    num_bits=weight_quant.num_bits,
+                    strategy=weight_quant.strategy,
+                    symmetric=weight_quant.symmetric,
+                    group_size=weight_quant.group_size,
+                    actorder=weight_quant.actorder,
+                    layer_name=layer_name,
+                )
             return CompressedTensorsWNA16(
                 num_bits=weight_quant.num_bits,
                 strategy=weight_quant.strategy,

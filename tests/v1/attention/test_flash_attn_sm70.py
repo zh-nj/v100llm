@@ -1,11 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import torch
+
 from vllm.platforms.cuda import _get_backend_priorities
 from vllm.platforms.interface import DeviceCapability
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.vllm_flash_attn import flash_attn_interface
+
+
+def _validate_flash_attn(head_size: int, capability: DeviceCapability) -> list[str]:
+    return FlashAttentionBackend.validate_configuration(
+        head_size=head_size,
+        dtype=torch.float16,
+        kv_cache_dtype="auto",
+        block_size=None,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        use_per_head_quant_scales=False,
+        device_capability=capability,
+        attn_type=AttentionType.DECODER,
+    )
 
 
 def test_flash_attention_backend_supports_sm70():
@@ -31,3 +50,13 @@ def test_fa2_version_check_accepts_sm70_when_kernel_is_available(monkeypatch):
     )
 
     assert flash_attn_interface.is_fa_version_supported(2)
+
+
+def test_flash_attention_sm70_supports_hdim512():
+    assert _validate_flash_attn(512, DeviceCapability(7, 0)) == []
+
+
+def test_flash_attention_hdim512_is_sm70_specific():
+    reasons = _validate_flash_attn(512, DeviceCapability(8, 0))
+
+    assert any("head_size > 256" in reason for reason in reasons)

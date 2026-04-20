@@ -18,6 +18,8 @@
 # limitations under the License.
 """Gemma 4 model implementation for vLLM."""
 
+import os
+from collections import Counter
 from collections.abc import Iterable
 from itertools import islice
 
@@ -26,7 +28,7 @@ import torch
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -55,7 +57,12 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .utils import (
@@ -67,6 +74,9 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+GEMMA4_SM70_MIXED_ATTN_TRACE = (
+    os.getenv("VLLM_GEMMA4_SM70_MIXED_ATTN_TRACE", "0") == "1"
+)
 
 
 def _get_text_config(config):
@@ -79,6 +89,102 @@ def _get_text_config(config):
     if hasattr(config, "text_config"):
         return config.text_config
     return config
+
+
+def _select_gemma4_text_attention_backend(
+    *,
+    layer_type: str,
+    head_dim: int,
+    capability: DeviceCapability | object | None,
+    user_backend: AttentionBackendEnum | None,
+    kv_transfer_enabled: bool,
+) -> type[AttentionBackend] | None:
+    def is_sm70(capability: DeviceCapability | object | None) -> bool:
+        if capability is None:
+            return False
+        if isinstance(capability, DeviceCapability):
+            return capability == DeviceCapability(7, 0)
+        to_int = getattr(capability, "to_int", None)
+        return callable(to_int) and to_int() == 70
+
+    if user_backend is not None:
+        return None
+    if kv_transfer_enabled:
+        return None
+    if not is_sm70(capability):
+        return None
+
+    if layer_type in ("sliding_attention", "full_attention"):
+        if FlashAttentionBackend.supports_head_size(head_dim):
+            return FlashAttentionBackend
+    return None
+
+
+def _gemma4_kv_transfer_enabled(vllm_config: VllmConfig) -> bool:
+    kv_transfer_config = vllm_config.kv_transfer_config
+    return bool(
+        kv_transfer_config is not None and kv_transfer_config.is_kv_transfer_instance
+    )
+
+
+def _format_gemma4_capability(capability: DeviceCapability | object | None) -> str:
+    if capability is None:
+        return "unknown"
+    if isinstance(capability, DeviceCapability):
+        return capability.as_version_str()
+    to_int = getattr(capability, "to_int", None)
+    if callable(to_int):
+        return str(to_int())
+    return str(capability)
+
+
+def _log_gemma4_text_attention_backend_summary(
+    *,
+    layers: list["Gemma4DecoderLayer"],
+    config,
+    capability: DeviceCapability | object | None,
+    user_backend: AttentionBackendEnum | None,
+    kv_transfer_enabled: bool,
+) -> None:
+    if not layers or get_tensor_model_parallel_rank() != 0:
+        return
+
+    backend_counts = Counter(layer.self_attn.attn.backend.name for layer in layers)
+    start_idx = layers[0].layer_idx
+    end_idx = layers[-1].layer_idx
+
+    if user_backend is None and not kv_transfer_enabled:
+        logger.info(
+            "Gemma4 text attention summary: capability=%s local_layers=%d-%d "
+            "FLASH_ATTN=%d TRITON_ATTN=%d",
+            _format_gemma4_capability(capability),
+            start_idx,
+            end_idx,
+            backend_counts.get("FLASH_ATTN", 0),
+            backend_counts.get("TRITON_ATTN", 0),
+        )
+    else:
+        logger.info(
+            "Gemma4 text mixed attention disabled: capability=%s "
+            "user_backend=%s kv_transfer_enabled=%s local_layers=%d-%d "
+            "backends=%s",
+            _format_gemma4_capability(capability),
+            user_backend.name if user_backend is not None else None,
+            kv_transfer_enabled,
+            start_idx,
+            end_idx,
+            dict(sorted(backend_counts.items())),
+        )
+
+    if GEMMA4_SM70_MIXED_ATTN_TRACE:
+        logger.info(
+            "Gemma4 text attention layer map: %s",
+            ", ".join(
+                f"{layer.layer_idx}:{config.layer_types[layer.layer_idx]}:"
+                f"{layer.self_attn.attn.backend.name}"
+                for layer in layers
+            ),
+        )
 
 
 class Gemma4MLP(nn.Module):
@@ -315,6 +421,23 @@ class Gemma4Attention(nn.Module):
         layer_type = config.layer_types[layer_idx]
         self.is_sliding = layer_type == "sliding_attention"
         sliding_window = config.sliding_window if self.is_sliding else None
+        vllm_config = get_current_vllm_config()
+        layer_backend = _select_gemma4_text_attention_backend(
+            layer_type=layer_type,
+            head_dim=self.head_dim,
+            capability=current_platform.get_device_capability(),
+            user_backend=vllm_config.attention_config.backend,
+            kv_transfer_enabled=_gemma4_kv_transfer_enabled(vllm_config),
+        )
+        if GEMMA4_SM70_MIXED_ATTN_TRACE and layer_backend is not None:
+            logger.info(
+                "Gemma4 attention override layer=%d type=%s head_dim=%d "
+                "backend=%s",
+                layer_idx,
+                layer_type,
+                self.head_dim,
+                layer_backend.get_name(),
+            )
 
         # Initialize RoPE based on layer type.
         # Gemma4 uses different RoPE parameters for sliding vs full attention.
@@ -380,6 +503,7 @@ class Gemma4Attention(nn.Module):
             per_layer_sliding_window=sliding_window,
             kv_sharing_target_layer_name=kv_sharing_target_layer_name,
             prefix=f"{prefix}.attn",
+            attn_backend=layer_backend,
         )
 
     def forward(
@@ -729,6 +853,13 @@ class Gemma4Model(nn.Module):
                 prefix=prefix,
             ),
             prefix=f"{prefix}.layers",
+        )
+        _log_gemma4_text_attention_backend_summary(
+            layers=list(self.layers),
+            config=config,
+            capability=current_platform.get_device_capability(),
+            user_backend=vllm_config.attention_config.backend,
+            kv_transfer_enabled=_gemma4_kv_transfer_enabled(vllm_config),
         )
         # Final norm: output = norm(x) * weight
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
