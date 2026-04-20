@@ -25,6 +25,7 @@ from vllm.config.scheduler import RunnerType
 from vllm.config.utils import config, getattr_iter
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.tasks import PoolingTask, ScoreType, SupportedTask
 from vllm.transformers_utils.config import (
     ConfigFormat,
     get_config,
@@ -1370,6 +1371,41 @@ class ModelConfig:
 
         return diff_sampling_param
 
+    def get_pooling_task(
+        self, supported_tasks: tuple[SupportedTask, ...]
+    ) -> PoolingTask | None:
+        if self.pooler_config is None:
+            return None
+
+        pooling_task = self.pooler_config.task
+
+        if pooling_task is not None:
+            if self.pooler_config.task in supported_tasks:
+                return self.pooler_config.task
+            else:
+                raise RuntimeError(
+                    f"Unsupported task: {pooling_task!r} "
+                    f"Supported tasks: {supported_tasks}"
+                )
+
+        if "token_classify" in supported_tasks:
+            for architecture in self.architectures:
+                if "ForTokenClassification" in architecture:
+                    return "token_classify"
+
+        priority: list[PoolingTask] = [
+            "embed&token_classify",
+            "embed",
+            "classify",
+            "token_embed",
+            "token_classify",
+            "plugin",
+        ]
+        for task in priority:
+            if task in supported_tasks:
+                return task
+        return None
+
     @property
     def is_encoder_decoder(self) -> bool:
         """Extract the HF encoder/decoder model flag."""
@@ -1428,6 +1464,25 @@ class ModelConfig:
     def is_late_interaction(self) -> bool:
         """Check if model uses late interaction (ColBERT-style) scoring."""
         return self._model_info.supports_late_interaction
+
+    @property
+    def score_type(self) -> ScoreType:
+        """
+        Scoring API handles score/rerank for:
+
+        - "classify" task (score_type: cross-encoder models)
+        - "embed" task (score_type: bi-encoder models)
+        - "token_embed" task (score_type: late interaction models)
+        """
+        # fixme: self._model_info.score_type is the score type before
+        #  as_seq_cls_model, which is "bi-encoder", rather than the
+        #  score type after as_seq_cls_model, which is "cross-encoder".
+        #  Therefore, the following logic is required.
+        return (
+            "cross-encoder"
+            if self.convert_type == "classify"
+            else self._model_info.score_type
+        )
 
     @property
     def is_pp_supported(self) -> bool:
