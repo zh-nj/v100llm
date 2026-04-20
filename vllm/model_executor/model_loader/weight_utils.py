@@ -80,14 +80,18 @@ def enable_hf_transfer():
             # enable hf hub transfer if available
             import hf_transfer  # type: ignore # noqa
 
-            huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER = True
+            if hasattr(huggingface_hub.constants, "HF_HUB_ENABLE_HF_TRANSFER"):
+                huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER = True
         except ImportError:
             pass
 
 
 def enable_xet_high_performance():
     """automatically activates xet high performance mode"""
-    if "HF_XET_HIGH_PERFORMANCE" not in os.environ:
+    if (
+        "HF_XET_HIGH_PERFORMANCE" not in os.environ
+        and hasattr(huggingface_hub.constants, "HF_XET_HIGH_PERFORMANCE")
+    ):
         huggingface_hub.constants.HF_XET_HIGH_PERFORMANCE = True
 
 

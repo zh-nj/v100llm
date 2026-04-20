@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import sys
 import tempfile
+from unittest.mock import MagicMock
 
 import huggingface_hub.constants
 import pytest
@@ -11,6 +13,7 @@ from huggingface_hub.utils import LocalEntryNotFoundError
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     enable_hf_transfer,
+    enable_xet_high_performance,
     maybe_remap_kv_scale_name,
 )
 
@@ -27,7 +30,34 @@ def test_hf_transfer_auto_activation():
         HF_TRANSFER_ACTIVE = True
     except ImportError:
         HF_TRANSFER_ACTIVE = False
-    assert huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER == HF_TRANSFER_ACTIVE
+    if hasattr(huggingface_hub.constants, "HF_HUB_ENABLE_HF_TRANSFER"):
+        assert (
+            huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER
+            == HF_TRANSFER_ACTIVE
+        )
+
+
+def test_hf_transfer_auto_activation_is_noop_without_legacy_constant(monkeypatch):
+    monkeypatch.delenv("HF_HUB_ENABLE_HF_TRANSFER", raising=False)
+    monkeypatch.delattr(
+        huggingface_hub.constants, "HF_HUB_ENABLE_HF_TRANSFER", raising=False
+    )
+    monkeypatch.setitem(sys.modules, "hf_transfer", MagicMock())
+
+    enable_hf_transfer()
+
+    assert not hasattr(huggingface_hub.constants, "HF_HUB_ENABLE_HF_TRANSFER")
+
+
+def test_xet_high_performance_is_guarded_when_constant_is_missing(monkeypatch):
+    monkeypatch.delenv("HF_XET_HIGH_PERFORMANCE", raising=False)
+    monkeypatch.delattr(
+        huggingface_hub.constants, "HF_XET_HIGH_PERFORMANCE", raising=False
+    )
+
+    enable_xet_high_performance()
+
+    assert not hasattr(huggingface_hub.constants, "HF_XET_HIGH_PERFORMANCE")
 
 
 def test_download_weights_from_hf():
