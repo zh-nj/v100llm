@@ -431,6 +431,47 @@ __global__ void decode_block_fp8_panel_to_fp16_kernel(
   out[row * out_row_stride + col] = __float2half(value * scale);
 }
 
+__global__ void decode_tensorwise_fp8_panel_to_fp16_kernel(
+    half* out,
+    const c10::Float8_e4m3fn* weight,
+    float scale,
+    int rows,
+    int cols,
+    int weight_row_stride,
+    int out_row_stride) {
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows || col >= cols) {
+    return;
+  }
+  const float value = static_cast<float>(weight[row * weight_row_stride + col]);
+  out[row * out_row_stride + col] = __float2half(value * scale);
+}
+
+__global__ void decode_channelwise_fp8_panel_to_fp16_kernel(
+    half* out,
+    const c10::Float8_e4m3fn* weight,
+    const float* scales,
+    int rows,
+    int cols,
+    int weight_row_stride,
+    int out_row_stride,
+    int scale_axis) {
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows || col >= cols) {
+    return;
+  }
+  const float scale = scale_axis == 0 ? scales[row] : scales[col];
+  const float value = static_cast<float>(weight[row * weight_row_stride + col]);
+  out[row * out_row_stride + col] = __float2half(value * scale);
+}
+
+void launch_fp8_decode_grid(dim3& grid, dim3& block, int rows, int cols) {
+  block = dim3(16, 16);
+  grid = dim3((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y);
+}
+
 void decode_block_fp8_panel_to_fp16(torch::Tensor decoded_panel,
                                     torch::Tensor weight_panel,
                                     torch::Tensor scale_panel,
@@ -446,9 +487,9 @@ void decode_block_fp8_panel_to_fp16(torch::Tensor decoded_panel,
 
   const int rows = static_cast<int>(weight_panel.size(0));
   const int cols = static_cast<int>(weight_panel.size(1));
-  const dim3 block(16, 16);
-  const dim3 grid((cols + block.x - 1) / block.x,
-                  (rows + block.y - 1) / block.y);
+  dim3 block;
+  dim3 grid;
+  launch_fp8_decode_grid(grid, block, rows, cols);
   decode_block_fp8_panel_to_fp16_kernel<<<grid, block, 0, stream>>>(
       reinterpret_cast<half*>(decoded_panel.data_ptr<at::Half>()),
       weight_panel.data_ptr<c10::Float8_e4m3fn>(),
@@ -460,6 +501,52 @@ void decode_block_fp8_panel_to_fp16(torch::Tensor decoded_panel,
       static_cast<int>(scale_panel.stride(0)),
       static_cast<int>(block_n),
       static_cast<int>(block_k));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void decode_tensorwise_fp8_panel_to_fp16(torch::Tensor decoded_panel,
+                                         torch::Tensor weight_panel,
+                                         torch::Tensor scale,
+                                         cudaStream_t stream) {
+  TORCH_CHECK(scale.numel() == 1,
+              "sm70_fp8_runtime_gemm: tensor-wise scale must have one value.");
+  const int rows = static_cast<int>(weight_panel.size(0));
+  const int cols = static_cast<int>(weight_panel.size(1));
+  dim3 block;
+  dim3 grid;
+  launch_fp8_decode_grid(grid, block, rows, cols);
+  decode_tensorwise_fp8_panel_to_fp16_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<half*>(decoded_panel.data_ptr<at::Half>()),
+      weight_panel.data_ptr<c10::Float8_e4m3fn>(),
+      scale.item<float>(),
+      rows,
+      cols,
+      static_cast<int>(weight_panel.stride(0)),
+      static_cast<int>(decoded_panel.stride(0)));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void decode_channelwise_fp8_panel_to_fp16(torch::Tensor decoded_panel,
+                                          torch::Tensor weight_panel,
+                                          torch::Tensor scale,
+                                          int64_t scale_axis,
+                                          cudaStream_t stream) {
+  TORCH_CHECK(scale.dim() == 1,
+              "sm70_fp8_runtime_gemm: channel-wise scale must be 1D.");
+  const int rows = static_cast<int>(weight_panel.size(0));
+  const int cols = static_cast<int>(weight_panel.size(1));
+  dim3 block;
+  dim3 grid;
+  launch_fp8_decode_grid(grid, block, rows, cols);
+  decode_channelwise_fp8_panel_to_fp16_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<half*>(decoded_panel.data_ptr<at::Half>()),
+      weight_panel.data_ptr<c10::Float8_e4m3fn>(),
+      scale.data_ptr<float>(),
+      rows,
+      cols,
+      static_cast<int>(weight_panel.stride(0)),
+      static_cast<int>(decoded_panel.stride(0)),
+      static_cast<int>(scale_axis));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -871,26 +958,54 @@ std::vector<torch::Tensor> sm70_fp8_prepare(torch::Tensor weight,
               "sm70_fp8_prepare: weight_scale must be float32.");
   TORCH_CHECK(weight.dim() == 2,
               "sm70_fp8_prepare: weight must be 2D.");
-  TORCH_CHECK(weight_scale.dim() == 2,
-              "sm70_fp8_prepare: weight_scale must be 2D.");
-  TORCH_CHECK(layout_kind == 2,
-              "sm70_fp8_prepare: only block layout is currently supported.");
-  TORCH_CHECK(scale_axis == -1,
-              "sm70_fp8_prepare: block layout requires scale_axis=-1.");
-  TORCH_CHECK(block_n == 128 && block_k == 128,
-              "sm70_fp8_prepare: only block_n=block_k=128 is supported.");
-  TORCH_CHECK(panel_n > 0 && panel_n % block_n == 0,
-              "sm70_fp8_prepare: panel_n must be a positive multiple of block_n.");
+  TORCH_CHECK(weight_scale.dim() == 1 || weight_scale.dim() == 2,
+              "sm70_fp8_prepare: weight_scale must be 1D or 2D.");
+  TORCH_CHECK(layout_kind == 0 || layout_kind == 1 || layout_kind == 2,
+              "sm70_fp8_prepare: unsupported layout kind.");
+  if (layout_kind == 0) {
+    TORCH_CHECK(weight_scale.numel() == 1,
+                "sm70_fp8_prepare: tensor-wise layout requires one scale.");
+    TORCH_CHECK(scale_axis == -1,
+                "sm70_fp8_prepare: tensor-wise layout requires scale_axis=-1.");
+    TORCH_CHECK(block_n == 0 && block_k == 0,
+                "sm70_fp8_prepare: tensor-wise layout requires block_n=block_k=0.");
+  } else if (layout_kind == 1) {
+    TORCH_CHECK(weight_scale.dim() == 1,
+                "sm70_fp8_prepare: channel-wise layout requires 1D scales.");
+    TORCH_CHECK(scale_axis == 0 || scale_axis == 1,
+                "sm70_fp8_prepare: channel-wise layout requires scale_axis 0 or 1.");
+    TORCH_CHECK(block_n == 0 && block_k == 0,
+                "sm70_fp8_prepare: channel-wise layout requires block_n=block_k=0.");
+  } else {
+    TORCH_CHECK(weight_scale.dim() == 2,
+                "sm70_fp8_prepare: block-wise layout requires 2D scales.");
+    TORCH_CHECK(scale_axis == -1,
+                "sm70_fp8_prepare: block layout requires scale_axis=-1.");
+    TORCH_CHECK(block_n == 128 && block_k == 128,
+                "sm70_fp8_prepare: only block_n=block_k=128 is supported.");
+  }
+  TORCH_CHECK(panel_n > 0,
+              "sm70_fp8_prepare: panel_n must be positive.");
+  if (layout_kind == 2) {
+    TORCH_CHECK(panel_n % block_n == 0,
+                "sm70_fp8_prepare: panel_n must be a positive multiple of block_n.");
+  }
 
   weight = weight.contiguous();
   weight_scale = weight_scale.contiguous();
 
   const int64_t logical_n = weight.size(0);
   const int64_t logical_k = weight.size(1);
-  TORCH_CHECK(weight_scale.size(0) == (logical_n + block_n - 1) / block_n,
-              "sm70_fp8_prepare: scale rows mismatch.");
-  TORCH_CHECK(weight_scale.size(1) == (logical_k + block_k - 1) / block_k,
-              "sm70_fp8_prepare: scale cols mismatch.");
+  if (layout_kind == 1) {
+    const int64_t expected = scale_axis == 0 ? logical_n : logical_k;
+    TORCH_CHECK(weight_scale.size(0) == expected,
+                "sm70_fp8_prepare: channel-wise scale shape mismatch.");
+  } else if (layout_kind == 2) {
+    TORCH_CHECK(weight_scale.size(0) == (logical_n + block_n - 1) / block_n,
+                "sm70_fp8_prepare: scale rows mismatch.");
+    TORCH_CHECK(weight_scale.size(1) == (logical_k + block_k - 1) / block_k,
+                "sm70_fp8_prepare: scale cols mismatch.");
+  }
 
   auto prepared_meta = torch::tensor(
       std::vector<int64_t>{logical_n,
@@ -1277,9 +1392,10 @@ void sm70_fp8_runtime_gemm_out(torch::Tensor out,
               "sm70_fp8_runtime_gemm: prepared_weight must be float8_e4m3fn.");
   TORCH_CHECK(prepared_scale.scalar_type() == torch::kFloat32,
               "sm70_fp8_runtime_gemm: prepared_scale must be float32.");
-  TORCH_CHECK(input.dim() == 2 && out.dim() == 2 && prepared_weight.dim() == 2 &&
-                  prepared_scale.dim() == 2,
-              "sm70_fp8_runtime_gemm: input, out, prepared_weight, and prepared_scale must be 2D.");
+  TORCH_CHECK(input.dim() == 2 && out.dim() == 2 && prepared_weight.dim() == 2,
+              "sm70_fp8_runtime_gemm: input, out, and prepared_weight must be 2D.");
+  TORCH_CHECK(prepared_scale.dim() == 1 || prepared_scale.dim() == 2,
+              "sm70_fp8_runtime_gemm: prepared_scale must be 1D or 2D.");
   TORCH_CHECK(prepared_meta.dim() == 1 && prepared_meta.numel() >= 9,
               "sm70_fp8_runtime_gemm: prepared_meta must have 9 int64 values.");
   TORCH_CHECK(decoded_panel.dim() == 2 && packed_panel.dim() == 2,
@@ -1295,14 +1411,29 @@ void sm70_fp8_runtime_gemm_out(torch::Tensor out,
   const int64_t block_n = prepared_meta[7].item<int64_t>();
   const int64_t block_k = prepared_meta[8].item<int64_t>();
 
-  TORCH_CHECK(layout_kind == 2,
-              "sm70_fp8_runtime_gemm: only block layout is currently supported.");
-  TORCH_CHECK(scale_axis == -1,
-              "sm70_fp8_runtime_gemm: block layout requires scale_axis=-1.");
-  TORCH_CHECK(block_n == 128 && block_k == 128,
-              "sm70_fp8_runtime_gemm: only block_n=block_k=128 is supported.");
-  TORCH_CHECK(panel_n > 0 && panel_n % block_n == 0,
-              "sm70_fp8_runtime_gemm: panel_n must be a positive multiple of block_n.");
+  TORCH_CHECK(layout_kind == 0 || layout_kind == 1 || layout_kind == 2,
+              "sm70_fp8_runtime_gemm: unsupported layout kind.");
+  if (layout_kind == 0) {
+    TORCH_CHECK(prepared_scale.numel() == 1,
+                "sm70_fp8_runtime_gemm: tensor-wise layout requires one scale.");
+  } else if (layout_kind == 1) {
+    TORCH_CHECK(scale_axis == 0 || scale_axis == 1,
+                "sm70_fp8_runtime_gemm: channel-wise layout requires scale_axis 0 or 1.");
+    TORCH_CHECK(prepared_scale.dim() == 1,
+                "sm70_fp8_runtime_gemm: channel-wise scale must be 1D.");
+    const int64_t expected = scale_axis == 0 ? logical_n : logical_k;
+    TORCH_CHECK(prepared_scale.size(0) == expected,
+                "sm70_fp8_runtime_gemm: channel-wise scale shape mismatch.");
+  } else {
+    TORCH_CHECK(scale_axis == -1,
+                "sm70_fp8_runtime_gemm: block layout requires scale_axis=-1.");
+    TORCH_CHECK(block_n == 128 && block_k == 128,
+                "sm70_fp8_runtime_gemm: only block_n=block_k=128 is supported.");
+    TORCH_CHECK(panel_n % block_n == 0,
+                "sm70_fp8_runtime_gemm: panel_n must be a positive multiple of block_n.");
+  }
+  TORCH_CHECK(panel_n > 0,
+              "sm70_fp8_runtime_gemm: panel_n must be positive.");
   TORCH_CHECK(input.size(1) == logical_k,
               "sm70_fp8_runtime_gemm: input/weight K mismatch.");
   TORCH_CHECK(prepared_weight.size(0) == logical_n &&
@@ -1324,17 +1455,32 @@ void sm70_fp8_runtime_gemm_out(torch::Tensor out,
 
   for (int64_t n0 = 0; n0 < logical_n; n0 += panel_n) {
     const int64_t panel_cols = std::min(panel_n, logical_n - n0);
-    const int64_t scale_rows = (panel_cols + block_n - 1) / block_n;
     auto weight_panel = prepared_weight.narrow(0, n0, panel_cols);
-    auto scale_panel = prepared_scale.narrow(0, n0 / block_n, scale_rows);
     auto decoded_panel_view = decoded_panel.narrow(0, 0, panel_cols);
     auto packed_panel_view = packed_panel.narrow(0, 0, panel_cols);
-    decode_block_fp8_panel_to_fp16(decoded_panel_view,
-                                   weight_panel,
-                                   scale_panel,
-                                   block_n,
-                                   block_k,
-                                   stream);
+    if (layout_kind == 0) {
+      decode_tensorwise_fp8_panel_to_fp16(decoded_panel_view,
+                                          weight_panel,
+                                          prepared_scale,
+                                          stream);
+    } else if (layout_kind == 1) {
+      auto scale_panel = scale_axis == 0 ? prepared_scale.narrow(0, n0, panel_cols)
+                                         : prepared_scale;
+      decode_channelwise_fp8_panel_to_fp16(decoded_panel_view,
+                                           weight_panel,
+                                           scale_panel,
+                                           scale_axis,
+                                           stream);
+    } else {
+      const int64_t scale_rows = (panel_cols + block_n - 1) / block_n;
+      auto scale_panel = prepared_scale.narrow(0, n0 / block_n, scale_rows);
+      decode_block_fp8_panel_to_fp16(decoded_panel_view,
+                                     weight_panel,
+                                     scale_panel,
+                                     block_n,
+                                     block_k,
+                                     stream);
+    }
     const int64_t k_ld = pack_sm70_f16_weight_into(decoded_panel_view,
                                                    packed_panel_view,
                                                    stream);
