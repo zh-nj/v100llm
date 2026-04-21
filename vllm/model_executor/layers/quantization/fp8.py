@@ -351,26 +351,26 @@ def _copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
 class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
     """SM70 fallback for serialized block-FP8 dense linear layers.
 
-    The checkpoint remains FP8 on disk, but after loading we repack the weight
-    into the existing SM70 AWQ runtime format and reuse `awq_gemm_sm70`.
+    The checkpoint remains FP8 after loading. Runtime decodes one panel at a
+    time and dispatches to a dedicated SM70 custom op.
     """
 
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.weight_block_size = self.quant_config.weight_block_size
+        self.panel_n = 128
         self.block_quant = self.weight_block_size is not None
         self.act_q_static = self.quant_config.activation_scheme == "static"
         if not self.block_quant or self.act_q_static:
             raise ValueError(
-                "SM70 FP8 fallback only supports serialized block-FP8 weights "
+                "SM70 runtime decode only supports serialized block-FP8 weights "
                 "with dynamic activation scaling."
             )
         assert self.weight_block_size is not None
-        self.group_size = self.weight_block_size[1]
-        if self.group_size not in (32, 64, 128):
+        if tuple(self.weight_block_size) != (128, 128):
             raise ValueError(
-                "SM70 FP8 fallback requires block_k/group_size in {32, 64, 128}, "
-                f"got {self.group_size}."
+                "SM70 runtime decode currently requires weight_block_size "
+                f"[128, 128], got {self.weight_block_size}."
             )
 
     def create_weights(
@@ -422,46 +422,17 @@ class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        assert self.weight_block_size is not None
         weight, weight_scale_inv = process_fp8_weight_block_strategy(
             layer.weight, layer.weight_scale_inv
         )
         replace_parameter(layer, "weight", weight.data)
         replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
-
-        dequant_weight = _dequantize_block_fp8_weight(
-            layer.weight,
-            layer.weight_scale_inv,
-            block_shape=GroupShape(*self.weight_block_size),
-            out_dtype=torch.float16,
-        )
-        qweight, scales, qzeros = _quantize_fp8_weight_to_awq(
-            dequant_weight,
-            self.group_size,
-        )
-        tm_weight, tm_scales, meta = ops.awq_sm70_prepare(
-            qweight,
-            scales,
-            qzeros,
-            self.group_size,
-        )
-
-        layer._awq_sm70_weight = tm_weight
-        layer._awq_sm70_scales = tm_scales
-        layer._awq_sm70_k_ld = int(meta[0])
-        layer._awq_sm70_q_ld = int(meta[1])
-        layer._awq_sm70_prepared = True
-
-        replace_parameter(
-            layer,
-            "weight",
-            torch.empty(0, dtype=torch.float8_e4m3fn, device=tm_weight.device),
-        )
-        replace_parameter(
-            layer,
-            "weight_scale_inv",
-            torch.empty(0, dtype=torch.float32, device=tm_weight.device),
-        )
+        layer._sm70_fp8_runtime_prepared = True
+        layer._sm70_fp8_panel_n = self.panel_n
+        layer._sm70_fp8_block_shape = tuple(self.weight_block_size)
+        layer._sm70_fp8_output_size = int(layer.output_size_per_partition)
+        layer._sm70_fp8_logical_widths = tuple(layer.logical_widths)
+        layer.input_scale = None
         layer._already_called_process_weights_after_loading = True
 
     def apply(
@@ -470,20 +441,32 @@ class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if not getattr(layer, "_awq_sm70_prepared", False):
+        if not getattr(layer, "_sm70_fp8_runtime_prepared", False):
             raise RuntimeError(
-                "SM70 FP8 fallback weights were not prepared before apply()."
+                "SM70 FP8 runtime decode weights were not prepared."
             )
 
-        reshaped_x = x.reshape(-1, x.shape[-1])
-        out = ops.awq_gemm_sm70(
-            reshaped_x,
-            layer._awq_sm70_weight,
-            layer._awq_sm70_scales,
-            self.group_size,
-            layer._awq_sm70_k_ld,
-            layer._awq_sm70_q_ld,
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        padded_out_dim = int(layer.weight.size(0))
+        logical_out_dim = int(
+            getattr(layer, "_sm70_fp8_output_size", padded_out_dim)
         )
+        out_padded = torch.empty(
+            (x_2d.size(0), padded_out_dim),
+            dtype=x_2d.dtype,
+            device=x_2d.device,
+        )
+        block_n, block_k = layer._sm70_fp8_block_shape
+        ops.sm70_fp8_runtime_gemm_out(
+            out_padded,
+            x_2d,
+            layer.weight,
+            layer.weight_scale_inv,
+            block_n,
+            block_k,
+            layer._sm70_fp8_panel_n,
+        )
+        out = out_padded[:, :logical_out_dim]
         if bias is not None:
             out.add_(bias)
         return out.reshape(x.shape[:-1] + (out.shape[-1],))

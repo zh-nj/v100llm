@@ -146,81 +146,116 @@ def test_fp8_config_keeps_modules_to_not_convert_alias() -> None:
     ]
 
 
-def test_fp8_sm70_linear_repacks_to_awq_and_prepares(
+def test_fp8_sm70_process_keeps_fp8_resident_and_records_runtime_meta(
     default_vllm_config,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fp8_module = importlib.import_module("vllm.model_executor.layers.quantization.fp8")
-    ops_module = importlib.import_module("vllm._custom_ops")
-
     monkeypatch.setattr(
-        fp8_module,
-        "_get_current_capability_int",
+        "vllm.model_executor.layers.quantization.fp8._get_current_capability_int",
         lambda: 70,
         raising=False,
     )
 
-    layer = _make_linear(monkeypatch)
+    layer = _make_linear(monkeypatch, output_size=384)
     _populate_fp8_block_weights(layer)
-
-    called: dict[str, tuple[tuple[int, ...], ...] | int] = {}
-
-    def fake_prepare(qweight, scales, qzeros, group_size, **kwargs):
-        called["shapes"] = (
-            tuple(qweight.shape),
-            tuple(scales.shape),
-            tuple(qzeros.shape),
-        )
-        called["group_size"] = group_size
-        return (
-            torch.ones(256, 8, dtype=torch.int32, device=qweight.device),
-            torch.ones(2, 64, dtype=torch.int32, device=qweight.device),
-            torch.tensor([256, 32], dtype=torch.int64, device=qweight.device),
-        )
-
-    monkeypatch.setattr(ops_module, "awq_sm70_prepare", fake_prepare, raising=False)
 
     layer.quant_method.process_weights_after_loading(layer)
 
-    assert called["shapes"] == ((256, 8), (2, 64), (2, 8))
-    assert called["group_size"] == 128
-    assert layer._awq_sm70_prepared is True
-    assert layer._awq_sm70_k_ld == 256
-    assert layer._awq_sm70_q_ld == 32
+    assert layer.weight.dtype == torch.float8_e4m3fn
+    assert layer.weight.numel() > 0
+    assert layer.weight_scale_inv.dtype == torch.float32
+    assert layer._sm70_fp8_runtime_prepared is True
+    assert layer._sm70_fp8_panel_n == 128
+    assert layer._sm70_fp8_block_shape == (128, 128)
+    assert layer._sm70_fp8_output_size == 384
+    assert layer._sm70_fp8_logical_widths == (384,)
+    assert not hasattr(layer, "_awq_sm70_prepared")
 
 
-def test_fp8_sm70_linear_apply_uses_awq_gemm(
+def test_fp8_sm70_apply_calls_runtime_decode_custom_op(
     default_vllm_config,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fp8_module = importlib.import_module("vllm.model_executor.layers.quantization.fp8")
     ops_module = importlib.import_module("vllm._custom_ops")
 
-    method_cls = getattr(fp8_module, "Fp8SM70LinearMethod")
+    method_cls = getattr(fp8_module, "Fp8SM70RuntimeDecodeLinearMethod")
     method = method_cls(_make_fp8_config())
 
     layer = torch.nn.Module()
-    layer._awq_sm70_prepared = True
-    layer._awq_sm70_weight = torch.zeros(256, 8, dtype=torch.int32)
-    layer._awq_sm70_scales = torch.ones(2, 64, dtype=torch.int32)
-    layer._awq_sm70_k_ld = 256
-    layer._awq_sm70_q_ld = 32
+    layer.weight = torch.zeros(384, 256, dtype=torch.float8_e4m3fn)
+    layer.weight_scale_inv = torch.ones(3, 2, dtype=torch.float32)
+    layer._sm70_fp8_runtime_prepared = True
+    layer._sm70_fp8_panel_n = 128
+    layer._sm70_fp8_block_shape = (128, 128)
 
-    def fake_awq_gemm_sm70(x, qweight, scales, group_size, k_ld, q_ld):
-        assert tuple(x.shape) == (2, 256)
-        assert tuple(qweight.shape) == (256, 8)
-        assert tuple(scales.shape) == (2, 64)
-        assert group_size == 128
-        assert k_ld == 256
-        assert q_ld == 32
-        return torch.full((2, 64), 5, dtype=x.dtype, device=x.device)
+    called = {}
 
-    monkeypatch.setattr(ops_module, "awq_gemm_sm70", fake_awq_gemm_sm70, raising=False)
+    def fake_runtime_gemm_out(out, x, weight, weight_scale, block_n, block_k, panel_n):
+        called["shape"] = (tuple(out.shape), tuple(x.shape), tuple(weight.shape))
+        called["scale_shape"] = tuple(weight_scale.shape)
+        called["params"] = (block_n, block_k, panel_n)
+        out.copy_(torch.full_like(out, 7))
+
+    monkeypatch.setattr(
+        ops_module,
+        "sm70_fp8_runtime_gemm_out",
+        fake_runtime_gemm_out,
+        raising=False,
+    )
 
     out = method.apply(layer, torch.ones(2, 256, dtype=torch.float16), None)
 
-    assert tuple(out.shape) == (2, 64)
-    assert torch.all(out == 5)
+    assert called["shape"] == ((2, 384), (2, 256), (384, 256))
+    assert called["scale_shape"] == (3, 2)
+    assert called["params"] == (128, 128, 128)
+    assert torch.all(out == 7)
+
+
+def test_fp8_sm70_apply_slices_runtime_decode_output_to_logical_width(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fp8_module = importlib.import_module(
+        "vllm.model_executor.layers.quantization.fp8"
+    )
+    ops_module = importlib.import_module("vllm._custom_ops")
+
+    method_cls = getattr(fp8_module, "Fp8SM70RuntimeDecodeLinearMethod")
+    method = method_cls(_make_fp8_config())
+
+    layer = torch.nn.Module()
+    layer.weight = torch.zeros(384, 256, dtype=torch.float8_e4m3fn)
+    layer.weight_scale_inv = torch.ones(3, 2, dtype=torch.float32)
+    layer._sm70_fp8_runtime_prepared = True
+    layer._sm70_fp8_panel_n = 128
+    layer._sm70_fp8_block_shape = (128, 128)
+    layer._sm70_fp8_output_size = 320
+    layer._sm70_fp8_logical_widths = (128, 128, 64)
+
+    def fake_runtime_gemm_out(out, x, weight, weight_scale, block_n, block_k, panel_n):
+        out.copy_(
+            torch.arange(
+                out.numel(),
+                dtype=out.dtype,
+                device=out.device,
+            ).reshape_as(out)
+        )
+
+    monkeypatch.setattr(
+        ops_module,
+        "sm70_fp8_runtime_gemm_out",
+        fake_runtime_gemm_out,
+        raising=False,
+    )
+
+    out = method.apply(layer, torch.ones(2, 256, dtype=torch.float16), None)
+
+    assert tuple(out.shape) == (2, 320)
+    assert torch.equal(
+        out,
+        torch.arange(2 * 384, dtype=torch.float16).reshape(2, 384)[:, :320],
+    )
 
 
 def test_fp8_sm70_serialized_moe_raises_clear_error(
