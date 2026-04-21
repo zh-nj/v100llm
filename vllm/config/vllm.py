@@ -434,7 +434,15 @@ class VllmConfig:
 
             if capability_tuple is not None:
                 capability = capability_tuple.to_int()
-                if capability < quant_config.get_min_capability():
+                allow_sm70_fp8_fallback = (
+                    capability == 70
+                    and hasattr(quant_config, "supports_sm70_checkpoint_fallback")
+                    and quant_config.supports_sm70_checkpoint_fallback()
+                )
+                if (
+                    capability < quant_config.get_min_capability()
+                    and not allow_sm70_fp8_fallback
+                ):
                     raise ValueError(
                         f"The quantization method {model_config.quantization} "
                         "is not supported for the current GPU. Minimum "

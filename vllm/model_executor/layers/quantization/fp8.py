@@ -61,6 +61,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
+    awq_pack,
     is_layer_skipped,
     kFp8Dynamic128Sym,
     kFp8DynamicTensorSym,
@@ -95,6 +96,74 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = init_logger(__name__)
 
 
+def _get_current_capability_int() -> int:
+    capability = current_platform.get_device_capability()
+    return -1 if capability is None else capability.to_int()
+
+
+def _make_symmetric_awq_qzeros(
+    *, num_groups: int, output_size: int, device: torch.device
+) -> torch.Tensor:
+    qzeros = torch.full(
+        (num_groups, output_size),
+        8,
+        dtype=torch.int32,
+        device=device,
+    )
+    return awq_pack(qzeros, 4, num_groups, output_size)
+
+
+def _quantize_fp8_weight_to_awq(
+    weight: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    out_features, in_features = weight.shape
+    if in_features % group_size != 0:
+        raise ValueError(
+            "SM70 FP8 fallback requires input dim divisible by group_size, "
+            f"got input_dim={in_features}, group_size={group_size}."
+        )
+    if out_features % 8 != 0:
+        raise ValueError(
+            "SM70 FP8 fallback requires output dim divisible by 8 for AWQ "
+            f"packing, got output_dim={out_features}."
+        )
+
+    weight_kn = weight.t().contiguous().to(torch.float32)
+    num_groups = in_features // group_size
+    grouped_weight = weight_kn.view(num_groups, group_size, out_features)
+    max_abs = grouped_weight.abs().amax(dim=1)
+    scales = torch.where(max_abs > 0, max_abs / 7.0, torch.ones_like(max_abs))
+    qweight = torch.round(grouped_weight / scales.unsqueeze(1))
+    qweight = qweight.clamp_(-8, 7).to(torch.int32).add_(8)
+    qweight = qweight.view(in_features, out_features).contiguous()
+
+    packed_qweight = awq_pack(qweight, 4, in_features, out_features)
+    packed_qzeros = _make_symmetric_awq_qzeros(
+        num_groups=num_groups,
+        output_size=out_features,
+        device=weight.device,
+    )
+    return packed_qweight, scales.to(torch.float16), packed_qzeros
+
+
+def _dequantize_block_fp8_weight(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_shape: GroupShape,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    block_n, block_k = block_shape
+    expanded_scale = torch.repeat_interleave(
+        weight_scale.to(torch.float32),
+        block_n,
+        dim=-2,
+    )
+    expanded_scale = torch.repeat_interleave(expanded_scale, block_k, dim=-1)
+    expanded_scale = expanded_scale[: weight.shape[-2], : weight.shape[-1]]
+    return (weight.to(torch.float32) * expanded_scale).to(out_dtype)
+
+
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
@@ -113,6 +182,8 @@ class Fp8Config(QuantizationConfig):
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
+        # Several multimodal model adapters still expect this AWQ-style field.
+        self.modules_to_not_convert = self.ignored_layers
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -152,6 +223,14 @@ class Fp8Config(QuantizationConfig):
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
         if self.ignored_layers is not None:
             self.ignored_layers = hf_to_vllm_mapper.apply_list(self.ignored_layers)
+            self.modules_to_not_convert = self.ignored_layers
+
+    def supports_sm70_checkpoint_fallback(self) -> bool:
+        return (
+            self.is_checkpoint_fp8_serialized
+            and self.activation_scheme == "dynamic"
+            and self.weight_block_size is not None
+        )
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "Fp8Config":
@@ -185,6 +264,11 @@ class Fp8Config(QuantizationConfig):
                 online_method = Fp8OnlineLinearMethod(self)
                 online_method.marlin_input_dtype = get_marlin_input_dtype(prefix)
                 return online_method
+            if (
+                _get_current_capability_int() == 70
+                and self.supports_sm70_checkpoint_fallback()
+            ):
+                return Fp8SM70RuntimeDecodeLinearMethod(self)
             else:
                 offline_method = Fp8LinearMethod(self)
                 offline_method.marlin_input_dtype = get_marlin_input_dtype(prefix)
@@ -196,6 +280,14 @@ class Fp8Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
+            if (
+                self.is_checkpoint_fp8_serialized
+                and _get_current_capability_int() == 70
+            ):
+                raise ValueError(
+                    "sm70 serialized FP8 MoE is not supported yet. "
+                    "Only dense linear layers use the SM70 fallback path."
+                )
             if self.is_checkpoint_fp8_serialized:
                 moe_quant_method = Fp8MoEMethod(self, layer)
             else:
@@ -254,6 +346,147 @@ def _copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
         if attr not in new_attrs:
             attrs_to_set[attr] = getattr(old, attr)
     set_weight_attrs(new, attrs_to_set)
+
+
+class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
+    """SM70 fallback for serialized block-FP8 dense linear layers.
+
+    The checkpoint remains FP8 on disk, but after loading we repack the weight
+    into the existing SM70 AWQ runtime format and reuse `awq_gemm_sm70`.
+    """
+
+    def __init__(self, quant_config: Fp8Config):
+        self.quant_config = quant_config
+        self.weight_block_size = self.quant_config.weight_block_size
+        self.block_quant = self.weight_block_size is not None
+        self.act_q_static = self.quant_config.activation_scheme == "static"
+        if not self.block_quant or self.act_q_static:
+            raise ValueError(
+                "SM70 FP8 fallback only supports serialized block-FP8 weights "
+                "with dynamic activation scaling."
+            )
+        assert self.weight_block_size is not None
+        self.group_size = self.weight_block_size[1]
+        if self.group_size not in (32, 64, 128):
+            raise ValueError(
+                "SM70 FP8 fallback requires block_k/group_size in {32, 64, 128}, "
+                f"got {self.group_size}."
+            )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = self.weight_block_size
+
+        assert self.weight_block_size is not None
+        validate_fp8_block_shape(
+            layer,
+            input_size,
+            output_size,
+            input_size_per_partition,
+            output_partition_sizes,
+            self.weight_block_size,
+        )
+
+        weight = create_fp8_weight_parameter(
+            output_size_per_partition,
+            input_size_per_partition,
+            weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+        scale = create_fp8_scale_parameter(
+            BlockQuantScaleParameter,
+            output_partition_sizes,
+            input_size_per_partition,
+            self.weight_block_size,
+            weight_loader,
+        )
+        layer.register_parameter("weight_scale_inv", scale)
+        layer.input_scale = None
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+
+        assert self.weight_block_size is not None
+        weight, weight_scale_inv = process_fp8_weight_block_strategy(
+            layer.weight, layer.weight_scale_inv
+        )
+        replace_parameter(layer, "weight", weight.data)
+        replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
+
+        dequant_weight = _dequantize_block_fp8_weight(
+            layer.weight,
+            layer.weight_scale_inv,
+            block_shape=GroupShape(*self.weight_block_size),
+            out_dtype=torch.float16,
+        )
+        qweight, scales, qzeros = _quantize_fp8_weight_to_awq(
+            dequant_weight,
+            self.group_size,
+        )
+        tm_weight, tm_scales, meta = ops.awq_sm70_prepare(
+            qweight,
+            scales,
+            qzeros,
+            self.group_size,
+        )
+
+        layer._awq_sm70_weight = tm_weight
+        layer._awq_sm70_scales = tm_scales
+        layer._awq_sm70_k_ld = int(meta[0])
+        layer._awq_sm70_q_ld = int(meta[1])
+        layer._awq_sm70_prepared = True
+
+        replace_parameter(
+            layer,
+            "weight",
+            torch.empty(0, dtype=torch.float8_e4m3fn, device=tm_weight.device),
+        )
+        replace_parameter(
+            layer,
+            "weight_scale_inv",
+            torch.empty(0, dtype=torch.float32, device=tm_weight.device),
+        )
+        layer._already_called_process_weights_after_loading = True
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not getattr(layer, "_awq_sm70_prepared", False):
+            raise RuntimeError(
+                "SM70 FP8 fallback weights were not prepared before apply()."
+            )
+
+        reshaped_x = x.reshape(-1, x.shape[-1])
+        out = ops.awq_gemm_sm70(
+            reshaped_x,
+            layer._awq_sm70_weight,
+            layer._awq_sm70_scales,
+            self.group_size,
+            layer._awq_sm70_k_ld,
+            layer._awq_sm70_q_ld,
+        )
+        if bias is not None:
+            out.add_(bias)
+        return out.reshape(x.shape[:-1] + (out.shape[-1],))
 
 
 class Fp8LinearMethod(LinearMethodBase):
