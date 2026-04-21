@@ -70,8 +70,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
 )
 from vllm.model_executor.layers.quantization.utils.sm70_fp8_runtime_decode import (
-    SM70_FP8_LAYOUT_BLOCK,
     get_or_create_sm70_fp8_workspace,
+    infer_sm70_fp8_layout,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_block_fp8_supported,
@@ -431,14 +431,20 @@ class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
         )
         replace_parameter(layer, "weight", weight.data)
         replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
+        layout_kind, scale_axis, block_n, block_k = infer_sm70_fp8_layout(
+            layer.weight_scale_inv,
+            tuple(self.weight_block_size)
+            if self.weight_block_size is not None
+            else None,
+        )
         prepared_weight, prepared_scale, prepared_meta, workspace_meta = (
             ops.sm70_fp8_prepare(
                 layer.weight,
                 layer.weight_scale_inv,
-                SM70_FP8_LAYOUT_BLOCK,
-                -1,
-                self.weight_block_size[0],
-                self.weight_block_size[1],
+                layout_kind,
+                scale_axis,
+                block_n,
+                block_k,
                 self.panel_n,
             )
         )

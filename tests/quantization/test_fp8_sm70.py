@@ -159,6 +159,22 @@ def test_fp8_sm70_process_keeps_fp8_resident_and_records_runtime_meta(
 
     layer = _make_linear(monkeypatch, output_size=384)
     _populate_fp8_block_weights(layer)
+    ops_module = importlib.import_module("vllm._custom_ops")
+
+    monkeypatch.setattr(
+        ops_module,
+        "sm70_fp8_prepare",
+        lambda weight, scale, *_args: [
+            weight,
+            scale,
+            torch.tensor(
+                [384, 256, 384, 256, 128, 2, -1, 128, 128],
+                dtype=torch.int64,
+            ),
+            torch.tensor([128, 256, 384, 256, 4], dtype=torch.int64),
+        ],
+        raising=False,
+    )
 
     layer.quant_method.process_weights_after_loading(layer)
 
@@ -170,7 +186,73 @@ def test_fp8_sm70_process_keeps_fp8_resident_and_records_runtime_meta(
     assert layer._sm70_fp8_block_shape == (128, 128)
     assert layer._sm70_fp8_output_size == 384
     assert layer._sm70_fp8_logical_widths == (384,)
+    assert layer._sm70_fp8_prepared_weight is layer.weight
+    assert layer._sm70_fp8_prepared_scale is layer.weight_scale_inv
+    assert tuple(layer._sm70_fp8_prepared_meta.tolist()) == (
+        384,
+        256,
+        384,
+        256,
+        128,
+        2,
+        -1,
+        128,
+        128,
+    )
+    assert tuple(layer._sm70_fp8_workspace_meta.tolist()) == (
+        128,
+        256,
+        384,
+        256,
+        4,
+    )
     assert not hasattr(layer, "_awq_sm70_prepared")
+
+
+def test_fp8_sm70_merged_linear_process_records_logical_widths(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
+    _patch_single_rank_params(monkeypatch)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8._get_current_capability_int",
+        lambda: 70,
+        raising=False,
+    )
+    ops_module = importlib.import_module("vllm._custom_ops")
+
+    layer = MergedColumnParallelLinear(
+        input_size=256,
+        output_sizes=[128, 128, 64],
+        bias=False,
+        params_dtype=torch.float16,
+        quant_config=_make_fp8_config(),
+        prefix="model.layers.0.self_attn.qkv_proj",
+        disable_tp=True,
+    )
+    _populate_fp8_block_weights(layer)
+
+    monkeypatch.setattr(
+        ops_module,
+        "sm70_fp8_prepare",
+        lambda weight, scale, *_args: [
+            weight,
+            scale,
+            torch.tensor(
+                [384, 256, 384, 256, 128, 2, -1, 128, 128],
+                dtype=torch.int64,
+            ),
+            torch.tensor([128, 256, 384, 256, 4], dtype=torch.int64),
+        ],
+        raising=False,
+    )
+
+    layer.quant_method.process_weights_after_loading(layer)
+
+    assert layer._sm70_fp8_output_size == 320
+    assert layer._sm70_fp8_logical_widths == (128, 128, 64)
 
 
 def test_fp8_sm70_process_calls_prepare_op_and_stores_prepared_tensors(
@@ -258,15 +340,41 @@ def test_fp8_sm70_apply_calls_runtime_decode_custom_op(
     layer.weight = torch.zeros(384, 256, dtype=torch.float8_e4m3fn)
     layer.weight_scale_inv = torch.ones(3, 2, dtype=torch.float32)
     layer._sm70_fp8_runtime_prepared = True
-    layer._sm70_fp8_panel_n = 128
-    layer._sm70_fp8_block_shape = (128, 128)
+    layer._sm70_fp8_prepared_weight = layer.weight
+    layer._sm70_fp8_prepared_scale = layer.weight_scale_inv
+    layer._sm70_fp8_prepared_meta = torch.tensor(
+        [384, 256, 384, 256, 128, 2, -1, 128, 128], dtype=torch.int64
+    )
+    layer._sm70_fp8_workspace_meta = torch.tensor(
+        [128, 256, 384, 256, 4], dtype=torch.int64
+    )
+    layer._sm70_fp8_output_size = 384
+    layer._sm70_fp8_logical_widths = (384,)
 
     called = {}
 
-    def fake_runtime_gemm_out(out, x, weight, weight_scale, block_n, block_k, panel_n):
-        called["shape"] = (tuple(out.shape), tuple(x.shape), tuple(weight.shape))
-        called["scale_shape"] = tuple(weight_scale.shape)
-        called["params"] = (block_n, block_k, panel_n)
+    def fake_runtime_gemm_out(
+        out,
+        x,
+        prepared_weight,
+        prepared_scale,
+        prepared_meta,
+        decoded_panel,
+        packed_panel,
+        meta_buffer,
+    ):
+        called["shape"] = (
+            tuple(out.shape),
+            tuple(x.shape),
+            tuple(prepared_weight.shape),
+        )
+        called["scale_shape"] = tuple(prepared_scale.shape)
+        called["prepared_meta"] = tuple(prepared_meta.tolist())
+        called["workspace_shapes"] = (
+            tuple(decoded_panel.shape),
+            tuple(packed_panel.shape),
+            tuple(meta_buffer.shape),
+        )
         out.copy_(torch.full_like(out, 7))
 
     monkeypatch.setattr(
@@ -280,7 +388,8 @@ def test_fp8_sm70_apply_calls_runtime_decode_custom_op(
 
     assert called["shape"] == ((2, 384), (2, 256), (384, 256))
     assert called["scale_shape"] == (3, 2)
-    assert called["params"] == (128, 128, 128)
+    assert called["prepared_meta"] == (384, 256, 384, 256, 128, 2, -1, 128, 128)
+    assert called["workspace_shapes"] == ((128, 256), (384, 256), (4,))
     assert torch.all(out == 7)
 
 
@@ -373,12 +482,27 @@ def test_fp8_sm70_apply_slices_runtime_decode_output_to_logical_width(
     layer.weight = torch.zeros(384, 256, dtype=torch.float8_e4m3fn)
     layer.weight_scale_inv = torch.ones(3, 2, dtype=torch.float32)
     layer._sm70_fp8_runtime_prepared = True
-    layer._sm70_fp8_panel_n = 128
-    layer._sm70_fp8_block_shape = (128, 128)
+    layer._sm70_fp8_prepared_weight = layer.weight
+    layer._sm70_fp8_prepared_scale = layer.weight_scale_inv
+    layer._sm70_fp8_prepared_meta = torch.tensor(
+        [384, 256, 384, 256, 128, 2, -1, 128, 128], dtype=torch.int64
+    )
+    layer._sm70_fp8_workspace_meta = torch.tensor(
+        [128, 256, 384, 256, 4], dtype=torch.int64
+    )
     layer._sm70_fp8_output_size = 320
     layer._sm70_fp8_logical_widths = (128, 128, 64)
 
-    def fake_runtime_gemm_out(out, x, weight, weight_scale, block_n, block_k, panel_n):
+    def fake_runtime_gemm_out(
+        out,
+        x,
+        prepared_weight,
+        prepared_scale,
+        prepared_meta,
+        decoded_panel,
+        packed_panel,
+        meta_buffer,
+    ):
         out.copy_(
             torch.arange(
                 out.numel(),

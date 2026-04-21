@@ -18,6 +18,9 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.sm70_fp8_runtime_decode import (
+    get_or_create_sm70_fp8_workspace,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
@@ -144,18 +147,18 @@ def _iter_unique_dense_layers(model: torch.nn.Module) -> Iterable[torch.nn.Modul
 def _iter_unique_runtime_decode_dense_layers(
     model: torch.nn.Module,
 ) -> Iterable[torch.nn.Module]:
-    seen: set[tuple[int, int, int, int, int]] = set()
+    seen: set[tuple[int, int, tuple[int, int, int, int]]] = set()
     for layer in model.modules():
         if not getattr(layer, "_sm70_fp8_runtime_prepared", False):
             continue
-        block_n, block_k = layer._sm70_fp8_block_shape
-        logical_n = int(getattr(layer, "_sm70_fp8_output_size", layer.weight.shape[0]))
+        prepared_meta = tuple(
+            int(v) for v in layer._sm70_fp8_prepared_meta.tolist()
+        )
+        logical_n = int(getattr(layer, "_sm70_fp8_output_size", prepared_meta[0]))
         key = (
-            int(layer.weight.shape[1]),
+            int(prepared_meta[1]),
             logical_n,
-            block_n,
-            block_k,
-            int(layer._sm70_fp8_panel_n),
+            tuple(prepared_meta[5:9]),
         )
         if key in seen:
             continue
@@ -218,21 +221,22 @@ def _warmup_runtime_decode_dense_layers(
 ) -> int:
     calls = 0
     for layer in dense_layers:
-        device = layer.weight.device
-        k_dim = int(layer.weight.shape[1])
+        device = layer._sm70_fp8_prepared_weight.device
+        k_dim = int(layer._sm70_fp8_prepared_meta[1].item())
         n_dim = int(getattr(layer, "_sm70_fp8_output_size", layer.weight.shape[0]))
-        block_n, block_k = layer._sm70_fp8_block_shape
         for m_dim in m_values:
             x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
             out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
+            workspace = get_or_create_sm70_fp8_workspace(layer, x)
             ops.sm70_fp8_runtime_gemm_out(
                 out,
                 x,
-                layer.weight,
-                layer.weight_scale_inv,
-                block_n,
-                block_k,
-                layer._sm70_fp8_panel_n,
+                layer._sm70_fp8_prepared_weight,
+                layer._sm70_fp8_prepared_scale,
+                layer._sm70_fp8_prepared_meta,
+                workspace.decoded_panel,
+                workspace.packed_panel,
+                workspace.meta_buffer,
             )
             calls += 1
     return calls

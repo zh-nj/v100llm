@@ -29,11 +29,21 @@ class _DummyWorker:
 def test_sm70_awq_warmup_handles_runtime_decode_dense(monkeypatch):
     layer = torch.nn.Module()
     layer._sm70_fp8_runtime_prepared = True
-    layer._sm70_fp8_panel_n = 128
-    layer._sm70_fp8_block_shape = (128, 128)
     layer._sm70_fp8_output_size = 320
     layer.weight = torch.zeros(320, 256, dtype=torch.float8_e4m3fn, device="cuda")
     layer.weight_scale_inv = torch.ones(3, 2, dtype=torch.float32, device="cuda")
+    layer._sm70_fp8_prepared_weight = layer.weight
+    layer._sm70_fp8_prepared_scale = layer.weight_scale_inv
+    layer._sm70_fp8_prepared_meta = torch.tensor(
+        [320, 256, 320, 256, 128, 2, -1, 128, 128],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    layer._sm70_fp8_workspace_meta = torch.tensor(
+        [128, 256, 320, 256, 4],
+        dtype=torch.int64,
+        device="cuda",
+    )
 
     calls = []
 
@@ -43,7 +53,9 @@ def test_sm70_awq_warmup_handles_runtime_decode_dense(monkeypatch):
     )
     monkeypatch.setattr(
         "vllm.model_executor.warmup.awq_sm70_warmup.ops.sm70_fp8_runtime_gemm_out",
-        lambda out, x, w, s, bn, bk, pn: calls.append((tuple(out.shape), pn)),
+        lambda out, x, pw, ps, pm, decoded, packed, meta: calls.append(
+            (tuple(out.shape), tuple(decoded.shape), tuple(packed.shape))
+        ),
         raising=False,
     )
     monkeypatch.setattr("torch.cuda.synchronize", lambda *_args, **_kwargs: None)
@@ -51,5 +63,6 @@ def test_sm70_awq_warmup_handles_runtime_decode_dense(monkeypatch):
     sm70_awq_warmup(_DummyWorker(layer))
 
     assert calls
-    assert calls[0][1] == 128
     assert calls[0][0][1] == 320
+    assert calls[0][1] == (128, 256)
+    assert calls[0][2] == (320, 256)

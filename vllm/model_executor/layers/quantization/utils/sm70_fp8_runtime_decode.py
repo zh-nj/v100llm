@@ -8,6 +8,8 @@ from dataclasses import dataclass
 import torch
 
 
+SM70_FP8_LAYOUT_TENSOR = 0
+SM70_FP8_LAYOUT_CHANNEL = 1
 SM70_FP8_LAYOUT_BLOCK = 2
 
 
@@ -17,6 +19,19 @@ class Sm70Fp8RuntimeWorkspace:
     packed_panel: torch.Tensor
     meta_buffer: torch.Tensor
     capacity_m: int
+
+
+def infer_sm70_fp8_layout(
+    weight_scale: torch.Tensor,
+    weight_block_size: tuple[int, int] | None,
+) -> tuple[int, int, int, int]:
+    if weight_block_size is not None:
+        return (SM70_FP8_LAYOUT_BLOCK, -1, weight_block_size[0], weight_block_size[1])
+    if weight_scale.ndim == 0 or tuple(weight_scale.shape) == (1,):
+        return (SM70_FP8_LAYOUT_TENSOR, -1, 0, 0)
+    if weight_scale.ndim == 1:
+        return (SM70_FP8_LAYOUT_CHANNEL, 0, 0, 0)
+    return (SM70_FP8_LAYOUT_CHANNEL, 1, 0, 0)
 
 
 def alloc_sm70_fp8_workspace(
