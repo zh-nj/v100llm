@@ -1484,10 +1484,6 @@ void sm70_fp8_runtime_gemm_out(torch::Tensor out,
     const int64_t k_ld = pack_sm70_f16_weight_into(decoded_panel_view,
                                                    packed_panel_view,
                                                    stream);
-    meta_buffer.index_put_({0}, k_ld);
-    meta_buffer.index_put_({1}, panel_cols);
-    meta_buffer.index_put_({2}, logical_k);
-    meta_buffer.index_put_({3}, n0);
     sm70_f16_gemm_out(
         out.narrow(1, n0, panel_cols), input, packed_panel_view, k_ld, false);
   }

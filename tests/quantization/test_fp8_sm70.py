@@ -466,6 +466,67 @@ def test_fp8_sm70_apply_reuses_workspace_and_slices_logical_width(
     )
 
 
+def test_fp8_sm70_apply_does_not_reallocate_workspace_for_larger_batch(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fp8_module = importlib.import_module(
+        "vllm.model_executor.layers.quantization.fp8"
+    )
+    ops_module = importlib.import_module("vllm._custom_ops")
+
+    method_cls = getattr(fp8_module, "Fp8SM70RuntimeDecodeLinearMethod")
+    method = method_cls(_make_fp8_config())
+
+    layer = torch.nn.Module()
+    layer.weight = torch.zeros(384, 256, dtype=torch.float8_e4m3fn)
+    layer.weight_scale_inv = torch.ones(3, 2, dtype=torch.float32)
+    layer._sm70_fp8_runtime_prepared = True
+    layer._sm70_fp8_prepared_weight = layer.weight
+    layer._sm70_fp8_prepared_scale = layer.weight_scale_inv
+    layer._sm70_fp8_prepared_meta = torch.tensor(
+        [384, 256, 384, 256, 128, 2, -1, 128, 128], dtype=torch.int64
+    )
+    layer._sm70_fp8_workspace_meta = torch.tensor(
+        [128, 256, 384, 256, 4], dtype=torch.int64
+    )
+    layer._sm70_fp8_output_size = 384
+    layer._sm70_fp8_logical_widths = (384,)
+
+    seen_workspace_ptrs = []
+
+    def fake_runtime_gemm_out(
+        out,
+        x,
+        prepared_weight,
+        prepared_scale,
+        prepared_meta,
+        decoded_panel,
+        packed_panel,
+        meta_buffer,
+    ):
+        seen_workspace_ptrs.append(
+            (
+                decoded_panel.data_ptr(),
+                packed_panel.data_ptr(),
+                meta_buffer.data_ptr(),
+            )
+        )
+        out.zero_()
+
+    monkeypatch.setattr(
+        ops_module,
+        "sm70_fp8_runtime_gemm_out",
+        fake_runtime_gemm_out,
+        raising=False,
+    )
+
+    method.apply(layer, torch.ones(2, 256, dtype=torch.float16), None)
+    method.apply(layer, torch.ones(4, 256, dtype=torch.float16), None)
+
+    assert seen_workspace_ptrs[0] == seen_workspace_ptrs[1]
+
+
 def test_fp8_sm70_apply_slices_runtime_decode_output_to_logical_width(
     default_vllm_config,
     monkeypatch: pytest.MonkeyPatch,

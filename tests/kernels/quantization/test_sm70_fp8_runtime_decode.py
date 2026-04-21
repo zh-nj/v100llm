@@ -131,6 +131,63 @@ def test_sm70_fp8_prepare_and_runtime_gemm_block_layout_matches_reference():
     torch.testing.assert_close(out, ref, atol=6e-1, rtol=8e-2)
 
 
+@pytest.mark.cuda
+def test_sm70_fp8_runtime_gemm_out_is_cuda_graph_capturable():
+    _require_sm70()
+    torch.manual_seed(0)
+    x = torch.randn(1, 256, device="cuda", dtype=torch.float16) / 4
+    w_ref = torch.randn(256, 256, device="cuda", dtype=torch.float16) / 4
+    w_fp8, w_scale = _to_block_fp8(w_ref)
+    prepared_w, prepared_s, prepared_meta, workspace_meta = ops.sm70_fp8_prepare(
+        w_fp8,
+        w_scale,
+        2,
+        -1,
+        128,
+        128,
+        128,
+    )
+    workspace = alloc_sm70_fp8_workspace(
+        workspace_meta,
+        device=x.device,
+        m_capacity=x.shape[0],
+    )
+    out = torch.empty((x.shape[0], w_ref.shape[0]), dtype=torch.float16, device="cuda")
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        ops.sm70_fp8_runtime_gemm_out(
+            out,
+            x,
+            prepared_w,
+            prepared_s,
+            prepared_meta,
+            workspace.decoded_panel,
+            workspace.packed_panel,
+            workspace.meta_buffer,
+        )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ops.sm70_fp8_runtime_gemm_out(
+            out,
+            x,
+            prepared_w,
+            prepared_s,
+            prepared_meta,
+            workspace.decoded_panel,
+            workspace.packed_panel,
+            workspace.meta_buffer,
+        )
+
+    graph.replay()
+    ref = x @ w_ref.t()
+    torch.testing.assert_close(out, ref, atol=6e-1, rtol=8e-2)
+
+
 def test_sm70_fp8_runtime_gemm_fake_uses_prepared_meta_output_dim():
     import vllm._custom_ops as ops_module
 

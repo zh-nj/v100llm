@@ -66,7 +66,7 @@ def get_or_create_sm70_fp8_workspace(
 
     device_idx = -1 if x_2d.device.index is None else int(x_2d.device.index)
     workspace = cache.get(device_idx)
-    if workspace is None or workspace.capacity_m < int(x_2d.shape[0]):
+    if workspace is None:
         workspace = alloc_sm70_fp8_workspace(
             layer._sm70_fp8_workspace_meta,
             device=x_2d.device,
