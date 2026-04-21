@@ -9,6 +9,7 @@ import torch
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.parameter import BlockQuantScaleParameter
 
 
 def _patch_single_rank_params(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,6 +173,77 @@ def test_fp8_sm70_process_keeps_fp8_resident_and_records_runtime_meta(
     assert not hasattr(layer, "_awq_sm70_prepared")
 
 
+def test_fp8_sm70_process_calls_prepare_op_and_stores_prepared_tensors(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8._get_current_capability_int",
+        lambda: 70,
+        raising=False,
+    )
+    ops_module = importlib.import_module("vllm._custom_ops")
+    layer = _make_linear(monkeypatch, output_size=384)
+    _populate_fp8_block_weights(layer)
+    called = {}
+
+    def fake_prepare(
+        weight,
+        weight_scale,
+        layout_kind,
+        scale_axis,
+        block_n,
+        block_k,
+        panel_n,
+    ):
+        called["args"] = (
+            tuple(weight.shape),
+            tuple(weight_scale.shape),
+            layout_kind,
+            scale_axis,
+            block_n,
+            block_k,
+            panel_n,
+        )
+        prepared_meta = torch.tensor(
+            [384, 256, 384, 256, 128, layout_kind, scale_axis, block_n, block_k],
+            dtype=torch.int64,
+        )
+        workspace_meta = torch.tensor([128, 256, 384, 256, 4], dtype=torch.int64)
+        return [weight, weight_scale, prepared_meta, workspace_meta]
+
+    monkeypatch.setattr(
+        ops_module,
+        "sm70_fp8_prepare",
+        fake_prepare,
+        raising=False,
+    )
+
+    layer.quant_method.process_weights_after_loading(layer)
+
+    assert called["args"] == ((384, 256), (3, 2), 2, -1, 128, 128, 128)
+    assert layer._sm70_fp8_prepared_weight is layer.weight
+    assert layer._sm70_fp8_prepared_scale is layer.weight_scale_inv
+    assert tuple(layer._sm70_fp8_prepared_meta.tolist()) == (
+        384,
+        256,
+        384,
+        256,
+        128,
+        2,
+        -1,
+        128,
+        128,
+    )
+    assert tuple(layer._sm70_fp8_workspace_meta.tolist()) == (
+        128,
+        256,
+        384,
+        256,
+        4,
+    )
+
+
 def test_fp8_sm70_apply_calls_runtime_decode_custom_op(
     default_vllm_config,
     monkeypatch: pytest.MonkeyPatch,
@@ -210,6 +282,79 @@ def test_fp8_sm70_apply_calls_runtime_decode_custom_op(
     assert called["scale_shape"] == (3, 2)
     assert called["params"] == (128, 128, 128)
     assert torch.all(out == 7)
+
+
+def test_fp8_sm70_apply_reuses_workspace_and_slices_logical_width(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fp8_module = importlib.import_module(
+        "vllm.model_executor.layers.quantization.fp8"
+    )
+    ops_module = importlib.import_module("vllm._custom_ops")
+
+    method_cls = getattr(fp8_module, "Fp8SM70RuntimeDecodeLinearMethod")
+    method = method_cls(_make_fp8_config())
+
+    layer = torch.nn.Module()
+    layer.weight = torch.zeros(384, 256, dtype=torch.float8_e4m3fn)
+    layer.weight_scale_inv = torch.ones(3, 2, dtype=torch.float32)
+    layer._sm70_fp8_runtime_prepared = True
+    layer._sm70_fp8_prepared_weight = layer.weight
+    layer._sm70_fp8_prepared_scale = layer.weight_scale_inv
+    layer._sm70_fp8_prepared_meta = torch.tensor(
+        [384, 256, 384, 256, 128, 2, -1, 128, 128], dtype=torch.int64
+    )
+    layer._sm70_fp8_workspace_meta = torch.tensor(
+        [128, 256, 384, 256, 4], dtype=torch.int64
+    )
+    layer._sm70_fp8_output_size = 320
+    layer._sm70_fp8_logical_widths = (128, 128, 64)
+
+    seen_workspace_ptrs = []
+
+    def fake_runtime_gemm_out(
+        out,
+        x,
+        prepared_weight,
+        prepared_scale,
+        prepared_meta,
+        decoded_panel,
+        packed_panel,
+        meta_buffer,
+    ):
+        seen_workspace_ptrs.append(
+            (
+                decoded_panel.data_ptr(),
+                packed_panel.data_ptr(),
+                meta_buffer.data_ptr(),
+            )
+        )
+        out.copy_(
+            torch.arange(
+                out.numel(),
+                dtype=out.dtype,
+                device=out.device,
+            ).reshape_as(out)
+        )
+
+    monkeypatch.setattr(
+        ops_module,
+        "sm70_fp8_runtime_gemm_out",
+        fake_runtime_gemm_out,
+        raising=False,
+    )
+
+    out1 = method.apply(layer, torch.ones(2, 256, dtype=torch.float16), None)
+    out2 = method.apply(layer, torch.ones(2, 256, dtype=torch.float16), None)
+
+    assert tuple(out1.shape) == (2, 320)
+    assert tuple(out2.shape) == (2, 320)
+    assert seen_workspace_ptrs[0] == seen_workspace_ptrs[1]
+    assert torch.equal(
+        out1,
+        torch.arange(2 * 384, dtype=torch.float16).reshape(2, 384)[:, :320],
+    )
 
 
 def test_fp8_sm70_apply_slices_runtime_decode_output_to_logical_width(
@@ -282,3 +427,77 @@ def test_fp8_sm70_serialized_moe_raises_clear_error(
 
     with pytest.raises(ValueError, match="sm70.*MoE.*not supported"):
         config.get_quant_method(layer, "model.layers.0.moe")
+
+
+def test_qwen35_linear_attn_tuple_shard_adjusts_block_scale_space(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_single_rank_params(monkeypatch)
+    qwen35_module = importlib.import_module("vllm.model_executor.models.qwen3_5")
+    utils_module = importlib.import_module("vllm.model_executor.models.utils")
+
+    monkeypatch.setattr(
+        utils_module,
+        "is_pp_missing_parameter",
+        lambda name, model: False,
+    )
+
+    class DummyOwner:
+        def __init__(self) -> None:
+            self.output_sizes = [2048, 2048, 2048, 2048]
+            self.weight_block_size = (128, 128)
+            self.loaded: list[tuple[int, tuple[int, ...]]] = []
+
+        def weight_loader(
+            self,
+            param: BlockQuantScaleParameter,
+            loaded_weight: torch.Tensor,
+            shard_id: int,
+        ) -> None:
+            self.loaded.append((shard_id, tuple(loaded_weight.shape)))
+
+    class DummyModel:
+        def __init__(self, owner: DummyOwner, param: BlockQuantScaleParameter):
+            self._owner = owner
+            self._param = param
+            self._extra_param = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+
+        def named_parameters(self):
+            return iter([
+                (
+                    "model.layers.0.linear_attn.in_proj_qkvz.weight_scale_inv",
+                    self._param,
+                ),
+                (
+                    "model.layers.0.linear_attn.in_proj_ba.weight",
+                    self._extra_param,
+                ),
+            ])
+
+        def get_expert_mapping(self):
+            return []
+
+    owner = DummyOwner()
+    param = BlockQuantScaleParameter(
+        data=torch.empty((64, 8), dtype=torch.float32),
+        input_dim=1,
+        output_dim=0,
+        weight_loader=owner.weight_loader,
+    )
+    model = DummyModel(owner, param)
+
+    qwen35_module.Qwen3_5Model.load_weights(
+        model,
+        [
+            (
+                "model.layers.0.linear_attn.in_proj_qkv.weight_scale_inv",
+                torch.ones((48, 8), dtype=torch.float32),
+            )
+        ],
+    )
+
+    assert owner.loaded == [
+        (0, (16, 8)),
+        (1, (16, 8)),
+        (2, (16, 8)),
+    ]

@@ -69,6 +69,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
     kFp8StaticTensorSym,
 )
+from vllm.model_executor.layers.quantization.utils.sm70_fp8_runtime_decode import (
+    SM70_FP8_LAYOUT_BLOCK,
+    get_or_create_sm70_fp8_workspace,
+)
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_block_fp8_supported,
     cutlass_fp8_supported,
@@ -427,11 +431,27 @@ class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
         )
         replace_parameter(layer, "weight", weight.data)
         replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
+        prepared_weight, prepared_scale, prepared_meta, workspace_meta = (
+            ops.sm70_fp8_prepare(
+                layer.weight,
+                layer.weight_scale_inv,
+                SM70_FP8_LAYOUT_BLOCK,
+                -1,
+                self.weight_block_size[0],
+                self.weight_block_size[1],
+                self.panel_n,
+            )
+        )
         layer._sm70_fp8_runtime_prepared = True
         layer._sm70_fp8_panel_n = self.panel_n
         layer._sm70_fp8_block_shape = tuple(self.weight_block_size)
         layer._sm70_fp8_output_size = int(layer.output_size_per_partition)
         layer._sm70_fp8_logical_widths = tuple(layer.logical_widths)
+        layer._sm70_fp8_prepared_weight = prepared_weight
+        layer._sm70_fp8_prepared_scale = prepared_scale
+        layer._sm70_fp8_prepared_meta = prepared_meta
+        layer._sm70_fp8_workspace_meta = workspace_meta
+        layer._sm70_fp8_workspace_cache = {}
         layer.input_scale = None
         layer._already_called_process_weights_after_loading = True
 
@@ -456,15 +476,16 @@ class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
             dtype=x_2d.dtype,
             device=x_2d.device,
         )
-        block_n, block_k = layer._sm70_fp8_block_shape
+        workspace = get_or_create_sm70_fp8_workspace(layer, x_2d)
         ops.sm70_fp8_runtime_gemm_out(
             out_padded,
             x_2d,
-            layer.weight,
-            layer.weight_scale_inv,
-            block_n,
-            block_k,
-            layer._sm70_fp8_panel_n,
+            layer._sm70_fp8_prepared_weight,
+            layer._sm70_fp8_prepared_scale,
+            layer._sm70_fp8_prepared_meta,
+            workspace.decoded_panel,
+            workspace.packed_panel,
+            workspace.meta_buffer,
         )
         out = out_padded[:, :logical_out_dim]
         if bias is not None:
