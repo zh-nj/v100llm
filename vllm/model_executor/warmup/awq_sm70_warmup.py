@@ -141,6 +141,28 @@ def _iter_unique_dense_layers(model: torch.nn.Module) -> Iterable[torch.nn.Modul
         yield layer
 
 
+def _iter_unique_runtime_decode_dense_layers(
+    model: torch.nn.Module,
+) -> Iterable[torch.nn.Module]:
+    seen: set[tuple[int, int, int, int, int]] = set()
+    for layer in model.modules():
+        if not getattr(layer, "_sm70_fp8_runtime_prepared", False):
+            continue
+        block_n, block_k = layer._sm70_fp8_block_shape
+        logical_n = int(getattr(layer, "_sm70_fp8_output_size", layer.weight.shape[0]))
+        key = (
+            int(layer.weight.shape[1]),
+            logical_n,
+            block_n,
+            block_k,
+            int(layer._sm70_fp8_panel_n),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        yield layer
+
+
 def _iter_unique_moe_layers(model: torch.nn.Module) -> Iterable[torch.nn.Module]:
     seen: set[tuple[int, int, int, int, int, int]] = set()
     for layer in model.modules():
@@ -185,6 +207,32 @@ def _warmup_dense_layers(
                 layer._awq_sm70_k_ld,
                 layer._awq_sm70_q_ld,
                 False,
+            )
+            calls += 1
+    return calls
+
+
+def _warmup_runtime_decode_dense_layers(
+    dense_layers: list[torch.nn.Module],
+    m_values: list[int],
+) -> int:
+    calls = 0
+    for layer in dense_layers:
+        device = layer.weight.device
+        k_dim = int(layer.weight.shape[1])
+        n_dim = int(getattr(layer, "_sm70_fp8_output_size", layer.weight.shape[0]))
+        block_n, block_k = layer._sm70_fp8_block_shape
+        for m_dim in m_values:
+            x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
+            out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
+            ops.sm70_fp8_runtime_gemm_out(
+                out,
+                x,
+                layer.weight,
+                layer.weight_scale_inv,
+                block_n,
+                block_k,
+                layer._sm70_fp8_panel_n,
             )
             calls += 1
     return calls
@@ -250,7 +298,7 @@ def _warmup_moe_layers(
 
 
 def sm70_awq_warmup(worker: "Worker") -> None:
-    if not _warmup_enabled() or not hasattr(torch.ops._C, "awq_gemm_sm70_out"):
+    if not _warmup_enabled():
         return
 
     device = worker.device
@@ -259,8 +307,9 @@ def sm70_awq_warmup(worker: "Worker") -> None:
 
     model = worker.get_model()
     dense_layers = list(_iter_unique_dense_layers(model))
+    runtime_decode_dense_layers = list(_iter_unique_runtime_decode_dense_layers(model))
     moe_layers = list(_iter_unique_moe_layers(model))
-    if not dense_layers and not moe_layers:
+    if not dense_layers and not runtime_decode_dense_layers and not moe_layers:
         return
 
     imported_records = _load_lut_cache(device)
@@ -275,17 +324,24 @@ def sm70_awq_warmup(worker: "Worker") -> None:
     moe_token_counts = _get_moe_token_counts(worker)
 
     logger.info(
-        "Warming up SM70 AWQ kernels (%d dense shapes, %d MoE shapes).",
+        "Warming up SM70 AWQ/runtime-decode kernels (%d AWQ dense shapes, "
+        "%d runtime-decode dense shapes, %d MoE shapes).",
         len(dense_layers),
+        len(runtime_decode_dense_layers),
         len(moe_layers),
     )
     with torch.inference_mode():
         dense_calls = _warmup_dense_layers(dense_layers, m_values)
+        runtime_decode_dense_calls = _warmup_runtime_decode_dense_layers(
+            runtime_decode_dense_layers, m_values
+        )
         moe_calls = _warmup_moe_layers(moe_layers, moe_token_counts)
     torch.cuda.synchronize(device)
     logger.info(
-        "SM70 AWQ warmup finished (%d dense calls, %d MoE calls).",
+        "SM70 AWQ/runtime-decode warmup finished (%d AWQ dense calls, "
+        "%d runtime-decode dense calls, %d MoE calls).",
         dense_calls,
+        runtime_decode_dense_calls,
         moe_calls,
     )
     exported_records = _save_lut_cache(device)
