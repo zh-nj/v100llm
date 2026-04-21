@@ -626,45 +626,61 @@ def sm70_f16_gemm(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return torch.ops._C.sm70_f16_gemm(input, weight)
 
 
-def _sm70_decode_fp8_weight_panel(
+def sm70_fp8_prepare(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    block_n: int,
-    block_k: int,
-) -> torch.Tensor:
-    expanded_scale = torch.repeat_interleave(
-        weight_scale.to(torch.float32),
-        block_n,
-        dim=0,
-    )
-    expanded_scale = torch.repeat_interleave(expanded_scale, block_k, dim=1)
-    expanded_scale = expanded_scale[: weight.shape[0], : weight.shape[1]]
-    return (weight.to(torch.float32) * expanded_scale).to(torch.float16)
-
-
-def sm70_fp8_runtime_gemm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
+    layout_kind: int,
+    scale_axis: int,
     block_n: int,
     block_k: int,
     panel_n: int,
-) -> torch.Tensor:
-    out = torch.empty(
-        (input.shape[0], weight.shape[0]),
-        dtype=input.dtype,
-        device=input.device,
-    )
-    sm70_fp8_runtime_gemm_out(
-        out,
-        input,
+) -> list[torch.Tensor]:
+    return torch.ops._C.sm70_fp8_prepare(
         weight,
         weight_scale,
+        layout_kind,
+        scale_axis,
         block_n,
         block_k,
         panel_n,
     )
-    return out
+
+
+if hasattr(torch.ops._C, "sm70_fp8_prepare"):
+
+    @register_fake("_C::sm70_fp8_prepare")
+    def _sm70_fp8_prepare_fake(
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        layout_kind: int,
+        scale_axis: int,
+        block_n: int,
+        block_k: int,
+        panel_n: int,
+    ) -> list[torch.Tensor]:
+        prepared_meta = torch.empty((9,), dtype=torch.int64)
+        workspace_meta = torch.empty((5,), dtype=torch.int64)
+        return [torch.empty_like(weight), torch.empty_like(weight_scale), prepared_meta, workspace_meta]
+
+
+def sm70_fp8_runtime_gemm(
+    input: torch.Tensor,
+    prepared_weight: torch.Tensor,
+    prepared_scale: torch.Tensor,
+    prepared_meta: torch.Tensor,
+    decoded_panel: torch.Tensor,
+    packed_panel: torch.Tensor,
+    meta_buffer: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._C.sm70_fp8_runtime_gemm(
+        input,
+        prepared_weight,
+        prepared_scale,
+        prepared_meta,
+        decoded_panel,
+        packed_panel,
+        meta_buffer,
+    )
 
 
 def sm70_f16_gemm_out(
@@ -680,61 +696,23 @@ def sm70_f16_gemm_out(
 def sm70_fp8_runtime_gemm_out(
     out: torch.Tensor,
     input: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    block_n: int,
-    block_k: int,
-    panel_n: int,
+    prepared_weight: torch.Tensor,
+    prepared_scale: torch.Tensor,
+    prepared_meta: torch.Tensor,
+    decoded_panel: torch.Tensor,
+    packed_panel: torch.Tensor,
+    meta_buffer: torch.Tensor,
 ) -> None:
-    if input.dtype != torch.float16:
-        raise RuntimeError("sm70_fp8_runtime_gemm: input must be float16.")
-    if weight.dtype != torch.float8_e4m3fn:
-        raise RuntimeError(
-            "sm70_fp8_runtime_gemm: weight must be float8_e4m3fn."
-        )
-    if weight_scale.dtype != torch.float32:
-        raise RuntimeError(
-            "sm70_fp8_runtime_gemm: weight_scale must be float32."
-        )
-    if input.dim() != 2 or weight.dim() != 2 or weight_scale.dim() != 2:
-        raise RuntimeError("sm70_fp8_runtime_gemm: all tensors must be 2D.")
-    if block_n != 128 or block_k != 128:
-        raise RuntimeError(
-            "sm70_fp8_runtime_gemm: only block_n=block_k=128 is supported."
-        )
-    if panel_n <= 0 or panel_n % block_n != 0:
-        raise RuntimeError(
-            "sm70_fp8_runtime_gemm: panel_n must be a positive multiple "
-            "of block_n."
-        )
-    if input.shape[1] != weight.shape[1]:
-        raise RuntimeError("sm70_fp8_runtime_gemm: input/weight K mismatch.")
-    if out.shape != (input.shape[0], weight.shape[0]):
-        raise RuntimeError("sm70_fp8_runtime_gemm: out shape mismatch.")
-
-    x = input.contiguous()
-    for n0 in range(0, weight.shape[0], panel_n):
-        panel_cols = min(panel_n, weight.shape[0] - n0)
-        block_rows = (panel_cols + block_n - 1) // block_n
-        weight_panel = weight[n0 : n0 + panel_cols].contiguous()
-        scale_panel = weight_scale[
-            n0 // block_n : n0 // block_n + block_rows
-        ].contiguous()
-        weight_panel_f16 = _sm70_decode_fp8_weight_panel(
-            weight_panel,
-            scale_panel,
-            block_n,
-            block_k,
-        )
-        tm_weight, meta = sm70_f16_prepare(weight_panel_f16)
-        k_ld = int(meta[0].item())
-        sm70_f16_gemm_out(
-            out[:, n0 : n0 + panel_cols],
-            x,
-            tm_weight,
-            k_ld,
-            False,
-        )
+    torch.ops._C.sm70_fp8_runtime_gemm_out(
+        out,
+        input,
+        prepared_weight,
+        prepared_scale,
+        prepared_meta,
+        decoded_panel,
+        packed_panel,
+        meta_buffer,
+    )
 
 
 def sm70_f16_gate_mul_out(
@@ -793,14 +771,15 @@ if hasattr(torch.ops._C, "sm70_fp8_runtime_gemm"):
     @register_fake("_C::sm70_fp8_runtime_gemm")
     def _sm70_fp8_runtime_gemm_fake(
         input: torch.Tensor,
-        weight: torch.Tensor,
-        weight_scale: torch.Tensor,
-        block_n: int,
-        block_k: int,
-        panel_n: int,
+        prepared_weight: torch.Tensor,
+        prepared_scale: torch.Tensor,
+        prepared_meta: torch.Tensor,
+        decoded_panel: torch.Tensor,
+        packed_panel: torch.Tensor,
+        meta_buffer: torch.Tensor,
     ) -> torch.Tensor:
         num_in_feats = input.size(0)
-        out_dim = weight.size(0)
+        out_dim = int(prepared_meta[0].item())
         return torch.empty(
             (num_in_feats, out_dim),
             dtype=input.dtype,
@@ -843,11 +822,12 @@ if hasattr(torch.ops._C, "sm70_fp8_runtime_gemm_out"):
     def _sm70_fp8_runtime_gemm_out_fake(
         out: torch.Tensor,
         input: torch.Tensor,
-        weight: torch.Tensor,
-        weight_scale: torch.Tensor,
-        block_n: int,
-        block_k: int,
-        panel_n: int,
+        prepared_weight: torch.Tensor,
+        prepared_scale: torch.Tensor,
+        prepared_meta: torch.Tensor,
+        decoded_panel: torch.Tensor,
+        packed_panel: torch.Tensor,
+        meta_buffer: torch.Tensor,
     ) -> None:
         return None
 

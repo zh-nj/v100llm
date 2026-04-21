@@ -210,6 +210,14 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor _kernel,
 
 std::vector<torch::Tensor> sm70_f16_prepare(torch::Tensor _kernel);
 
+std::vector<torch::Tensor> sm70_fp8_prepare(torch::Tensor weight,
+                                            torch::Tensor weight_scale,
+                                            int64_t layout_kind,
+                                            int64_t scale_axis,
+                                            int64_t block_n,
+                                            int64_t block_k,
+                                            int64_t panel_n);
+
 torch::Tensor awq_gemm_sm70(torch::Tensor _in_feats,
                             torch::Tensor _kernel,
                             torch::Tensor _scaling_factors,
@@ -218,6 +226,14 @@ torch::Tensor awq_gemm_sm70(torch::Tensor _in_feats,
                             int64_t q_ld);
 
 torch::Tensor sm70_f16_gemm(torch::Tensor _in_feats, torch::Tensor _kernel);
+
+torch::Tensor sm70_fp8_runtime_gemm(torch::Tensor input,
+                                    torch::Tensor prepared_weight,
+                                    torch::Tensor prepared_scale,
+                                    torch::Tensor prepared_meta,
+                                    torch::Tensor decoded_panel,
+                                    torch::Tensor packed_panel,
+                                    torch::Tensor meta_buffer);
 
 void awq_gemm_sm70_out(torch::Tensor out,
                        torch::Tensor _in_feats,
@@ -233,6 +249,15 @@ void sm70_f16_gemm_out(torch::Tensor out,
                        torch::Tensor _kernel,
                        int64_t k_ld,
                        bool gated_silu);
+
+void sm70_fp8_runtime_gemm_out(torch::Tensor out,
+                               torch::Tensor input,
+                               torch::Tensor prepared_weight,
+                               torch::Tensor prepared_scale,
+                               torch::Tensor prepared_meta,
+                               torch::Tensor decoded_panel,
+                               torch::Tensor packed_panel,
+                               torch::Tensor meta_buffer);
 
 void sm70_f16_gate_mul_out(torch::Tensor out,
                            torch::Tensor _in_feats,

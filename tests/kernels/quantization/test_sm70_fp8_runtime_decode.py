@@ -5,6 +5,9 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.quantization.utils.sm70_fp8_runtime_decode import (
+    alloc_sm70_fp8_workspace,
+)
 
 
 def _require_sm70():
@@ -38,21 +41,66 @@ def _to_block_fp8(weight_fp16: torch.Tensor):
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("out_dim", [128, 320])
-def test_sm70_fp8_runtime_gemm_matches_reference(out_dim: int):
+def test_sm70_fp8_prepare_and_runtime_gemm_block_layout_matches_reference():
     _require_sm70()
     torch.manual_seed(0)
     x = torch.randn(3, 256, device="cuda", dtype=torch.float16) / 4
-    w_ref = torch.randn(out_dim, 256, device="cuda", dtype=torch.float16) / 4
+    w_ref = torch.randn(320, 256, device="cuda", dtype=torch.float16) / 4
     w_fp8, w_scale = _to_block_fp8(w_ref)
 
-    out = ops.sm70_fp8_runtime_gemm(
-        x,
+    prepared_w, prepared_s, prepared_meta, workspace_meta = ops.sm70_fp8_prepare(
         w_fp8,
         w_scale,
+        2,
+        -1,
         128,
         128,
         128,
     )
+    workspace = alloc_sm70_fp8_workspace(
+        workspace_meta,
+        device=x.device,
+        m_capacity=x.shape[0],
+    )
+    out = torch.empty((x.shape[0], w_ref.shape[0]), dtype=torch.float16, device="cuda")
+    ops.sm70_fp8_runtime_gemm_out(
+        out,
+        x,
+        prepared_w,
+        prepared_s,
+        prepared_meta,
+        workspace.decoded_panel,
+        workspace.packed_panel,
+        workspace.meta_buffer,
+    )
+
     ref = x @ w_ref.t()
     torch.testing.assert_close(out, ref, atol=6e-1, rtol=8e-2)
+
+
+def test_sm70_fp8_runtime_gemm_fake_uses_prepared_meta_output_dim():
+    import vllm._custom_ops as ops_module
+
+    input = torch.empty((4, 256), device="meta", dtype=torch.float16)
+    prepared_weight = torch.empty(
+        (384, 256), device="meta", dtype=torch.float8_e4m3fn
+    )
+    prepared_scale = torch.empty((3, 2), device="meta", dtype=torch.float32)
+    prepared_meta = torch.tensor(
+        [320, 256, 384, 256, 128, 2, -1, 128, 128], dtype=torch.int64
+    )
+    decoded = torch.empty((128, 256), device="meta", dtype=torch.float16)
+    packed = torch.empty((384, 256), device="meta", dtype=torch.float16)
+    meta_buffer = torch.empty((4,), device="meta", dtype=torch.int64)
+
+    out = ops_module._sm70_fp8_runtime_gemm_fake(
+        input,
+        prepared_weight,
+        prepared_scale,
+        prepared_meta,
+        decoded,
+        packed,
+        meta_buffer,
+    )
+
+    assert tuple(out.shape) == (4, 320)

@@ -257,6 +257,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   ops.def("sm70_f16_prepare(Tensor _kernel) -> Tensor[]");
   ops.impl("sm70_f16_prepare", torch::kCUDA, &sm70_f16_prepare);
+  ops.def(
+      "sm70_fp8_prepare(Tensor weight, Tensor weight_scale, int layout_kind, "
+      "int scale_axis, int block_n, int block_k, int panel_n) -> Tensor[]");
+  ops.impl("sm70_fp8_prepare", torch::kCUDA, &sm70_fp8_prepare);
 
   ops.def(
       "awq_gemm_sm70(Tensor _in_feats, Tensor _kernel, Tensor "
@@ -264,6 +268,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("awq_gemm_sm70", torch::kCUDA, &awq_gemm_sm70);
   ops.def("sm70_f16_gemm(Tensor _in_feats, Tensor _kernel) -> Tensor");
   ops.impl("sm70_f16_gemm", torch::kCUDA, &sm70_f16_gemm);
+  ops.def(
+      "sm70_fp8_runtime_gemm(Tensor input, Tensor prepared_weight, "
+      "Tensor prepared_scale, Tensor prepared_meta, Tensor decoded_panel, "
+      "Tensor packed_panel, Tensor meta_buffer) -> Tensor");
+  ops.impl("sm70_fp8_runtime_gemm", torch::kCUDA, &sm70_fp8_runtime_gemm);
   ops.def(
       "awq_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
@@ -274,6 +283,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int k_ld, "
       "bool gated_silu) -> ()");
   ops.impl("sm70_f16_gemm_out", torch::kCUDA, &sm70_f16_gemm_out);
+  ops.def(
+      "sm70_fp8_runtime_gemm_out(Tensor(a!) out, Tensor input, "
+      "Tensor prepared_weight, Tensor prepared_scale, Tensor prepared_meta, "
+      "Tensor(b!) decoded_panel, Tensor(c!) packed_panel, "
+      "Tensor(d!) meta_buffer) -> ()");
+  ops.impl("sm70_fp8_runtime_gemm_out", torch::kCUDA,
+           &sm70_fp8_runtime_gemm_out);
   ops.def(
       "sm70_f16_gate_mul_out(Tensor(a!) out, Tensor _in_feats, "
       "Tensor _gate_weight) -> ()");
