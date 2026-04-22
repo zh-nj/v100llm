@@ -166,7 +166,13 @@ runtime 按 active experts 把 FP8 临时 decode/pack 到 FP16 workspace，再�
 新增 3D prepare op：
 
 ```text
-sm70_fp8_moe_direct_prepare(weight, weight_scale, block_n, block_k)
+sm70_fp8_moe_direct_prepare(
+  weight,
+  weight_scale,
+  block_n,
+  block_k,
+  interleave_gated_silu,
+)
   -> prepared_weight, prepared_scale, prepared_meta
 ```
 
@@ -176,6 +182,7 @@ sm70_fp8_moe_direct_prepare(weight, weight_scale, block_n, block_k)
 - `weight_scale`: `[E, N / 128, K / 128]`, float32-compatible
 - `block_n=128`
 - `block_k=128`
+- `interleave_gated_silu`: whether to interleave gate/up output rows before packing
 
 输出：
 
@@ -189,6 +196,12 @@ sm70_fp8_moe_direct_prepare(weight, weight_scale, block_n, block_k)
 - `expand_block_fp8_scales_to_group_half`
 - `pack_sm70_fp8_weight_into`
 - `pack_sm70_fp8_scales_into`
+
+For `w13`, `interleave_gated_silu=True` makes the packed output order match
+TurboMind `Epilogue::kGatedSilu`: `[gate0, up0, gate1, up1, ...]`.
+The prepare op must interleave both the FP8 weight rows and the expanded
+per-output scale columns before packing. Interleaving only the weight would
+apply incorrect block scales. For `w2`, `interleave_gated_silu=False`.
 
 prepare 在 C++ 内循环 experts，避免 Python 端 40 层 * 256 experts * 2 matrices 的高额调度开销。
 
@@ -255,8 +268,8 @@ scale 参数用 float32 存储，checkpoint 的 bf16 scale 由 loader copy 到 f
 
 1. 校验 `weight_block_size == [128,128]`
 2. 校验 `w13/w2` 的 `N/K` 均为 128 的整数倍
-3. 调用 `ops.sm70_fp8_moe_direct_prepare()` 准备 w13
-4. 调用 `ops.sm70_fp8_moe_direct_prepare()` 准备 w2
+3. 调用 `ops.sm70_fp8_moe_direct_prepare(..., interleave_gated_silu=True)` 准备 w13
+4. 调用 `ops.sm70_fp8_moe_direct_prepare(..., interleave_gated_silu=False)` 准备 w2
 5. 将输出注册为 non-trainable parameters
 6. 调用 `ops.awq_moe_build_strided_ptrs()` 构造 batched GEMM pointer tables
 7. 删除原始 `w13_weight/w2_weight/w13_weight_scale_inv/w2_weight_scale_inv`
