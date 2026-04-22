@@ -41,7 +41,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
 )
-from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    adjust_block_scale_shard,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
@@ -50,6 +53,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.parameter import BlockQuantScaleParameter
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -512,6 +516,18 @@ class Qwen3_5Model(Qwen3NextModel):
                     for sub_id in shard_id:
                         shard_offset = sum(output_sizes[:sub_id])
                         shard_size = output_sizes[sub_id]
+
+                        if isinstance(param, BlockQuantScaleParameter):
+                            weight_block_size = getattr(owner, "weight_block_size",
+                                                        None)
+                            if weight_block_size is None:
+                                raise RuntimeError(
+                                    "Missing weight_block_size for block scale "
+                                    f"tuple shard load: {name}"
+                                )
+                            shard_size, shard_offset = adjust_block_scale_shard(
+                                weight_block_size, shard_size, shard_offset
+                            )
 
                         # Match MergedColumnParallelLinear packing behavior.
                         if (

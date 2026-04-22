@@ -646,6 +646,73 @@ def sm70_fp8_prepare(
     )
 
 
+def sm70_fp8_direct_prepare(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_n: int,
+    block_k: int,
+) -> list[torch.Tensor]:
+    return torch.ops._C.sm70_fp8_direct_prepare(
+        weight,
+        weight_scale,
+        block_n,
+        block_k,
+    )
+
+
+def sm70_fp8_moe_direct_prepare(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    interleave_gated_silu: bool,
+) -> list[torch.Tensor]:
+    return torch.ops._C.sm70_fp8_moe_direct_prepare(
+        weight,
+        weight_scale,
+        block_n,
+        block_k,
+        interleave_gated_silu,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_fp8_direct_prepare"):
+
+    @register_fake("_C::sm70_fp8_direct_prepare")
+    def _sm70_fp8_direct_prepare_fake(
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        block_n: int,
+        block_k: int,
+    ) -> list[torch.Tensor]:
+        packed_scale = torch.empty(
+            (weight.size(1) // block_k, weight.size(0)),
+            dtype=torch.float16,
+            device=weight.device,
+        )
+        meta = torch.empty((5,), dtype=torch.int64)
+        return [torch.empty_like(weight), packed_scale, meta]
+
+
+if hasattr(torch.ops._C, "sm70_fp8_moe_direct_prepare"):
+
+    @register_fake("_C::sm70_fp8_moe_direct_prepare")
+    def _sm70_fp8_moe_direct_prepare_fake(
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        block_n: int,
+        block_k: int,
+        interleave_gated_silu: bool,
+    ) -> list[torch.Tensor]:
+        packed_scale = torch.empty(
+            (weight.size(0), weight.size(2) // block_k, weight.size(1)),
+            dtype=torch.float16,
+            device=weight.device,
+        )
+        meta = torch.empty((5,), dtype=torch.int64)
+        return [torch.empty_like(weight), packed_scale, meta]
+
+
 if hasattr(torch.ops._C, "sm70_fp8_prepare"):
 
     @register_fake("_C::sm70_fp8_prepare")
@@ -683,6 +750,20 @@ def sm70_fp8_runtime_gemm(
     )
 
 
+def sm70_fp8_direct_gemm(
+    input: torch.Tensor,
+    prepared_weight: torch.Tensor,
+    prepared_scale: torch.Tensor,
+    prepared_meta: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._C.sm70_fp8_direct_gemm(
+        input,
+        prepared_weight,
+        prepared_scale,
+        prepared_meta,
+    )
+
+
 def sm70_f16_gemm_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -712,6 +793,22 @@ def sm70_fp8_runtime_gemm_out(
         decoded_panel,
         packed_panel,
         meta_buffer,
+    )
+
+
+def sm70_fp8_direct_gemm_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    prepared_weight: torch.Tensor,
+    prepared_scale: torch.Tensor,
+    prepared_meta: torch.Tensor,
+) -> None:
+    torch.ops._C.sm70_fp8_direct_gemm_out(
+        out,
+        input,
+        prepared_weight,
+        prepared_scale,
+        prepared_meta,
     )
 
 
@@ -787,6 +884,24 @@ if hasattr(torch.ops._C, "sm70_fp8_runtime_gemm"):
         )
 
 
+if hasattr(torch.ops._C, "sm70_fp8_direct_gemm"):
+
+    @register_fake("_C::sm70_fp8_direct_gemm")
+    def _sm70_fp8_direct_gemm_fake(
+        input: torch.Tensor,
+        prepared_weight: torch.Tensor,
+        prepared_scale: torch.Tensor,
+        prepared_meta: torch.Tensor,
+    ) -> torch.Tensor:
+        num_in_feats = input.size(0)
+        out_dim = int(prepared_meta[0].item())
+        return torch.empty(
+            (num_in_feats, out_dim),
+            dtype=input.dtype,
+            device=input.device,
+        )
+
+
 if hasattr(torch.ops._C, "awq_gemm_sm70_out"):
 
     @register_fake("_C::awq_gemm_sm70_out")
@@ -828,6 +943,19 @@ if hasattr(torch.ops._C, "sm70_fp8_runtime_gemm_out"):
         decoded_panel: torch.Tensor,
         packed_panel: torch.Tensor,
         meta_buffer: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "sm70_fp8_direct_gemm_out"):
+
+    @register_fake("_C::sm70_fp8_direct_gemm_out")
+    def _sm70_fp8_direct_gemm_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        prepared_weight: torch.Tensor,
+        prepared_scale: torch.Tensor,
+        prepared_meta: torch.Tensor,
     ) -> None:
         return None
 
@@ -1039,6 +1167,32 @@ def awq_moe_gemm_sm70_out(
     )
 
 
+def sm70_fp8_moe_gemm_out(
+    out: torch.Tensor,
+    sorted_input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    strided_ptrs_w: torch.Tensor,
+    strided_ptrs_s: torch.Tensor,
+    num_experts: int,
+    k: int,
+    n: int,
+    group_size: int,
+    gated_silu: bool = False,
+) -> None:
+    torch.ops._C.sm70_fp8_moe_gemm_out(
+        out,
+        sorted_input,
+        expert_offsets,
+        strided_ptrs_w,
+        strided_ptrs_s,
+        num_experts,
+        k,
+        n,
+        group_size,
+        gated_silu,
+    )
+
+
 if hasattr(torch.ops._C, "awq_moe_gemm_sm70"):
 
     @register_fake("_C::awq_moe_gemm_sm70")
@@ -1073,6 +1227,24 @@ if hasattr(torch.ops._C, "awq_moe_gemm_sm70_out"):
         n: int,
         group_size: int,
         gated_silu: bool,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "sm70_fp8_moe_gemm_out"):
+
+    @register_fake("_C::sm70_fp8_moe_gemm_out")
+    def _sm70_fp8_moe_gemm_out_fake(
+        out: torch.Tensor,
+        sorted_input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        strided_ptrs_w: torch.Tensor,
+        strided_ptrs_s: torch.Tensor,
+        num_experts: int,
+        k: int,
+        n: int,
+        group_size: int,
+        gated_silu: bool = False,
     ) -> None:
         return None
 # gptq

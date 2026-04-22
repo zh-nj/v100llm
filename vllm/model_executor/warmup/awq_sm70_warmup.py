@@ -151,6 +151,8 @@ def _iter_unique_runtime_decode_dense_layers(
     for layer in model.modules():
         if not getattr(layer, "_sm70_fp8_runtime_prepared", False):
             continue
+        if getattr(layer, "_sm70_fp8_direct_prepared", False):
+            continue
         prepared_meta = tuple(
             int(v) for v in layer._sm70_fp8_prepared_meta.tolist()
         )
@@ -166,10 +168,33 @@ def _iter_unique_runtime_decode_dense_layers(
         yield layer
 
 
+def _iter_unique_direct_fp8_dense_layers(
+    model: torch.nn.Module,
+) -> Iterable[torch.nn.Module]:
+    seen: set[tuple[int, int, int]] = set()
+    for layer in model.modules():
+        if not getattr(layer, "_sm70_fp8_direct_prepared", False):
+            continue
+        prepared_meta = tuple(
+            int(v) for v in layer._sm70_fp8_prepared_meta.tolist()
+        )
+        key = (
+            int(prepared_meta[1]),
+            int(prepared_meta[0]),
+            int(prepared_meta[2]),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        yield layer
+
+
 def _iter_unique_moe_layers(model: torch.nn.Module) -> Iterable[torch.nn.Module]:
     seen: set[tuple[int, int, int, int, int, int]] = set()
     for layer in model.modules():
         if not getattr(layer, "sm70_batched_ready", False):
+            continue
+        if getattr(layer, "_sm70_fp8_moe_direct_prepared", False):
             continue
         group_size = _group_size_from_tm_scales(
             int(layer.sm70_w13_k_dim), layer.w13_tm_scales[0]
@@ -181,6 +206,26 @@ def _iter_unique_moe_layers(model: torch.nn.Module) -> Iterable[torch.nn.Module]
             int(layer.sm70_w2_n_dim),
             int(layer.sm70_num_experts),
             group_size,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        yield layer
+
+
+def _iter_unique_direct_fp8_moe_layers(
+    model: torch.nn.Module,
+) -> Iterable[torch.nn.Module]:
+    seen: set[tuple[int, int, int, int, int]] = set()
+    for layer in model.modules():
+        if not getattr(layer, "_sm70_fp8_moe_direct_prepared", False):
+            continue
+        key = (
+            int(layer.sm70_w13_k_dim),
+            int(layer.sm70_w13_n_dim),
+            int(layer.sm70_w2_k_dim),
+            int(layer.sm70_w2_n_dim),
+            int(layer.sm70_num_experts),
         )
         if key in seen:
             continue
@@ -237,6 +282,29 @@ def _warmup_runtime_decode_dense_layers(
                 workspace.decoded_panel,
                 workspace.packed_panel,
                 workspace.meta_buffer,
+            )
+            calls += 1
+    return calls
+
+
+def _warmup_direct_fp8_dense_layers(
+    dense_layers: list[torch.nn.Module],
+    m_values: list[int],
+) -> int:
+    calls = 0
+    for layer in dense_layers:
+        device = layer._sm70_fp8_prepared_weight.device
+        k_dim = int(layer._sm70_fp8_prepared_meta[1].item())
+        n_dim = int(layer._sm70_fp8_prepared_meta[0].item())
+        for m_dim in m_values:
+            x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
+            out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
+            ops.sm70_fp8_direct_gemm_out(
+                out,
+                x,
+                layer._sm70_fp8_prepared_weight,
+                layer._sm70_fp8_prepared_scale,
+                layer._sm70_fp8_prepared_meta,
             )
             calls += 1
     return calls
@@ -301,6 +369,62 @@ def _warmup_moe_layers(
     return calls
 
 
+def _warmup_direct_fp8_moe_layers(
+    moe_layers: list[torch.nn.Module],
+    token_counts: list[int],
+) -> int:
+    calls = 0
+    for layer in moe_layers:
+        device = layer.w13_tm_weight.device
+        top_k = int(layer._buf_top_k)
+        for num_tokens in token_counts:
+            total_slots = num_tokens * top_k
+            expert_offsets = _build_balanced_offsets(
+                total_slots, int(layer.sm70_num_experts), device
+            )
+            permuted_input = torch.empty(
+                (total_slots, int(layer.sm70_w13_k_dim)),
+                dtype=torch.float16,
+                device=device,
+            )
+            intermediate = torch.empty(
+                (total_slots, int(layer.sm70_intermediate_size)),
+                dtype=torch.float16,
+                device=device,
+            )
+            sorted_output = torch.empty(
+                (total_slots, int(layer.sm70_w2_n_dim)),
+                dtype=torch.float16,
+                device=device,
+            )
+            ops.sm70_fp8_moe_gemm_out(
+                intermediate,
+                permuted_input,
+                expert_offsets,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                int(layer.sm70_num_experts),
+                int(layer.sm70_w13_k_dim),
+                int(layer.sm70_w13_n_dim),
+                128,
+                True,
+            )
+            ops.sm70_fp8_moe_gemm_out(
+                sorted_output,
+                intermediate,
+                expert_offsets,
+                layer.w2_strided_ptrs_w,
+                layer.w2_strided_ptrs_s,
+                int(layer.sm70_num_experts),
+                int(layer.sm70_w2_k_dim),
+                int(layer.sm70_w2_n_dim),
+                128,
+                False,
+            )
+            calls += 2
+    return calls
+
+
 def sm70_awq_warmup(worker: "Worker") -> None:
     if not _warmup_enabled():
         return
@@ -311,9 +435,17 @@ def sm70_awq_warmup(worker: "Worker") -> None:
 
     model = worker.get_model()
     dense_layers = list(_iter_unique_dense_layers(model))
+    direct_fp8_dense_layers = list(_iter_unique_direct_fp8_dense_layers(model))
     runtime_decode_dense_layers = list(_iter_unique_runtime_decode_dense_layers(model))
     moe_layers = list(_iter_unique_moe_layers(model))
-    if not dense_layers and not runtime_decode_dense_layers and not moe_layers:
+    direct_fp8_moe_layers = list(_iter_unique_direct_fp8_moe_layers(model))
+    if (
+        not dense_layers
+        and not direct_fp8_dense_layers
+        and not runtime_decode_dense_layers
+        and not moe_layers
+        and not direct_fp8_moe_layers
+    ):
         return
 
     imported_records = _load_lut_cache(device)
@@ -328,25 +460,37 @@ def sm70_awq_warmup(worker: "Worker") -> None:
     moe_token_counts = _get_moe_token_counts(worker)
 
     logger.info(
-        "Warming up SM70 AWQ/runtime-decode kernels (%d AWQ dense shapes, "
-        "%d runtime-decode dense shapes, %d MoE shapes).",
+        "Warming up SM70 AWQ/FP8 kernels (%d AWQ dense shapes, "
+        "%d direct FP8 dense shapes, %d runtime-decode dense shapes, "
+        "%d AWQ MoE shapes, %d direct FP8 MoE shapes).",
         len(dense_layers),
+        len(direct_fp8_dense_layers),
         len(runtime_decode_dense_layers),
         len(moe_layers),
+        len(direct_fp8_moe_layers),
     )
     with torch.inference_mode():
         dense_calls = _warmup_dense_layers(dense_layers, m_values)
+        direct_fp8_dense_calls = _warmup_direct_fp8_dense_layers(
+            direct_fp8_dense_layers, m_values
+        )
         runtime_decode_dense_calls = _warmup_runtime_decode_dense_layers(
             runtime_decode_dense_layers, m_values
         )
         moe_calls = _warmup_moe_layers(moe_layers, moe_token_counts)
+        direct_fp8_moe_calls = _warmup_direct_fp8_moe_layers(
+            direct_fp8_moe_layers, moe_token_counts
+        )
     torch.cuda.synchronize(device)
     logger.info(
-        "SM70 AWQ/runtime-decode warmup finished (%d AWQ dense calls, "
-        "%d runtime-decode dense calls, %d MoE calls).",
+        "SM70 AWQ/FP8 warmup finished (%d AWQ dense calls, "
+        "%d direct FP8 dense calls, %d runtime-decode dense calls, "
+        "%d AWQ MoE calls, %d direct FP8 MoE calls).",
         dense_calls,
+        direct_fp8_dense_calls,
         runtime_decode_dense_calls,
         moe_calls,
+        direct_fp8_moe_calls,
     )
     exported_records = _save_lut_cache(device)
     if exported_records > 0:

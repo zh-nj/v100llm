@@ -218,6 +218,18 @@ std::vector<torch::Tensor> sm70_fp8_prepare(torch::Tensor weight,
                                             int64_t block_k,
                                             int64_t panel_n);
 
+std::vector<torch::Tensor> sm70_fp8_direct_prepare(torch::Tensor weight,
+                                                   torch::Tensor weight_scale,
+                                                   int64_t block_n,
+                                                   int64_t block_k);
+
+std::vector<torch::Tensor> sm70_fp8_moe_direct_prepare(
+    torch::Tensor weight,
+    torch::Tensor weight_scale,
+    int64_t block_n,
+    int64_t block_k,
+    bool interleave_gated_silu);
+
 torch::Tensor awq_gemm_sm70(torch::Tensor _in_feats,
                             torch::Tensor _kernel,
                             torch::Tensor _scaling_factors,
@@ -234,6 +246,11 @@ torch::Tensor sm70_fp8_runtime_gemm(torch::Tensor input,
                                     torch::Tensor decoded_panel,
                                     torch::Tensor packed_panel,
                                     torch::Tensor meta_buffer);
+
+torch::Tensor sm70_fp8_direct_gemm(torch::Tensor input,
+                                   torch::Tensor prepared_weight,
+                                   torch::Tensor prepared_scale,
+                                   torch::Tensor prepared_meta);
 
 void awq_gemm_sm70_out(torch::Tensor out,
                        torch::Tensor _in_feats,
@@ -258,6 +275,23 @@ void sm70_fp8_runtime_gemm_out(torch::Tensor out,
                                torch::Tensor decoded_panel,
                                torch::Tensor packed_panel,
                                torch::Tensor meta_buffer);
+
+void sm70_fp8_direct_gemm_out(torch::Tensor out,
+                              torch::Tensor input,
+                              torch::Tensor prepared_weight,
+                              torch::Tensor prepared_scale,
+                              torch::Tensor prepared_meta);
+
+void sm70_fp8_moe_gemm_out(torch::Tensor out,
+                           torch::Tensor sorted_input,
+                           torch::Tensor expert_offsets,
+                           torch::Tensor strided_ptrs_w,
+                           torch::Tensor strided_ptrs_s,
+                           int64_t num_experts,
+                           int64_t k,
+                           int64_t n,
+                           int64_t group_size,
+                           bool gated_silu);
 
 void sm70_f16_gate_mul_out(torch::Tensor out,
                            torch::Tensor _in_feats,

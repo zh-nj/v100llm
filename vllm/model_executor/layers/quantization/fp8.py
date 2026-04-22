@@ -39,6 +39,10 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization.awq_sm70_moe import (
+    _DEFAULT_PERSISTENT_MAX_TOKENS as _SM70_FP8_MOE_PERSISTENT_TOKENS,
+    _moe_permute_accepts_scale_and_m_indices,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -70,8 +74,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
 )
 from vllm.model_executor.layers.quantization.utils.sm70_fp8_runtime_decode import (
+    SM70_FP8_LAYOUT_BLOCK,
+    ensure_sm70_fp8_workspace,
     get_or_create_sm70_fp8_workspace,
     infer_sm70_fp8_layout,
+    select_sm70_fp8_panel_n,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_block_fp8_supported,
@@ -288,9 +295,11 @@ class Fp8Config(QuantizationConfig):
                 self.is_checkpoint_fp8_serialized
                 and _get_current_capability_int() == 70
             ):
+                if self.supports_sm70_checkpoint_fallback():
+                    return Fp8SM70DirectMoEMethod(self, layer)
                 raise ValueError(
-                    "sm70 serialized FP8 MoE is not supported yet. "
-                    "Only dense linear layers use the SM70 fallback path."
+                    "sm70 serialized FP8 MoE requires dynamic block FP8 "
+                    "with weight_block_size=[128, 128]."
                 )
             if self.is_checkpoint_fp8_serialized:
                 moe_quant_method = Fp8MoEMethod(self, layer)
@@ -355,14 +364,14 @@ def _copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
 class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
     """SM70 fallback for serialized block-FP8 dense linear layers.
 
-    The checkpoint remains FP8 after loading. Runtime decodes one panel at a
-    time and dispatches to a dedicated SM70 custom op.
+    The checkpoint remains FP8 after loading. By default, weights are prepared
+    into TurboMind's compressed SM70 E4M3 layout and consumed directly by GEMM.
+    Set VLLM_SM70_FP8_DIRECT_GEMM=0 to use the older runtime decode fallback.
     """
 
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.weight_block_size = self.quant_config.weight_block_size
-        self.panel_n = 128
         self.block_quant = self.weight_block_size is not None
         self.act_q_static = self.quant_config.activation_scheme == "static"
         if not self.block_quant or self.act_q_static:
@@ -376,6 +385,10 @@ class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
                 "SM70 runtime decode currently requires weight_block_size "
                 f"[128, 128], got {self.weight_block_size}."
             )
+
+    @staticmethod
+    def _direct_gemm_enabled() -> bool:
+        return envs.VLLM_SM70_FP8_DIRECT_GEMM
 
     def create_weights(
         self,
@@ -437,27 +450,53 @@ class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
             if self.weight_block_size is not None
             else None,
         )
-        prepared_weight, prepared_scale, prepared_meta, workspace_meta = (
-            ops.sm70_fp8_prepare(
-                layer.weight,
-                layer.weight_scale_inv,
-                layout_kind,
-                scale_axis,
-                block_n,
-                block_k,
-                self.panel_n,
-            )
+        direct_gemm = (
+            self._direct_gemm_enabled()
+            and layout_kind == SM70_FP8_LAYOUT_BLOCK
+            and block_n == 128
+            and block_k == 128
         )
+
+        if direct_gemm:
+            prepared_weight, prepared_scale, prepared_meta = (
+                ops.sm70_fp8_direct_prepare(
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    block_n,
+                    block_k,
+                )
+            )
+            layer._sm70_fp8_direct_prepared = True
+        else:
+            panel_n = select_sm70_fp8_panel_n(
+                logical_n=int(layer.output_size_per_partition),
+                logical_k=int(layer.input_size_per_partition),
+                block_n=block_n,
+            )
+            prepared_weight, prepared_scale, prepared_meta, workspace_meta = (
+                ops.sm70_fp8_prepare(
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    layout_kind,
+                    scale_axis,
+                    block_n,
+                    block_k,
+                    panel_n,
+                )
+            )
+            layer._sm70_fp8_direct_prepared = False
+            layer._sm70_fp8_panel_n = panel_n
+            layer._sm70_fp8_workspace_meta = workspace_meta
+            layer._sm70_fp8_workspace_cols = int(workspace_meta[1].item())
+            ensure_sm70_fp8_workspace(layer, layer.weight.device)
+
         layer._sm70_fp8_runtime_prepared = True
-        layer._sm70_fp8_panel_n = self.panel_n
         layer._sm70_fp8_block_shape = tuple(self.weight_block_size)
         layer._sm70_fp8_output_size = int(layer.output_size_per_partition)
         layer._sm70_fp8_logical_widths = tuple(layer.logical_widths)
         layer._sm70_fp8_prepared_weight = prepared_weight
         layer._sm70_fp8_prepared_scale = prepared_scale
         layer._sm70_fp8_prepared_meta = prepared_meta
-        layer._sm70_fp8_workspace_meta = workspace_meta
-        layer._sm70_fp8_workspace_cache = {}
         layer.input_scale = None
         layer._already_called_process_weights_after_loading = True
 
@@ -482,22 +521,30 @@ class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
             dtype=x_2d.dtype,
             device=x_2d.device,
         )
-        workspace = get_or_create_sm70_fp8_workspace(layer, x_2d)
-        ops.sm70_fp8_runtime_gemm_out(
-            out_padded,
-            x_2d,
-            layer._sm70_fp8_prepared_weight,
-            layer._sm70_fp8_prepared_scale,
-            layer._sm70_fp8_prepared_meta,
-            workspace.decoded_panel,
-            workspace.packed_panel,
-            workspace.meta_buffer,
-        )
+        if getattr(layer, "_sm70_fp8_direct_prepared", False):
+            ops.sm70_fp8_direct_gemm_out(
+                out_padded,
+                x_2d,
+                layer._sm70_fp8_prepared_weight,
+                layer._sm70_fp8_prepared_scale,
+                layer._sm70_fp8_prepared_meta,
+            )
+        else:
+            workspace = get_or_create_sm70_fp8_workspace(layer, x_2d)
+            ops.sm70_fp8_runtime_gemm_out(
+                out_padded,
+                x_2d,
+                layer._sm70_fp8_prepared_weight,
+                layer._sm70_fp8_prepared_scale,
+                layer._sm70_fp8_prepared_meta,
+                workspace.decoded_panel,
+                workspace.packed_panel,
+                workspace.meta_buffer,
+            )
         out = out_padded[:, :logical_out_dim]
         if bias is not None:
             out.add_(bias)
         return out.reshape(x.shape[:-1] + (out.shape[-1],))
-
 
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
@@ -805,6 +852,361 @@ class Fp8OnlineLinearMethod(Fp8LinearMethod):
 
         # Prevent duplicate processing (e.g., during weight reload)
         layer._already_called_process_weights_after_loading = True
+
+
+class Fp8SM70DirectMoEMethod(FusedMoEMethodBase):
+    """SM70 direct FP8 MoE method using TurboMind grouped GEMM."""
+
+    def __init__(self, quant_config: Fp8Config, layer: torch.nn.Module):
+        super().__init__(layer.moe_config)
+        self.quant_config = quant_config
+        self.weight_block_size = quant_config.weight_block_size
+        if self.weight_block_size != [128, 128]:
+            raise ValueError(
+                "SM70 FP8 MoE requires weight_block_size=[128, 128], "
+                f"got {self.weight_block_size}."
+            )
+        if quant_config.activation_scheme != "dynamic":
+            raise ValueError("SM70 FP8 MoE requires dynamic activation scheme.")
+
+    @property
+    def supports_eplb(self) -> bool:
+        return True
+
+    def create_weights(
+        self,
+        layer: Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        layer.num_experts = num_experts
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = self.weight_block_size
+        block_n, block_k = self.weight_block_size
+        if hidden_size % block_k != 0:
+            raise ValueError(
+                "SM70 FP8 MoE requires hidden_size divisible by 128, "
+                f"got {hidden_size}."
+            )
+        if intermediate_size_per_partition % block_n != 0:
+            raise ValueError(
+                "SM70 FP8 MoE requires intermediate_size_per_partition "
+                f"divisible by 128, got {intermediate_size_per_partition}."
+            )
+
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        w13_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                2 * (intermediate_size_per_partition // block_n),
+                hidden_size // block_k,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        w2_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                hidden_size // block_n,
+                intermediate_size_per_partition // block_k,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+        )
+        layer.register_parameter("w13_weight_scale_inv", w13_scale)
+        layer.register_parameter("w2_weight_scale_inv", w2_scale)
+        set_weight_attrs(w13_scale, extra_weight_attrs)
+        set_weight_attrs(w2_scale, extra_weight_attrs)
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
+    def _prepare_matrix(
+        self,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        interleave_gated_silu: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        block_n, block_k = self.weight_block_size
+        return ops.sm70_fp8_moe_direct_prepare(
+            weight,
+            scale.to(torch.float32),
+            block_n,
+            block_k,
+            interleave_gated_silu,
+        )
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        w13, w13_scale, w13_meta = self._prepare_matrix(
+            layer.w13_weight,
+            layer.w13_weight_scale_inv,
+            True,
+        )
+        w2, w2_scale, w2_meta = self._prepare_matrix(
+            layer.w2_weight,
+            layer.w2_weight_scale_inv,
+            False,
+        )
+        layer.w13_tm_weight = torch.nn.Parameter(w13, requires_grad=False)
+        layer.w13_tm_scales = torch.nn.Parameter(w13_scale, requires_grad=False)
+        layer.w2_tm_weight = torch.nn.Parameter(w2, requires_grad=False)
+        layer.w2_tm_scales = torch.nn.Parameter(w2_scale, requires_grad=False)
+        del layer.w13_weight, layer.w2_weight
+        del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+
+        num_experts = int(w13.shape[0])
+        w13_k_ld = int(w13_meta[3].item())
+        w13_q_ld = int(w13_meta[4].item())
+        w2_k_ld = int(w2_meta[3].item())
+        w2_q_ld = int(w2_meta[4].item())
+        w13_ptrs = ops.awq_moe_build_strided_ptrs(
+            w13, w13_scale, w13_k_ld, w13_q_ld, num_experts
+        )
+        w2_ptrs = ops.awq_moe_build_strided_ptrs(
+            w2, w2_scale, w2_k_ld, w2_q_ld, num_experts
+        )
+        layer.w13_strided_ptrs_w = torch.nn.Parameter(w13_ptrs[0], requires_grad=False)
+        layer.w13_strided_ptrs_s = torch.nn.Parameter(w13_ptrs[1], requires_grad=False)
+        layer.w2_strided_ptrs_w = torch.nn.Parameter(w2_ptrs[0], requires_grad=False)
+        layer.w2_strided_ptrs_s = torch.nn.Parameter(w2_ptrs[1], requires_grad=False)
+        layer.w13_strided_ptrs_w_rows = layer.w13_strided_ptrs_w.view(num_experts, -1)
+        layer.w13_strided_ptrs_s_rows = layer.w13_strided_ptrs_s.view(num_experts, -1)
+        layer.w2_strided_ptrs_w_rows = layer.w2_strided_ptrs_w.view(num_experts, -1)
+        layer.w2_strided_ptrs_s_rows = layer.w2_strided_ptrs_s.view(num_experts, -1)
+
+        layer.sm70_num_experts = num_experts
+        layer.sm70_w13_n_dim = int(w13_meta[0].item())
+        layer.sm70_w13_k_dim = int(w13_meta[1].item())
+        layer.sm70_w2_n_dim = int(w2_meta[0].item())
+        layer.sm70_w2_k_dim = int(w2_meta[1].item())
+        layer.sm70_hidden_logical_size = layer.sm70_w2_n_dim
+        layer.sm70_intermediate_size = layer.sm70_w2_k_dim
+        layer.sm70_batched_ready = True
+        layer._sm70_fp8_moe_direct_prepared = True
+        self._allocate_buffers(layer, w13.device)
+
+    def _allocate_buffers(self, layer: Module, device: torch.device) -> None:
+        top_k = self.moe.experts_per_token
+        persistent_tokens = _SM70_FP8_MOE_PERSISTENT_TOKENS
+        max_slots = persistent_tokens * top_k
+        hidden_size = layer.sm70_hidden_logical_size
+        layer._buf_max_tokens = persistent_tokens
+        layer._buf_max_slots = max_slots
+        layer._buf_top_k = top_k
+        layer._buf_expert_offsets = torch.empty(
+            layer.sm70_num_experts + 1, dtype=torch.int32, device=device
+        )
+        layer._buf_expert_offsets64 = torch.empty(
+            layer.sm70_num_experts + 1, dtype=torch.int64, device=device
+        )
+        layer._buf_gate_up = torch.empty(
+            max_slots, layer.sm70_w13_n_dim, dtype=torch.float16, device=device
+        )
+        layer._buf_intermediate = torch.empty(
+            max_slots, layer.sm70_intermediate_size, dtype=torch.float16, device=device
+        )
+        layer._buf_permuted_input = torch.empty(
+            max_slots, hidden_size, dtype=torch.float16, device=device
+        )
+        layer._buf_sorted_output = torch.empty(
+            max_slots, hidden_size, dtype=torch.float16, device=device
+        )
+        layer._buf_inv_permuted_idx = torch.empty(
+            persistent_tokens, top_k, dtype=torch.int32, device=device
+        )
+        layer._buf_topk_ids_i32 = torch.empty(
+            persistent_tokens, top_k, dtype=torch.int32, device=device
+        )
+        layer._buf_token_expert_indices = torch.arange(
+            max_slots, dtype=torch.int32, device=device
+        ).view(persistent_tokens, top_k)
+        layer._buf_permuted_idx = torch.empty(max_slots, dtype=torch.int32, device=device)
+        layer._buf_m_indices = torch.empty(max_slots, dtype=torch.int32, device=device)
+        layer._buf_output = torch.empty(
+            persistent_tokens, hidden_size, dtype=torch.float16, device=device
+        )
+
+    def _get_buffers(self, layer: Module, total_slots: int, num_tokens: int):
+        if total_slots <= layer._buf_max_slots and num_tokens <= layer._buf_max_tokens:
+            return {
+                "output": layer._buf_output[:num_tokens],
+                "permuted_input": layer._buf_permuted_input[:total_slots],
+                "sorted_output": layer._buf_sorted_output[:total_slots],
+                "intermediate": layer._buf_intermediate[:total_slots],
+                "expert_offsets": layer._buf_expert_offsets,
+                "expert_offsets64": layer._buf_expert_offsets64,
+                "inv_permuted_idx": layer._buf_inv_permuted_idx[:num_tokens],
+                "topk_ids_i32": layer._buf_topk_ids_i32[:num_tokens],
+                "token_expert_indices": layer._buf_token_expert_indices[:num_tokens],
+                "permuted_idx": layer._buf_permuted_idx[:total_slots],
+                "m_indices": layer._buf_m_indices[:total_slots],
+            }
+        device = layer._buf_output.device
+        top_k = layer._buf_top_k
+        hidden_size = layer.sm70_hidden_logical_size
+        return {
+            "output": torch.empty(
+                num_tokens, hidden_size, dtype=torch.float16, device=device
+            ),
+            "permuted_input": torch.empty(
+                total_slots, hidden_size, dtype=torch.float16, device=device
+            ),
+            "sorted_output": torch.empty(
+                total_slots, hidden_size, dtype=torch.float16, device=device
+            ),
+            "intermediate": torch.empty(
+                total_slots,
+                layer.sm70_intermediate_size,
+                dtype=torch.float16,
+                device=device,
+            ),
+            "expert_offsets": torch.empty(
+                layer.sm70_num_experts + 1, dtype=torch.int32, device=device
+            ),
+            "expert_offsets64": torch.empty(
+                layer.sm70_num_experts + 1, dtype=torch.int64, device=device
+            ),
+            "inv_permuted_idx": torch.empty(
+                num_tokens, top_k, dtype=torch.int32, device=device
+            ),
+            "topk_ids_i32": torch.empty(
+                num_tokens, top_k, dtype=torch.int32, device=device
+            ),
+            "token_expert_indices": torch.arange(
+                total_slots, dtype=torch.int32, device=device
+            ).view(num_tokens, top_k),
+            "permuted_idx": torch.empty(total_slots, dtype=torch.int32, device=device),
+            "m_indices": torch.empty(total_slots, dtype=torch.int32, device=device),
+        }
+
+    def apply(
+        self,
+        layer: Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        del shared_experts_input
+        if not getattr(layer, "sm70_batched_ready", False):
+            raise RuntimeError("SM70 FP8 MoE batched runtime is not prepared.")
+        num_tokens = x.shape[0]
+        top_k = topk_ids.shape[1]
+        total_slots = num_tokens * top_k
+        buffers = self._get_buffers(layer, total_slots, num_tokens)
+        output = buffers["output"]
+        output.zero_()
+        if total_slots == 0:
+            return output
+
+        topk_ids_i32 = buffers["topk_ids_i32"]
+        topk_ids_i32.copy_(topk_ids, non_blocking=True)
+        if _moe_permute_accepts_scale_and_m_indices():
+            torch.ops._moe_C.moe_permute(
+                x,
+                topk_ids_i32,
+                buffers["token_expert_indices"],
+                None,
+                layer.sm70_num_experts,
+                layer.sm70_num_experts,
+                top_k,
+                None,
+                buffers["permuted_input"],
+                buffers["expert_offsets64"],
+                buffers["inv_permuted_idx"],
+                buffers["permuted_idx"],
+                buffers["m_indices"],
+            )
+        else:
+            torch.ops._moe_C.moe_permute(
+                x,
+                topk_ids_i32,
+                buffers["token_expert_indices"],
+                None,
+                layer.sm70_num_experts,
+                layer.sm70_num_experts,
+                top_k,
+                buffers["permuted_input"],
+                buffers["expert_offsets64"],
+                buffers["inv_permuted_idx"],
+                buffers["permuted_idx"],
+            )
+        buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
+
+        ops.sm70_fp8_moe_gemm_out(
+            buffers["intermediate"],
+            buffers["permuted_input"],
+            buffers["expert_offsets"],
+            layer.w13_strided_ptrs_w,
+            layer.w13_strided_ptrs_s,
+            layer.sm70_num_experts,
+            layer.sm70_w13_k_dim,
+            layer.sm70_w13_n_dim,
+            128,
+            True,
+        )
+        ops.sm70_fp8_moe_gemm_out(
+            buffers["sorted_output"],
+            buffers["intermediate"],
+            buffers["expert_offsets"],
+            layer.w2_strided_ptrs_w,
+            layer.w2_strided_ptrs_s,
+            layer.sm70_num_experts,
+            layer.sm70_w2_k_dim,
+            layer.sm70_w2_n_dim,
+            128,
+            False,
+        )
+        torch.ops._moe_C.moe_unpermute(
+            buffers["sorted_output"][:, : layer.sm70_hidden_logical_size],
+            topk_weights,
+            buffers["inv_permuted_idx"],
+            buffers["expert_offsets64"],
+            top_k,
+            output,
+        )
+        return output
+
+    def apply_monolithic(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError(
+            "Fp8SM70DirectMoEMethod only supports the routed FusedMoE path."
+        )
+
+    def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> None:
+        return None
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):

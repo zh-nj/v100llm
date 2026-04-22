@@ -40,6 +40,16 @@ def _to_block_fp8(weight_fp16: torch.Tensor):
     return q.cuda(), s
 
 
+def _to_block_fp8_3d(weight_fp16: torch.Tensor):
+    weights = []
+    scales = []
+    for expert in range(weight_fp16.shape[0]):
+        q, s = _to_block_fp8(weight_fp16[expert])
+        weights.append(q)
+        scales.append(s)
+    return torch.stack(weights), torch.stack(scales)
+
+
 def _sm70_decode_reference_block(
     weight_fp8: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -57,6 +67,23 @@ def _sm70_decode_reference_block(
             row_chunks.append((block * scale).to(torch.float16))
         rows.append(torch.cat(row_chunks, dim=1))
     return torch.cat(rows, dim=0)
+
+
+def _sm70_decode_reference_block_3d(
+    weight_fp8: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    decoded = []
+    for expert in range(weight_fp8.shape[0]):
+        decoded.append(
+            _sm70_decode_reference_block(
+                weight_fp8[expert],
+                weight_scale[expert],
+                128,
+                128,
+            )
+        )
+    return torch.stack(decoded)
 
 
 def _to_tensor_fp8(weight_fp16: torch.Tensor):
@@ -132,6 +159,27 @@ def test_sm70_fp8_prepare_and_runtime_gemm_block_layout_matches_reference():
 
 
 @pytest.mark.cuda
+def test_sm70_fp8_direct_gemm_block_layout_matches_reference():
+    _require_sm70()
+    torch.manual_seed(3)
+    x = torch.randn(3, 256, device="cuda", dtype=torch.float16) / 4
+    w_ref = torch.randn(384, 256, device="cuda", dtype=torch.float16) / 4
+    w_fp8, w_scale = _to_block_fp8(w_ref)
+
+    prepared_w, prepared_s, prepared_meta = ops.sm70_fp8_direct_prepare(
+        w_fp8,
+        w_scale,
+        128,
+        128,
+    )
+    out = torch.empty((x.shape[0], w_ref.shape[0]), dtype=torch.float16, device="cuda")
+    ops.sm70_fp8_direct_gemm_out(out, x, prepared_w, prepared_s, prepared_meta)
+
+    ref = x @ w_ref.t()
+    torch.testing.assert_close(out, ref, atol=6e-1, rtol=8e-2)
+
+
+@pytest.mark.cuda
 def test_sm70_fp8_runtime_gemm_out_is_cuda_graph_capturable():
     _require_sm70()
     torch.manual_seed(0)
@@ -185,6 +233,182 @@ def test_sm70_fp8_runtime_gemm_out_is_cuda_graph_capturable():
 
     graph.replay()
     ref = x @ w_ref.t()
+    torch.testing.assert_close(out, ref, atol=6e-1, rtol=8e-2)
+
+
+@pytest.mark.cuda
+def test_sm70_fp8_direct_gemm_out_is_cuda_graph_capturable():
+    _require_sm70()
+    torch.manual_seed(4)
+    x = torch.randn(1, 256, device="cuda", dtype=torch.float16) / 4
+    w_ref = torch.randn(256, 256, device="cuda", dtype=torch.float16) / 4
+    w_fp8, w_scale = _to_block_fp8(w_ref)
+    prepared_w, prepared_s, prepared_meta = ops.sm70_fp8_direct_prepare(
+        w_fp8,
+        w_scale,
+        128,
+        128,
+    )
+    out = torch.empty((x.shape[0], w_ref.shape[0]), dtype=torch.float16, device="cuda")
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        ops.sm70_fp8_direct_gemm_out(out, x, prepared_w, prepared_s, prepared_meta)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ops.sm70_fp8_direct_gemm_out(out, x, prepared_w, prepared_s, prepared_meta)
+
+    graph.replay()
+    ref = x @ w_ref.t()
+    torch.testing.assert_close(out, ref, atol=6e-1, rtol=8e-2)
+
+
+@pytest.mark.cuda
+def test_sm70_fp8_moe_direct_gemm_matches_reference():
+    _require_sm70()
+    torch.manual_seed(10)
+    num_experts = 2
+    k = 256
+    n = 256
+    x = torch.randn(3, k, device="cuda", dtype=torch.float16) / 4
+    w_ref = torch.randn(num_experts, n, k, device="cuda", dtype=torch.float16) / 4
+    w_fp8, w_scale = _to_block_fp8_3d(w_ref)
+    prepared_w, prepared_s, prepared_meta = ops.sm70_fp8_moe_direct_prepare(
+        w_fp8,
+        w_scale,
+        128,
+        128,
+        False,
+    )
+    ptrs_w, ptrs_s = ops.awq_moe_build_strided_ptrs(
+        prepared_w,
+        prepared_s,
+        int(prepared_meta[3].item()),
+        int(prepared_meta[4].item()),
+        num_experts,
+    )
+    expert_offsets = torch.tensor([0, 2, 3], dtype=torch.int32, device="cuda")
+    out = torch.empty((3, n), dtype=torch.float16, device="cuda")
+    ops.sm70_fp8_moe_gemm_out(
+        out,
+        x,
+        expert_offsets,
+        ptrs_w,
+        ptrs_s,
+        num_experts,
+        k,
+        n,
+        128,
+        False,
+    )
+
+    decoded = _sm70_decode_reference_block_3d(w_fp8, w_scale)
+    ref = torch.empty_like(out)
+    ref[:2] = x[:2] @ decoded[0].t()
+    ref[2:] = x[2:] @ decoded[1].t()
+    torch.testing.assert_close(out, ref, atol=6e-1, rtol=8e-2)
+
+
+@pytest.mark.cuda
+def test_sm70_fp8_moe_direct_gemm_gated_silu_matches_reference():
+    _require_sm70()
+    torch.manual_seed(11)
+    num_experts = 2
+    k = 256
+    intermediate = 128
+    n = intermediate * 2
+    x = torch.randn(3, k, device="cuda", dtype=torch.float16) / 4
+    w_ref = torch.randn(num_experts, n, k, device="cuda", dtype=torch.float16) / 4
+    w_fp8, w_scale = _to_block_fp8_3d(w_ref)
+    prepared_w, prepared_s, prepared_meta = ops.sm70_fp8_moe_direct_prepare(
+        w_fp8,
+        w_scale,
+        128,
+        128,
+        True,
+    )
+    ptrs_w, ptrs_s = ops.awq_moe_build_strided_ptrs(
+        prepared_w,
+        prepared_s,
+        int(prepared_meta[3].item()),
+        int(prepared_meta[4].item()),
+        num_experts,
+    )
+    expert_offsets = torch.tensor([0, 2, 3], dtype=torch.int32, device="cuda")
+    out = torch.empty((3, intermediate), dtype=torch.float16, device="cuda")
+    ops.sm70_fp8_moe_gemm_out(
+        out,
+        x,
+        expert_offsets,
+        ptrs_w,
+        ptrs_s,
+        num_experts,
+        k,
+        n,
+        128,
+        True,
+    )
+
+    decoded = _sm70_decode_reference_block_3d(w_fp8, w_scale)
+    ref = torch.empty_like(out)
+    full0 = x[:2] @ decoded[0].t()
+    full1 = x[2:] @ decoded[1].t()
+    gate0, up0 = full0.chunk(2, dim=1)
+    gate1, up1 = full1.chunk(2, dim=1)
+    ref[:2] = torch.nn.functional.silu(gate0) * up0
+    ref[2:] = torch.nn.functional.silu(gate1) * up1
+    torch.testing.assert_close(out, ref, atol=7e-1, rtol=1e-1)
+
+
+@pytest.mark.cuda
+def test_sm70_fp8_moe_direct_gemm_out_is_cuda_graph_capturable():
+    _require_sm70()
+    torch.manual_seed(12)
+    num_experts = 2
+    k = 256
+    n = 256
+    x = torch.randn(1, k, device="cuda", dtype=torch.float16) / 4
+    w_ref = torch.randn(num_experts, n, k, device="cuda", dtype=torch.float16) / 4
+    w_fp8, w_scale = _to_block_fp8_3d(w_ref)
+    prepared_w, prepared_s, prepared_meta = ops.sm70_fp8_moe_direct_prepare(
+        w_fp8,
+        w_scale,
+        128,
+        128,
+        False,
+    )
+    ptrs_w, ptrs_s = ops.awq_moe_build_strided_ptrs(
+        prepared_w,
+        prepared_s,
+        int(prepared_meta[3].item()),
+        int(prepared_meta[4].item()),
+        num_experts,
+    )
+    expert_offsets = torch.tensor([0, 1, 1], dtype=torch.int32, device="cuda")
+    out = torch.empty((1, n), dtype=torch.float16, device="cuda")
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        ops.sm70_fp8_moe_gemm_out(
+            out, x, expert_offsets, ptrs_w, ptrs_s, num_experts, k, n, 128, False
+        )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ops.sm70_fp8_moe_gemm_out(
+            out, x, expert_offsets, ptrs_w, ptrs_s, num_experts, k, n, 128, False
+        )
+    graph.replay()
+
+    decoded = _sm70_decode_reference_block_3d(w_fp8, w_scale)
+    ref = x @ decoded[0].t()
     torch.testing.assert_close(out, ref, atol=6e-1, rtol=8e-2)
 
 
