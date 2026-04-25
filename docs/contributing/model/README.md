@@ -16,6 +16,7 @@ Read through these pages for a step-by-step guide:
 - [Unit Testing](tests.md)
 - [Multi-Modal Support](multimodal.md)
 - [Speech-to-Text Support](transcription.md)
+- [SM70 / V100 新模型接入指南](sm70_new_model_zh.md)
 
 !!! tip
     If you are encountering issues while integrating your model into vLLM, feel free to open a [GitHub issue](https://github.com/vllm-project/vllm/issues)

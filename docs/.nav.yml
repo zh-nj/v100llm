@@ -43,6 +43,7 @@ nav:
       - contributing/model/tests.md
       - contributing/model/multimodal.md
       - contributing/model/transcription.md
+      - contributing/model/sm70_new_model_zh.md
     - CI: contributing/ci
     - Design Documents:
       - Plugins:
