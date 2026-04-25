@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import importlib.util
 import hashlib
 import multiprocessing
 import os
 import pickle
 import tempfile
+import textwrap
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -22,7 +24,7 @@ from vllm.compilation.caching import (
     VllmSerializableFunction,
 )
 from vllm.compilation.counter import compilation_counter
-from vllm.compilation.decorators import support_torch_compile
+from vllm.compilation.decorators import _model_hash_key, support_torch_compile
 from vllm.config import (
     CompilationConfig,
     CompilationMode,
@@ -89,10 +91,38 @@ def make_vllm_config() -> VllmConfig:
     )
 
 
+def _load_toy_forward(tmp_path: Path, module_name: str, body: str):
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text(
+        textwrap.dedent(
+            f"""
+            class Toy:
+                def forward(self, x):
+                    {body}
+            """
+        )
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Toy.forward
+
+
 @contextmanager
 def use_vllm_config(vllm_config: VllmConfig):
     with set_forward_context({}, vllm_config), set_current_vllm_config(vllm_config):
         yield
+
+
+def test_model_hash_key_changes_when_forward_source_changes(tmp_path: Path):
+    forward_add = _load_toy_forward(tmp_path, "toy_add", "return x + 1")
+    forward_sub = _load_toy_forward(tmp_path, "toy_sub", "return x - 1")
+
+    assert forward_add.__qualname__ == forward_sub.__qualname__ == "Toy.forward"
+    assert forward_add.__code__.co_firstlineno == forward_sub.__code__.co_firstlineno
+
+    assert _model_hash_key(forward_add) != _model_hash_key(forward_sub)
 
 
 @pytest.mark.skipif(not is_torch_equal_or_newer("2.10.0"), reason="requires torch 2.10")

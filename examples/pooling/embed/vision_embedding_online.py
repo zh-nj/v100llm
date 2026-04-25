@@ -8,8 +8,9 @@ Refer to each `run_*` function for the command to run the server for that model.
 
 import argparse
 import io
-from typing import Literal
+from typing import Any, Literal
 
+import numpy as np
 import pybase64 as base64
 from openai import OpenAI
 from openai._types import NOT_GIVEN, NotGiven
@@ -17,6 +18,10 @@ from openai.types.chat import ChatCompletionMessageParam
 from openai.types.create_embedding_response import CreateEmbeddingResponse
 from PIL import Image
 
+from vllm.multimodal.utils import (
+    encode_image_url,
+    encode_video_url,
+)
 from vllm.utils.print_utils import print_embeddings
 
 # Modify OpenAI's API key and API base to use vLLM's API server.
@@ -25,6 +30,7 @@ openai_api_base = "http://localhost:8000/v1"
 
 image_url = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/cat_snow.jpg"
 text = "A cat standing in the snow."
+video_text = "A short blue animation."
 
 
 def create_chat_embeddings(
@@ -162,15 +168,36 @@ def run_qwen3_vl(client: OpenAI, model: str):
 
     vllm serve Qwen/Qwen3-VL-Embedding-2B \
         --runner pooling \
-        --max-model-len 8192
+        --convert embed \
+        --dtype half \
+        --gpu-memory-utilization 0.35 \
+        --max-model-len 1536 \
+        --max-num-seqs 1 \
+        --limit-mm-per-prompt '{"image": 2, "video": 1}' \
+        --media-io-kwargs '{"video": {"num_frames": 8}}' \
+        --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1]}'
+
+    Note: the pooling runner currently downgrades full cudagraph modes to
+    PIECEWISE during startup.
+
+    For debugging on a crowded single SM70 GPU, replace the compilation
+    config with `--enforce-eager`.
     """
 
     default_instruction = "Represent the user's input."
+    qwen3_vl_image_url = encode_image_url(
+        Image.new("RGB", (224, 224), color=(220, 30, 30))
+    )
+    frames = np.zeros((8, 96, 96, 3), dtype=np.uint8)
+    for idx in range(frames.shape[0]):
+        frames[idx, :, :, 2] = min(255, 80 + idx * 20)
+        row_start = idx * 8
+        row_end = min(frames.shape[1], row_start + 16)
+        frames[idx, row_start:row_end, :, 1] = 160
+    qwen3_vl_video_url = encode_video_url(frames)
 
-    print("Text embedding output:")
-    response = create_chat_embeddings(
-        client,
-        messages=[
+    def make_messages(content: list[dict[str, Any]]) -> list[ChatCompletionMessageParam]:
+        return [
             {
                 "role": "system",
                 "content": [
@@ -179,9 +206,7 @@ def run_qwen3_vl(client: OpenAI, model: str):
             },
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": text},
-                ],
+                "content": content,
             },
             {
                 "role": "assistant",
@@ -189,78 +214,49 @@ def run_qwen3_vl(client: OpenAI, model: str):
                     {"type": "text", "text": ""},
                 ],
             },
-        ],
-        model=model,
-        encoding_format="float",
-        continue_final_message=True,
-        add_special_tokens=True,
-    )
-    print_embeddings(response.data[0].embedding)
+        ]
 
-    print("Image embedding output:")
-    response = create_chat_embeddings(
-        client,
-        messages=[
-            {
-                "role": "system",
-                "content": [
-                    {"type": "text", "text": default_instruction},
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                    {"type": "text", "text": ""},
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": ""},
-                ],
-            },
-        ],
-        model=model,
-        encoding_format="float",
-        continue_final_message=True,
-        add_special_tokens=True,
-    )
-    print_embeddings(response.data[0].embedding)
+    def print_qwen3_vl_embedding(
+        label: str,
+        content: list[dict[str, Any]],
+    ) -> None:
+        print(f"{label} embedding output:")
+        response = create_chat_embeddings(
+            client,
+            messages=make_messages(content),
+            model=model,
+            encoding_format="float",
+            continue_final_message=True,
+            add_special_tokens=True,
+        )
+        print_embeddings(response.data[0].embedding)
 
-    print("Image+Text embedding output:")
-    response = create_chat_embeddings(
-        client,
-        messages=[
-            {
-                "role": "system",
-                "content": [
-                    {"type": "text", "text": default_instruction},
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                    {
-                        "type": "text",
-                        "text": f"{text}",
-                    },
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": ""},
-                ],
-            },
-        ],
-        model=model,
-        encoding_format="float",
-        continue_final_message=True,
-        add_special_tokens=True,
+    print_qwen3_vl_embedding(
+        "Text",
+        [{"type": "text", "text": text}],
     )
-    print_embeddings(response.data[0].embedding)
+    print_qwen3_vl_embedding(
+        "Image",
+        [{"type": "image_url", "image_url": {"url": qwen3_vl_image_url}}],
+    )
+    print_qwen3_vl_embedding(
+        "Video",
+        [{"type": "video_url", "video_url": {"url": qwen3_vl_video_url}}],
+    )
+    print_qwen3_vl_embedding(
+        "Image+Text",
+        [
+            {"type": "image_url", "image_url": {"url": qwen3_vl_image_url}},
+            {"type": "text", "text": text},
+        ],
+    )
+    print_qwen3_vl_embedding(
+        "Video+Text",
+        [
+            {"type": "video_url", "video_url": {"url": qwen3_vl_video_url}},
+            {"type": "text", "text": video_text},
+        ],
+    )
 
 
 def run_siglip(client: OpenAI, model: str):

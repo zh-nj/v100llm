@@ -43,6 +43,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensors24,
     CompressedTensorsScheme,
+    CompressedTensorsSM70Fp8,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A8Fp8,
     CompressedTensorsW4A8Int,
@@ -640,12 +641,22 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         act_quant_format = is_activation_quantization_format(format)
         if act_quant_format:
+            capability = current_platform.get_device_capability()
+            is_sm70 = capability is not None and capability.to_int() == 70
+
             if self._is_nvfp4_format(weight_quant) and self._is_nvfp4_format(
                 input_quant
             ):
                 return CompressedTensorsW4A4Fp4()
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
+                if is_sm70:
+                    return CompressedTensorsSM70Fp8(
+                        weight_quant=weight_quant,
+                        is_static_input_scheme=(
+                            input_quant is not None and not input_quant.dynamic
+                        ),
+                    )
                 is_fp8_w8a8_supported = self._check_scheme_supported(
                     CompressedTensorsW8A8Fp8.get_min_capability(), error=False
                 )
@@ -667,6 +678,11 @@ class CompressedTensorsConfig(QuantizationConfig):
             # note: input_quant can be None
             if self._is_fp8_w8a16(weight_quant, input_quant):
                 is_static_input_scheme = input_quant and not input_quant.dynamic
+                if is_sm70:
+                    return CompressedTensorsSM70Fp8(
+                        weight_quant=weight_quant,
+                        is_static_input_scheme=bool(is_static_input_scheme),
+                    )
                 return CompressedTensorsW8A16Fp8(
                     weight_quant=weight_quant,
                     is_static_input_scheme=is_static_input_scheme,

@@ -250,7 +250,24 @@ def _model_hash_key(fn: Callable[..., Any]) -> str:
     sha256_hash = hashlib.sha256()
     sha256_hash.update(vllm.__version__.encode())
     sha256_hash.update(fn.__qualname__.encode())
-    sha256_hash.update(str(fn.__code__.co_firstlineno).encode())
+
+    # AOT cache keys must change when the forward implementation changes,
+    # even if the method keeps the same qualname and first line number.
+    try:
+        source = inspect.getsource(fn)
+    except (OSError, TypeError):
+        source = None
+
+    if source is not None:
+        sha256_hash.update(source.encode())
+    else:
+        code = fn.__code__
+        sha256_hash.update(code.co_code)
+        sha256_hash.update(repr(code.co_consts).encode())
+        sha256_hash.update(repr(code.co_names).encode())
+        sha256_hash.update(repr(code.co_varnames).encode())
+        sha256_hash.update(repr(code.co_freevars).encode())
+        sha256_hash.update(repr(code.co_cellvars).encode())
     return sha256_hash.hexdigest()
 
 

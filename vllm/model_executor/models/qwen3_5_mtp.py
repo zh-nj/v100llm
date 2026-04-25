@@ -393,9 +393,15 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
                     quant_cfg, "modules_to_not_convert", None
                 )
 
-            if modules_to_not_convert and any(
-                str(module).startswith("mtp") for module in modules_to_not_convert
-            ):
+            # Some Qwen3.5 AWQ checkpoints mark the whole MTP branch as
+            # unquantized via `modules_to_not_convert=["mtp"]`. Newer FP8
+            # checkpoints only list specific non-quantized MTP submodules
+            # such as `mtp.fc` or layernorms; those should continue using the
+            # regular per-layer quantization skip rules.
+            normalized_modules = {
+                str(module).rstrip(".") for module in modules_to_not_convert or []
+            }
+            if "mtp" in normalized_modules:
                 return True
 
         return False

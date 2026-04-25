@@ -73,12 +73,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
     kFp8StaticTensorSym,
 )
-from vllm.model_executor.layers.quantization.utils.sm70_fp8_runtime_decode import (
-    SM70_FP8_LAYOUT_BLOCK,
-    ensure_sm70_fp8_workspace,
-    get_or_create_sm70_fp8_workspace,
-    infer_sm70_fp8_layout,
-    select_sm70_fp8_panel_n,
+from vllm.model_executor.layers.quantization.utils.sm70_fp8_runtime_decode_linear import (  # noqa: E501
+    apply_sm70_fp8_runtime_decode_layer,
+    prepare_sm70_fp8_runtime_decode_layer,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_block_fp8_supported,
@@ -444,59 +441,13 @@ class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
         )
         replace_parameter(layer, "weight", weight.data)
         replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
-        layout_kind, scale_axis, block_n, block_k = infer_sm70_fp8_layout(
-            layer.weight_scale_inv,
-            tuple(self.weight_block_size)
-            if self.weight_block_size is not None
-            else None,
+        prepare_sm70_fp8_runtime_decode_layer(
+            layer,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale_inv,
+            weight_block_size=tuple(self.weight_block_size),
+            direct_block_gemm_enabled=self._direct_gemm_enabled(),
         )
-        direct_gemm = (
-            self._direct_gemm_enabled()
-            and layout_kind == SM70_FP8_LAYOUT_BLOCK
-            and block_n == 128
-            and block_k == 128
-        )
-
-        if direct_gemm:
-            prepared_weight, prepared_scale, prepared_meta = (
-                ops.sm70_fp8_direct_prepare(
-                    layer.weight,
-                    layer.weight_scale_inv,
-                    block_n,
-                    block_k,
-                )
-            )
-            layer._sm70_fp8_direct_prepared = True
-        else:
-            panel_n = select_sm70_fp8_panel_n(
-                logical_n=int(layer.output_size_per_partition),
-                logical_k=int(layer.input_size_per_partition),
-                block_n=block_n,
-            )
-            prepared_weight, prepared_scale, prepared_meta, workspace_meta = (
-                ops.sm70_fp8_prepare(
-                    layer.weight,
-                    layer.weight_scale_inv,
-                    layout_kind,
-                    scale_axis,
-                    block_n,
-                    block_k,
-                    panel_n,
-                )
-            )
-            layer._sm70_fp8_direct_prepared = False
-            layer._sm70_fp8_panel_n = panel_n
-            layer._sm70_fp8_workspace_meta = workspace_meta
-            layer._sm70_fp8_workspace_cols = int(workspace_meta[1].item())
-            ensure_sm70_fp8_workspace(layer, layer.weight.device)
-
-        layer._sm70_fp8_runtime_prepared = True
-        layer._sm70_fp8_block_shape = tuple(self.weight_block_size)
-        layer._sm70_fp8_output_size = int(layer.output_size_per_partition)
-        layer._sm70_fp8_logical_widths = tuple(layer.logical_widths)
-        layer._sm70_fp8_prepared_weight = prepared_weight
-        layer._sm70_fp8_prepared_scale = prepared_scale
-        layer._sm70_fp8_prepared_meta = prepared_meta
         layer.input_scale = None
         layer._already_called_process_weights_after_loading = True
 
@@ -506,45 +457,7 @@ class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if not getattr(layer, "_sm70_fp8_runtime_prepared", False):
-            raise RuntimeError(
-                "SM70 FP8 runtime decode weights were not prepared."
-            )
-
-        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-        padded_out_dim = int(layer.weight.size(0))
-        logical_out_dim = int(
-            getattr(layer, "_sm70_fp8_output_size", padded_out_dim)
-        )
-        out_padded = torch.empty(
-            (x_2d.size(0), padded_out_dim),
-            dtype=x_2d.dtype,
-            device=x_2d.device,
-        )
-        if getattr(layer, "_sm70_fp8_direct_prepared", False):
-            ops.sm70_fp8_direct_gemm_out(
-                out_padded,
-                x_2d,
-                layer._sm70_fp8_prepared_weight,
-                layer._sm70_fp8_prepared_scale,
-                layer._sm70_fp8_prepared_meta,
-            )
-        else:
-            workspace = get_or_create_sm70_fp8_workspace(layer, x_2d)
-            ops.sm70_fp8_runtime_gemm_out(
-                out_padded,
-                x_2d,
-                layer._sm70_fp8_prepared_weight,
-                layer._sm70_fp8_prepared_scale,
-                layer._sm70_fp8_prepared_meta,
-                workspace.decoded_panel,
-                workspace.packed_panel,
-                workspace.meta_buffer,
-            )
-        out = out_padded[:, :logical_out_dim]
-        if bias is not None:
-            out.add_(bias)
-        return out.reshape(x.shape[:-1] + (out.shape[-1],))
+        return apply_sm70_fp8_runtime_decode_layer(layer, x, bias)
 
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.

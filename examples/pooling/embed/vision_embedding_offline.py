@@ -11,7 +11,9 @@ on HuggingFace model repository.
 
 import argparse
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 from PIL.Image import Image
 
 from vllm import LLM
@@ -23,6 +25,7 @@ EMBED_TEMPLATE_DIR = ROOT_DIR / "pooling/embed/template/"
 
 image_url = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/cat_snow.jpg"
 text = "A cat standing in the snow."
+video_text = "A short blue animation."
 multi_modal_data = {"image": fetch_image(image_url)}
 
 
@@ -103,32 +106,72 @@ def run_qwen3_vl(seed: int):
             )
             return image.resize((resized_width, resized_height))
 
-        multi_modal_data["image"] = post_process_image(multi_modal_data["image"])
+        qwen3_vl_image = post_process_image(
+            Image.new("RGB", (224, 224), color=(220, 30, 30))
+        )
+    else:
+        qwen3_vl_image = Image.new("RGB", (224, 224), color=(220, 30, 30))
+
+    frames = np.zeros((8, 96, 96, 3), dtype=np.uint8)
+    for idx in range(frames.shape[0]):
+        frames[idx, :, :, 2] = min(255, 80 + idx * 20)
+        row_start = idx * 8
+        row_end = min(frames.shape[1], row_start + 16)
+        frames[idx, row_start:row_end, :, 1] = 160
+    qwen3_vl_video: tuple[np.ndarray, dict[str, Any]] = (
+        frames,
+        {
+            "total_num_frames": int(frames.shape[0]),
+            "fps": 2.0,
+            "duration": float(frames.shape[0]) / 2.0,
+            "video_backend": "opencv",
+            "frames_indices": list(range(int(frames.shape[0]))),
+            "do_sample_frames": True,
+        },
+    )
 
     default_instruction = "Represent the user's input."
     image_placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
-    prompt_text = f"<|im_start|>system\n{default_instruction}<|im_end|>\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
-    prompt_image = f"<|im_start|>system\n{default_instruction}<|im_end|>\n<|im_start|>user\n{image_placeholder}<|im_end|>\n<|im_start|>assistant\n"
-    prompt_image_text = f"<|im_start|>system\n{default_instruction}<|im_end|>\n<|im_start|>user\n{image_placeholder}{text}<|im_end|>\n<|im_start|>assistant\n"
+    video_placeholder = "<|vision_start|><|video_pad|><|vision_end|>"
+
+    def make_prompt(user_content: str) -> str:
+        return (
+            f"<|im_start|>system\n{default_instruction}<|im_end|>\n"
+            f"<|im_start|>user\n{user_content}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
 
     llm = LLM(
         model="Qwen/Qwen3-VL-Embedding-2B",
         runner="pooling",
-        max_model_len=8192,
-        limit_mm_per_prompt={"image": 1},
+        dtype="half",
+        gpu_memory_utilization=0.35,
+        max_model_len=1536,
+        limit_mm_per_prompt={"image": 2, "video": 1},
+        media_io_kwargs={"video": {"num_frames": 8}},
         mm_processor_kwargs={"do_resize": False} if smart_resize is not None else None,
         seed=seed,
     )
 
     print("Text embedding output:")
-    outputs = llm.embed(prompt_text, use_tqdm=False)
+    outputs = llm.embed(make_prompt(text), use_tqdm=False)
     print_embeddings(outputs[0].outputs.embedding)
 
     print("Image embedding output:")
     outputs = llm.embed(
         {
-            "prompt": prompt_image,
-            "multi_modal_data": multi_modal_data,
+            "prompt": make_prompt(image_placeholder),
+            "multi_modal_data": {"image": qwen3_vl_image},
+        },
+        use_tqdm=False,
+    )
+    print_embeddings(outputs[0].outputs.embedding)
+
+    print("Video embedding output:")
+    outputs = llm.embed(
+        {
+            "prompt": make_prompt(video_placeholder),
+            "multi_modal_data": {"video": qwen3_vl_video},
         },
         use_tqdm=False,
     )
@@ -137,8 +180,18 @@ def run_qwen3_vl(seed: int):
     print("Image+Text embedding output:")
     outputs = llm.embed(
         {
-            "prompt": prompt_image_text,
-            "multi_modal_data": multi_modal_data,
+            "prompt": make_prompt(f"{image_placeholder}{text}"),
+            "multi_modal_data": {"image": qwen3_vl_image},
+        },
+        use_tqdm=False,
+    )
+    print_embeddings(outputs[0].outputs.embedding)
+
+    print("Video+Text embedding output:")
+    outputs = llm.embed(
+        {
+            "prompt": make_prompt(f"{video_placeholder}{video_text}"),
+            "multi_modal_data": {"video": qwen3_vl_video},
         },
         use_tqdm=False,
     )

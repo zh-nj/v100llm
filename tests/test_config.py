@@ -140,6 +140,18 @@ def test_pooling_runner(model_id, expected_runner_type, expected_convert_type):
     assert config.convert_type == expected_convert_type
 
 
+@pytest.mark.parametrize("convert", ["auto", "embed"])
+def test_qwen3_vl_embedding_pooling_runner(convert: str) -> None:
+    config = ModelConfig(
+        "Qwen/Qwen3-VL-Embedding-2B",
+        runner="pooling",
+        convert=convert,
+    )
+
+    assert config.runner_type == "pooling"
+    assert config.convert_type == "embed"
+
+
 @pytest.mark.parametrize(
     ("model_id", "expected_runner_type", "expected_convert_type"),
     [

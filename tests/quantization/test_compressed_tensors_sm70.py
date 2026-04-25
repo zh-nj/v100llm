@@ -5,6 +5,7 @@ import importlib
 from copy import deepcopy
 
 import torch
+from compressed_tensors.quantization import QuantizationStrategy
 
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
@@ -29,6 +30,29 @@ PACK_QUANTIZED_CONFIG = {
     },
 }
 
+FLOAT_QUANTIZED_CHANNEL_CONFIG = {
+    "format": "float-quantized",
+    "config_groups": {
+        "group_0": {
+            "targets": ["Linear"],
+            "weights": {
+                "num_bits": 8,
+                "type": "float",
+                "strategy": "channel",
+                "symmetric": True,
+                "dynamic": False,
+            },
+            "input_activations": {
+                "num_bits": 8,
+                "type": "float",
+                "strategy": "token",
+                "symmetric": True,
+                "dynamic": True,
+            },
+        }
+    },
+}
+
 
 class _Capability:
     def __init__(self, value: int):
@@ -48,6 +72,16 @@ def _make_quant_config():
     )
 
 
+def _make_fp8_quant_config():
+    ct_module = importlib.import_module(
+        "vllm.model_executor.layers.quantization.compressed_tensors."
+        "compressed_tensors"
+    )
+    return ct_module.CompressedTensorsConfig.from_config(
+        deepcopy(FLOAT_QUANTIZED_CHANNEL_CONFIG)
+    )
+
+
 def _make_linear(
     *,
     input_size: int = 256,
@@ -60,6 +94,23 @@ def _make_linear(
         bias=False,
         params_dtype=torch.float16,
         quant_config=_make_quant_config(),
+        prefix=prefix,
+        disable_tp=True,
+    )
+
+
+def _make_fp8_linear(
+    *,
+    input_size: int = 256,
+    output_size: int = 64,
+    prefix: str = "model.layers.0.mlp.down_proj",
+) -> ReplicatedLinear:
+    return ReplicatedLinear(
+        input_size=input_size,
+        output_size=output_size,
+        bias=False,
+        params_dtype=torch.float16,
+        quant_config=_make_fp8_quant_config(),
         prefix=prefix,
         disable_tp=True,
     )
@@ -209,3 +260,221 @@ def test_ct_dense_sm70_apply_uses_awq_gemm_sm70(monkeypatch) -> None:
 
     assert tuple(out.shape) == (2, 64)
     assert torch.all(out == 4)
+
+
+def test_ct_dense_fp8_sm70_selects_runtime_decode_scheme(monkeypatch) -> None:
+    from vllm.platforms import current_platform
+
+    _patch_single_rank_params(monkeypatch)
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_capability",
+        lambda: _Capability(70),
+    )
+
+    layer = _make_fp8_linear(input_size=256, output_size=64)
+
+    assert layer.scheme.__class__.__name__ == "CompressedTensorsSM70Fp8"
+    assert layer.scheme.strategy == QuantizationStrategy.CHANNEL
+
+
+def test_ct_dense_fp8_sm70_process_and_apply_use_runtime_decode(monkeypatch) -> None:
+    from vllm.platforms import current_platform
+
+    _patch_single_rank_params(monkeypatch)
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_capability",
+        lambda: _Capability(70),
+    )
+
+    layer = _make_fp8_linear(input_size=256, output_size=384)
+    layer.weight = torch.nn.Parameter(
+        torch.linspace(-1.0, 1.0, steps=layer.weight.numel(), dtype=torch.float32)
+        .reshape_as(layer.weight)
+        .to(torch.float8_e4m3fn),
+        requires_grad=False,
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.ones(layer.weight_scale.shape, dtype=torch.float32),
+        requires_grad=False,
+    )
+
+    ops_module = importlib.import_module("vllm._custom_ops")
+    workspace_module = importlib.import_module(
+        "vllm.model_executor.layers.quantization.utils.sm70_fp8_runtime_decode"
+    )
+    called: dict[str, tuple] = {}
+
+    def fake_prepare(
+        weight,
+        weight_scale,
+        layout_kind,
+        scale_axis,
+        block_n,
+        block_k,
+        panel_n,
+    ):
+        called["prepare"] = (
+            weight.dtype,
+            tuple(weight.shape),
+            tuple(weight_scale.shape),
+            layout_kind,
+            scale_axis,
+            block_n,
+            block_k,
+            panel_n,
+        )
+        return (
+            weight,
+            weight_scale,
+            torch.tensor([384, 256, 384, 256, panel_n, layout_kind], dtype=torch.int64),
+            torch.tensor([panel_n, 256, panel_n, 256, 8], dtype=torch.int64),
+        )
+
+    class _Workspace:
+        decoded_panel = torch.empty((128, 256), dtype=torch.float16)
+        packed_panel = torch.empty((128, 256), dtype=torch.float16)
+        meta_buffer = torch.empty((8,), dtype=torch.int64)
+
+    def fake_runtime_gemm_out(
+        out,
+        x,
+        prepared_weight,
+        prepared_scale,
+        prepared_meta,
+        decoded_panel,
+        packed_panel,
+        meta_buffer,
+    ):
+        called["apply"] = (
+            tuple(x.shape),
+            tuple(prepared_weight.shape),
+            tuple(prepared_scale.shape),
+            tuple(prepared_meta.tolist()),
+            tuple(decoded_panel.shape),
+            tuple(packed_panel.shape),
+            tuple(meta_buffer.shape),
+        )
+        out.fill_(5)
+
+    monkeypatch.setattr(ops_module, "sm70_fp8_prepare", fake_prepare, raising=False)
+    monkeypatch.setattr(
+        ops_module,
+        "sm70_fp8_runtime_gemm_out",
+        fake_runtime_gemm_out,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        workspace_module,
+        "ensure_sm70_fp8_workspace",
+        lambda layer, device: _Workspace(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        workspace_module,
+        "get_or_create_sm70_fp8_workspace",
+        lambda layer, x_2d: _Workspace(),
+        raising=False,
+    )
+
+    layer.quant_method.process_weights_after_loading(layer)
+    out = layer.quant_method.apply(
+        layer,
+        torch.ones(2, 256, dtype=torch.float16),
+        torch.ones(384, dtype=torch.float16),
+    )
+
+    assert called["prepare"] == (
+        torch.float8_e4m3fn,
+        (384, 256),
+        (384,),
+        1,
+        0,
+        0,
+        0,
+        128,
+    )
+    assert layer.weight.dtype == torch.float8_e4m3fn
+    assert layer.weight.numel() == 384 * 256
+    assert layer.weight_scale.dtype == torch.float32
+    assert tuple(layer.weight_scale.shape) == (384,)
+    assert layer._sm70_fp8_runtime_prepared is True
+    assert layer._sm70_fp8_direct_prepared is False
+    assert layer.input_scale is None
+    assert called["apply"] == (
+        (2, 256),
+        (384, 256),
+        (384,),
+        (384, 256, 384, 256, 128, 1),
+        (128, 256),
+        (128, 256),
+        (8,),
+    )
+    assert tuple(out.shape) == (2, 384)
+    assert torch.all(out == 6)
+
+
+def test_sm70_fp8_direct_prepare_adopts_prepared_tensors_as_resident_parameters(
+    monkeypatch,
+) -> None:
+    helper_module = importlib.import_module(
+        "vllm.model_executor.layers.quantization.utils."
+        "sm70_fp8_runtime_decode_linear"
+    )
+    ops_module = importlib.import_module("vllm._custom_ops")
+
+    for scale_name in ("weight_scale_inv", "weight_scale"):
+        layer = torch.nn.Module()
+        layer.output_size_per_partition = 256
+        layer.logical_widths = [256]
+        layer.register_parameter(
+            "weight",
+            torch.nn.Parameter(
+                torch.empty((256, 128), dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            ),
+        )
+        layer.register_parameter(
+            scale_name,
+            torch.nn.Parameter(
+                torch.ones((2, 1), dtype=torch.float32),
+                requires_grad=False,
+            ),
+        )
+
+        old_weight = layer.weight
+        old_scale = getattr(layer, scale_name)
+        prepared_weight = torch.empty_like(layer.weight)
+        prepared_scale = torch.empty((1, 256), dtype=torch.float16)
+        prepared_meta = torch.tensor([256, 128, 128, 128, 128], dtype=torch.int64)
+
+        def fake_direct_prepare(weight, weight_scale, block_n, block_k):
+            assert weight is old_weight
+            assert weight_scale is old_scale
+            assert block_n == 128
+            assert block_k == 128
+            return prepared_weight, prepared_scale, prepared_meta
+
+        monkeypatch.setattr(
+            ops_module,
+            "sm70_fp8_direct_prepare",
+            fake_direct_prepare,
+            raising=False,
+        )
+
+        helper_module.prepare_sm70_fp8_runtime_decode_layer(
+            layer,
+            weight=layer.weight,
+            weight_scale=getattr(layer, scale_name),
+            weight_block_size=(128, 128),
+            direct_block_gemm_enabled=True,
+        )
+
+        assert layer.weight is not old_weight
+        assert layer.weight.data_ptr() == prepared_weight.data_ptr()
+        assert layer._sm70_fp8_prepared_weight is layer.weight
+        assert getattr(layer, scale_name) is not old_scale
+        assert getattr(layer, scale_name).data_ptr() == prepared_scale.data_ptr()
+        assert layer._sm70_fp8_prepared_scale is getattr(layer, scale_name)
+        assert layer._sm70_fp8_direct_prepared is True

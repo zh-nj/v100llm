@@ -1133,7 +1133,8 @@ class LLM:
             raise ValueError(f"pooling_task must be one of {self.supported_tasks}.")
 
         for param in as_iter(pooling_params):
-            param.verify(pooling_task, model_config)
+            param.task = pooling_task
+            param.verify(model_config)
 
         self._validate_and_add_requests(
             prompts=prompts,
@@ -1745,7 +1746,10 @@ class LLM:
         else:
             priority = [0] * num_requests
 
-        if any(param.truncate_prompt_tokens is not None for param in engine_params):
+        if any(
+            getattr(param, "truncate_prompt_tokens", None) is not None
+            for param in engine_params
+        ):
             # TODO: Remove this after deprecating `param.truncate_prompt_tokens`
             # Then, move the code from the `else` block to the top and let
             # `self._preprocess_completion` handle prompt normalization
@@ -1756,7 +1760,13 @@ class LLM:
                     [in_prompt],
                     tokenization_kwargs=merge_kwargs(
                         tokenization_kwargs,
-                        dict(truncate_prompt_tokens=param.truncate_prompt_tokens),
+                        dict(
+                            truncate_prompt_tokens=getattr(
+                                param,
+                                "truncate_prompt_tokens",
+                                None,
+                            )
+                        ),
                     ),
                 )
             ]
@@ -1805,7 +1815,8 @@ class LLM:
         prompt_text, _, _ = get_prompt_components(prompt)
         request_id = str(next(self.request_counter))
 
-        if params.truncate_prompt_tokens is not None:
+        truncate_prompt_tokens = getattr(params, "truncate_prompt_tokens", None)
+        if truncate_prompt_tokens is not None:
             params_type = type(params).__name__
             warnings.warn(
                 f"The `truncate_prompt_tokens` parameter in `{params_type}` "
@@ -1817,7 +1828,7 @@ class LLM:
 
             tokenization_kwargs = merge_kwargs(
                 tokenization_kwargs,
-                dict(truncate_prompt_tokens=params.truncate_prompt_tokens),
+                dict(truncate_prompt_tokens=truncate_prompt_tokens),
             )
 
         tok_params = self._get_cmpl_tok_params(tokenization_kwargs)
