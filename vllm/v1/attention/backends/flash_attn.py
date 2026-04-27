@@ -18,6 +18,7 @@ from vllm.v1.attention.backend import (
     is_quantized_kv_cache,
 )
 from vllm.v1.attention.backends.fa_utils import (
+    flash_attn_decode_paged,
     flash_attn_supports_fp8,
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
@@ -43,6 +44,7 @@ from vllm.config import (
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.attention.backend import (
@@ -231,6 +233,8 @@ class FlashAttentionMetadata:
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
     max_num_splits: int = 0
+    spec_decode_seq_lens_minus_one: torch.Tensor | None = None
+    spec_decode_paged_verify_output: torch.Tensor | None = None
 
     causal: bool = True
 
@@ -324,6 +328,23 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
         self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
+        max_batch_size = max(
+            vllm_config.scheduler_config.max_num_seqs,
+            self.max_cudagraph_size or 0,
+        )
+        self.spec_decode_seq_lens_minus_one = torch.empty(
+            max_batch_size,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.spec_decode_paged_verify_output = torch.empty(
+            2,
+            max_batch_size,
+            self.num_heads_q,
+            self.headdim,
+            dtype=self.model_config.dtype,
+            device=self.device,
+        )
 
         if self.use_full_cuda_graph and self.aot_schedule:
             # FA3 scheduler_metadata size: 1 + round_up(batch_size, 4) * 4
@@ -331,10 +352,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # The 4 slots per batch element (num_prepare_batch_vectors) are:
             #   prepare_varlen + dynamic_split + sort_batches + head_swizzle
             # See: https://github.com/vllm-project/flash-attention/blob/5824e6e/hopper/flash_api.cpp#L664-L671  # noqa: E501
-            max_batch_size = max(
-                vllm_config.scheduler_config.max_num_seqs,
-                self.max_cudagraph_size or 0,
-            )
             self.scheduler_metadata = torch.zeros(
                 1 + round_up(max_batch_size, 4) * 4,
                 dtype=torch.int32,
@@ -514,6 +531,35 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
+        spec_decode_seq_lens_minus_one = None
+        if max_query_len == 2:
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            query_lens_cpu = (
+                query_start_loc_cpu[1 : num_reqs + 1]
+                - query_start_loc_cpu[:num_reqs]
+            )
+            is_unpadded_q_len_2 = (
+                int(query_start_loc_cpu[num_reqs].item()) == num_actual_tokens
+                and bool(torch.all(query_lens_cpu == 2).item())
+            )
+        else:
+            is_unpadded_q_len_2 = False
+
+        if is_unpadded_q_len_2:
+            spec_decode_seq_lens_minus_one = self.spec_decode_seq_lens_minus_one[
+                :num_reqs
+            ]
+            torch.sub(
+                seq_lens[:num_reqs],
+                1,
+                out=spec_decode_seq_lens_minus_one,
+            )
+            spec_decode_paged_verify_output = self.spec_decode_paged_verify_output[
+                :, :num_reqs
+            ]
+        else:
+            spec_decode_paged_verify_output = None
+
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -532,6 +578,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             suffix_kv_lens=suffix_kv_lens,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
+            spec_decode_seq_lens_minus_one=spec_decode_seq_lens_minus_one,
+            spec_decode_paged_verify_output=spec_decode_paged_verify_output,
             causal=causal,
         )
         return attn_metadata
@@ -628,6 +676,28 @@ class FlashAttentionImpl(AttentionImpl):
         )
         self.dcp_combine = dcp_a2a_lse_reduce if dcp_a2a else cp_lse_ag_out_rs
 
+    def _can_use_paged_verify(
+        self,
+        attn_metadata: FlashAttentionMetadata,
+        num_actual_tokens: int,
+        num_seqs: int,
+    ) -> bool:
+        return (
+            current_platform.is_cuda()
+            and self.vllm_flash_attn_version == 2
+            and self.dcp_world_size == 1
+            and attn_metadata.causal
+            and attn_metadata.max_query_len == 2
+            and num_actual_tokens == 2 * num_seqs
+            and attn_metadata.spec_decode_seq_lens_minus_one is not None
+            and attn_metadata.spec_decode_paged_verify_output is not None
+            and self.alibi_slopes is None
+            and self.sinks is None
+            and self.logits_soft_cap == 0
+            and self.sliding_window == (-1, -1)
+            and not self.kv_cache_dtype.startswith("fp8")
+        )
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -713,6 +783,42 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_k = attn_metadata.max_seq_len
             block_table = attn_metadata.block_table
             scheduler_metadata = attn_metadata.scheduler_metadata
+
+            num_seqs = cu_seqlens_q.shape[0] - 1
+            if self._can_use_paged_verify(
+                attn_metadata,
+                num_actual_tokens,
+                num_seqs,
+            ):
+                assert attn_metadata.spec_decode_paged_verify_output is not None
+                paged_verify_output = attn_metadata.spec_decode_paged_verify_output
+                flash_attn_decode_paged(
+                    query[:num_actual_tokens:2],
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    attn_metadata.spec_decode_seq_lens_minus_one,
+                    softmax_scale=self.scale,
+                    out=paged_verify_output[0],
+                )
+                flash_attn_decode_paged(
+                    query[1:num_actual_tokens:2],
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    seqused_k,
+                    softmax_scale=self.scale,
+                    out=paged_verify_output[1],
+                )
+                output_view = output[:num_actual_tokens].view(
+                    num_seqs,
+                    2,
+                    self.num_heads,
+                    self.head_size,
+                )
+                output_view[:, 0].copy_(paged_verify_output[0])
+                output_view[:, 1].copy_(paged_verify_output[1])
+                return output
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 

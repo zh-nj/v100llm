@@ -164,7 +164,10 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.metadata import (
+    SpecDecodeMetadata,
+    build_spec_decode_metadata_indices,
+)
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
     copy_num_valid_draft_tokens,
@@ -172,7 +175,10 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_scheduler_for_invalid_drafts,
 )
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
-from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
+from vllm.v1.spec_decode.utils import (
+    should_skip_intermediate_prefill_draft,
+    update_num_computed_tokens_for_batch_change,
+)
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -758,6 +764,22 @@ class GPUModelRunner(
         self.arange_np = np.arange(arange_size, dtype=np.int64)
         self.query_pos = self._make_buffer(arange_size, dtype=torch.int64)
         self._arange_scratch = np.empty(arange_size, dtype=np.int64)
+        if self.speculative_config is not None:
+            self.spec_decode_cu_num_draft_tokens = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+            self.spec_decode_cu_num_sampled_tokens = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+            self.spec_decode_logits_indices = self._make_buffer(
+                self.max_num_tokens, dtype=torch.int64
+            )
+            self.spec_decode_target_logits_indices = self._make_buffer(
+                self.max_num_tokens, dtype=torch.int32
+            )
+            self.spec_decode_bonus_logits_indices = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
 
         # Layer pairings for cross-layer KV sharing.
         # If an Attention layer `layer_name` is in the keys of this dict, it
@@ -2594,54 +2616,41 @@ class GPUModelRunner(
         # target_logits_indices:    [  0,   1,   2,   5,   6,   9]
         # bonus_logits_indices:     [  3,   4,   7,   8,  10]
 
-        # Compute the logits indices.
-        # [4, 1, 3, 1, 2]
-        num_sampled_tokens = num_draft_tokens + 1
+        indices = build_spec_decode_metadata_indices(
+            num_draft_tokens,
+            cu_num_scheduled_tokens,
+            self.arange_np,
+            self._arange_scratch,
+        )
+        num_reqs = num_draft_tokens.shape[0]
+        num_logits = int(indices.cu_num_sampled_tokens[-1])
+        num_target_logits = int(indices.cu_num_draft_tokens[-1])
 
-        # Step 1.
-        # cu_num_sampled_tokens: [4, 5, 8, 9, 11]
-        # _arange_scratch[:11]: [0, 1, 2, 3, 0, 0, 1, 2, 0, 0, 1]
-        cu_num_sampled_tokens = self._get_cumsum_and_arange(
-            num_sampled_tokens, self._arange_scratch, cumsum_dtype=np.int32
+        self.spec_decode_cu_num_draft_tokens.np[:num_reqs] = (
+            indices.cu_num_draft_tokens
         )
-        # Step 2. [0, 0, 0, 0, 103, 104, 104, 104, 206, 207, 207]
-        logits_indices = np.repeat(
-            cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens
+        cu_num_draft_tokens = self.spec_decode_cu_num_draft_tokens.copy_to_gpu(
+            num_reqs
         )
-        # Step 3. [0, 1, 2, 3, 103, 104, 105, 106, 206, 207, 208]
-        logits_indices += self._arange_scratch[: cu_num_sampled_tokens[-1]]
-
-        # Compute the bonus logits indices.
-        bonus_logits_indices = cu_num_sampled_tokens - 1
-
-        # Compute the draft logits indices.
-        # cu_num_draft_tokens: [3, 3, 5, 5, 6]
-        # _arange_scratch[:6]: [0, 1, 2, 0, 1, 0]
-        cu_num_draft_tokens = self._get_cumsum_and_arange(
-            num_draft_tokens, self._arange_scratch, cumsum_dtype=np.int32
+        self.spec_decode_cu_num_sampled_tokens.np[:num_reqs] = (
+            indices.cu_num_sampled_tokens
         )
-        # [0, 0, 0, 5, 5, 9]
-        target_logits_indices = np.repeat(
-            cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens
+        cu_num_sampled_tokens = self.spec_decode_cu_num_sampled_tokens.copy_to_gpu(
+            num_reqs
         )
-        # [0, 1, 2, 5, 6, 9]
-        target_logits_indices += self._arange_scratch[: cu_num_draft_tokens[-1]]
-
-        # TODO: Optimize the CPU -> GPU copy.
-        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
-            self.device, non_blocking=True
+        self.spec_decode_logits_indices.np[:num_logits] = indices.logits_indices
+        logits_indices = self.spec_decode_logits_indices.copy_to_gpu(num_logits)
+        self.spec_decode_target_logits_indices.np[:num_target_logits] = (
+            indices.target_logits_indices
         )
-        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(
-            self.device, non_blocking=True
+        target_logits_indices = self.spec_decode_target_logits_indices.copy_to_gpu(
+            num_target_logits
         )
-        logits_indices = torch.from_numpy(logits_indices).to(
-            self.device, non_blocking=True
+        self.spec_decode_bonus_logits_indices.np[:num_reqs] = (
+            indices.bonus_logits_indices
         )
-        target_logits_indices = torch.from_numpy(target_logits_indices).to(
-            self.device, non_blocking=True
-        )
-        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).to(
-            self.device, non_blocking=True
+        bonus_logits_indices = self.spec_decode_bonus_logits_indices.copy_to_gpu(
+            num_reqs
         )
 
         # Compute the draft token ids.
@@ -4202,7 +4211,22 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
+        skip_intermediate_prefill_draft = False
         if spec_config is not None:
+            num_reqs = self.input_batch.num_reqs
+            skip_intermediate_prefill_draft = should_skip_intermediate_prefill_draft(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                self.input_batch.num_prompt_tokens[:num_reqs],
+                np.array(
+                    [
+                        scheduler_output.num_scheduled_tokens[req_id]
+                        for req_id in self.input_batch.req_ids
+                    ],
+                    dtype=np.int32,
+                ),
+            )
+
+        if spec_config is not None and not skip_intermediate_prefill_draft:
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len

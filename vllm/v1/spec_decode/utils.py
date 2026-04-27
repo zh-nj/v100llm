@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import numpy as np
 import torch
 
 from vllm.platforms import current_platform
@@ -9,6 +10,22 @@ from vllm.v1.attention.backends.utils import (
 )
 
 PADDING_SLOT_ID = -1
+
+
+def should_skip_intermediate_prefill_draft(
+    num_computed_tokens: np.ndarray,
+    num_prompt_tokens: np.ndarray,
+    num_scheduled_tokens: np.ndarray,
+) -> bool:
+    """Return True when every scheduled request is a non-final prefill chunk."""
+    scheduled = num_scheduled_tokens > 0
+    if not np.any(scheduled):
+        return False
+
+    next_computed_tokens = (
+        num_computed_tokens[scheduled] + num_scheduled_tokens[scheduled]
+    )
+    return bool(np.all(next_computed_tokens < num_prompt_tokens[scheduled]))
 
 
 @triton.jit

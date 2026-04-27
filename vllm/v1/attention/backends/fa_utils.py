@@ -18,6 +18,7 @@ _ROCM_FLASH_ATTN_AVAILABLE = False
 if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
     from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+        flash_attn_decode_paged,
         flash_attn_varlen_func,
         get_scheduler_metadata,
     )
@@ -29,6 +30,10 @@ elif current_platform.is_xpu():
     reshape_and_cache_flash = ops.reshape_and_cache_flash
     flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func  # type: ignore[assignment]
     get_scheduler_metadata = xpu_ops.get_scheduler_metadata  # type: ignore[assignment]
+
+    def flash_attn_decode_paged(*args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("flash_attn_decode_paged is CUDA-only")
+
 elif current_platform.is_rocm():
     try:
         from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
@@ -47,10 +52,17 @@ elif current_platform.is_rocm():
     def get_scheduler_metadata(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
         return None
 
+    def flash_attn_decode_paged(*args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("flash_attn_decode_paged is CUDA-only")
+
     # ROCm uses the C++ custom op for reshape_and_cache
     from vllm import _custom_ops as ops
 
     reshape_and_cache_flash = ops.reshape_and_cache_flash
+else:
+
+    def flash_attn_decode_paged(*args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("flash_attn_decode_paged is CUDA-only")
 
 
 def get_flash_attn_version(
