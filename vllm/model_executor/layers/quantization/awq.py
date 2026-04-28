@@ -32,6 +32,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _should_use_awq_sm70(tensor: torch.Tensor) -> bool:
+    if not tensor.is_cuda or not hasattr(torch.ops._C, "awq_sm70_prepare"):
+        return False
+    cap = torch.cuda.get_device_capability(tensor.device)
+    return cap[0] == 7 and cap[1] == 0
+
+
 class AWQConfig(QuantizationConfig):
     """Config class for AWQ.
 
@@ -359,36 +366,33 @@ class AWQLinearMethod(LinearMethodBase):
         # SM70: eagerly prepare TurboMind weights at load time
         # (not lazily in apply()) so torch.compile can trace the forward.
         if (
-            layer.qweight.is_cuda
-            and hasattr(torch.ops._C, "awq_sm70_prepare")
+            _should_use_awq_sm70(layer.qweight)
             and self.quant_config.group_size in (32, 64, 128)
         ):
-            cap = torch.cuda.get_device_capability(layer.qweight.device)
-            if cap[0] == 7 and cap[1] == 0:
-                tm_weight, tm_scales, meta = ops.awq_sm70_prepare(
-                    layer.qweight, layer.scales, layer.qzeros,
-                    self.quant_config.group_size,
-                )
-                layer._awq_sm70_weight = tm_weight
-                layer._awq_sm70_scales = tm_scales
-                layer._awq_sm70_k_ld = int(meta[0])
-                layer._awq_sm70_q_ld = int(meta[1])
-                layer._awq_sm70_prepared = True
-                # Free original AWQ tensors once TM tensors are ready.
-                # This significantly lowers residency for large dense models
-                # (e.g. Qwen3.5-27B) and helps SM70 single-GPU startup.
-                layer.qweight = torch.nn.Parameter(
-                    torch.empty(0, dtype=torch.int32, device=tm_weight.device),
-                    requires_grad=False,
-                )
-                layer.qzeros = torch.nn.Parameter(
-                    torch.empty(0, dtype=torch.int32, device=tm_weight.device),
-                    requires_grad=False,
-                )
-                layer.scales = torch.nn.Parameter(
-                    torch.empty(0, dtype=torch.float16, device=tm_weight.device),
-                    requires_grad=False,
-                )
+            tm_weight, tm_scales, meta = ops.awq_sm70_prepare(
+                layer.qweight, layer.scales, layer.qzeros,
+                self.quant_config.group_size,
+            )
+            layer._awq_sm70_weight = tm_weight
+            layer._awq_sm70_scales = tm_scales
+            layer._awq_sm70_k_ld = int(meta[0])
+            layer._awq_sm70_q_ld = int(meta[1])
+            layer._awq_sm70_prepared = True
+            # Free original AWQ tensors once TM tensors are ready.
+            # This significantly lowers residency for large dense models
+            # (e.g. Qwen3.5-27B) and helps SM70 single-GPU startup.
+            layer.qweight = torch.nn.Parameter(
+                torch.empty(0, dtype=torch.int32, device=tm_weight.device),
+                requires_grad=False,
+            )
+            layer.qzeros = torch.nn.Parameter(
+                torch.empty(0, dtype=torch.int32, device=tm_weight.device),
+                requires_grad=False,
+            )
+            layer.scales = torch.nn.Parameter(
+                torch.empty(0, dtype=torch.float16, device=tm_weight.device),
+                requires_grad=False,
+            )
 
     def apply(
         self,

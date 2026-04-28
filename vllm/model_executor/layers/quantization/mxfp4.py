@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
-
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -33,8 +32,28 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+
+def _get_current_capability_int() -> int:
+    capability = current_platform.get_device_capability()
+    return -1 if capability is None else capability.to_int()
+
+
+def _has_sm70_mxfp4_moe_ops() -> bool:
+    c_ops = getattr(torch.ops, "_C", None)
+    return (
+        c_ops is not None
+        and hasattr(c_ops, "sm70_mxfp4_moe_direct_prepare")
+        and hasattr(c_ops, "sm70_mxfp4_moe_gemm_out")
+        and hasattr(c_ops, "sm70_moe_add_bias_out")
+    )
+
+
+def _is_sm70_mxfp4_moe_available() -> bool:
+    return _get_current_capability_int() == 70 and _has_sm70_mxfp4_moe_ops()
 
 
 class Mxfp4Config(QuantizationConfig):
@@ -48,7 +67,7 @@ class Mxfp4Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 80
+        return 70
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -56,7 +75,7 @@ class Mxfp4Config(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.bfloat16]
+        return [torch.bfloat16, torch.float16]
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
@@ -79,6 +98,12 @@ class Mxfp4Config(QuantizationConfig):
             )
             return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
+            if _is_sm70_mxfp4_moe_available():
+                from vllm.model_executor.layers.quantization.sm70_mxfp4_moe import (
+                    Mxfp4SM70MoEMethod,
+                )
+
+                return Mxfp4SM70MoEMethod(layer.moe_config)
             return Mxfp4MoEMethod(layer.moe_config)
         elif isinstance(layer, Attention):
             logger.debug_once(

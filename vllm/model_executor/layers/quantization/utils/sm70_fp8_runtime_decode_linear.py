@@ -29,27 +29,6 @@ def _adopt_resident_parameter(
     return getattr(layer, name)
 
 
-def _adopt_prepared_resident_tensors(
-    layer: torch.nn.Module,
-    prepared_weight: torch.Tensor,
-    prepared_scale: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    prepared_weight = _adopt_resident_parameter(layer, "weight", prepared_weight)
-    if "weight_scale_inv" in layer._parameters:
-        prepared_scale = _adopt_resident_parameter(
-            layer,
-            "weight_scale_inv",
-            prepared_scale,
-        )
-    elif "weight_scale" in layer._parameters:
-        prepared_scale = _adopt_resident_parameter(
-            layer,
-            "weight_scale",
-            prepared_scale,
-        )
-    return prepared_weight, prepared_scale
-
-
 def prepare_sm70_fp8_runtime_decode_layer(
     layer: torch.nn.Module,
     *,
@@ -57,6 +36,7 @@ def prepare_sm70_fp8_runtime_decode_layer(
     weight_scale: torch.Tensor,
     weight_block_size: tuple[int, int] | None,
     direct_block_gemm_enabled: bool,
+    adopt_prepared_scale: bool = True,
 ) -> None:
     layout_kind, scale_axis, block_n, block_k = infer_sm70_fp8_layout(
         weight_scale,
@@ -101,11 +81,20 @@ def prepare_sm70_fp8_runtime_decode_layer(
         layer._sm70_fp8_workspace_cols = int(workspace_meta[1].item())
         ensure_sm70_fp8_workspace(layer, weight.device)
 
-    prepared_weight, prepared_scale = _adopt_prepared_resident_tensors(
-        layer,
-        prepared_weight,
-        prepared_scale,
-    )
+    prepared_weight = _adopt_resident_parameter(layer, "weight", prepared_weight)
+    if adopt_prepared_scale:
+        if "weight_scale_inv" in layer._parameters:
+            prepared_scale = _adopt_resident_parameter(
+                layer,
+                "weight_scale_inv",
+                prepared_scale,
+            )
+        elif "weight_scale" in layer._parameters:
+            prepared_scale = _adopt_resident_parameter(
+                layer,
+                "weight_scale",
+                prepared_scale,
+            )
     layer._sm70_fp8_runtime_prepared = True
     layer._sm70_fp8_block_shape = weight_block_size
     layer._sm70_fp8_output_size = int(getattr(layer, "output_size_per_partition"))

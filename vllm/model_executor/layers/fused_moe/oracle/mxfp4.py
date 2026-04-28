@@ -61,6 +61,8 @@ class Mxfp4MoeBackend(Enum):
     TRITON_UNFUSED = "TRITON_UNFUSED"
     # XPU
     XPU = "XPU"
+    # SM70 TurboMind
+    SM70_TURBOMIND = "SM70_TURBOMIND"
 
 
 # Backends that share the same TRTLLM weight format
@@ -78,7 +80,10 @@ TRITON_BACKENDS = (
 def backend_to_kernel_cls(
     backend: Mxfp4MoeBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
-    if backend in (
+    if backend == Mxfp4MoeBackend.SM70_TURBOMIND:
+        return []
+
+    elif backend in (
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
     ):
@@ -172,6 +177,7 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
     Only includes BF16 backends. MXFP8 backends are selected via env vars.
     """
     _AVAILABLE_BACKENDS = [
+        Mxfp4MoeBackend.SM70_TURBOMIND,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.CK,
         Mxfp4MoeBackend.TRITON,
@@ -194,6 +200,20 @@ def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
     return None
 
 
+def _sm70_turbomind_mxfp4_available() -> bool:
+    capability = current_platform.get_device_capability()
+    c_ops = getattr(torch.ops, "_C", None)
+    return (
+        current_platform.is_cuda()
+        and capability is not None
+        and capability.to_int() == 70
+        and c_ops is not None
+        and hasattr(c_ops, "sm70_mxfp4_moe_direct_prepare")
+        and hasattr(c_ops, "sm70_mxfp4_moe_gemm_out")
+        and hasattr(c_ops, "sm70_moe_add_bias_out")
+    )
+
+
 def select_mxfp4_moe_backend(
     config: FusedMoEConfig,
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts] | None]:
@@ -201,6 +221,9 @@ def select_mxfp4_moe_backend(
     Select the primary MXFP4 MoE backend.
     Note: Shape-specific fallbacks may still occur at runtime.
     """
+    if _sm70_turbomind_mxfp4_available():
+        return Mxfp4MoeBackend.SM70_TURBOMIND, None
+
     triton_kernels_supported = has_triton_kernels() and (
         9,
         0,

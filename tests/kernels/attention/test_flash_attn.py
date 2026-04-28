@@ -215,3 +215,75 @@ def test_varlen_with_paged_kv(
         torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
         f"{torch.max(torch.abs(output - ref_output))}",
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_fa2_varlen_paged_gqa_sinks_support_split_kv() -> None:
+    torch.set_default_device("cuda")
+    if not is_fa_version_supported(2):
+        pytest.skip(
+            "Flash attention version 2 not supported due "
+            f'to: "{fa_version_unsupported_reason(2)}"'
+        )
+
+    set_random_seed(0)
+    query_lens = [1, 1]
+    kv_lens_list = [1024, 1536]
+    num_query_heads = 8
+    num_kv_heads = 2
+    head_size = 64
+    block_size = 16
+    num_blocks = 256
+    scale = head_size**-0.5
+
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=torch.float16
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16
+    )
+    value_cache = torch.randn_like(key_cache)
+    sinks = torch.linspace(-2.0, 2.0, num_query_heads, dtype=torch.float32)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32)
+
+    max_num_blocks_per_seq = (max(kv_lens_list) + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (len(query_lens), max_num_blocks_per_seq), dtype=torch.int32
+    )
+
+    base_output = flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens_list),
+        softmax_scale=scale,
+        causal=True,
+        block_table=block_tables,
+        fa_version=2,
+        s_aux=sinks,
+        num_splits=1,
+    )
+    split_output = flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens_list),
+        softmax_scale=scale,
+        causal=True,
+        block_table=block_tables,
+        fa_version=2,
+        s_aux=sinks,
+        num_splits=2,
+    )
+
+    torch.testing.assert_close(split_output, base_output, atol=2e-2, rtol=2e-2)

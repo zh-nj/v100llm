@@ -271,6 +271,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int block_n, int block_k, bool interleave_gated_silu) -> Tensor[]");
   ops.impl("sm70_fp8_moe_direct_prepare", torch::kCUDA,
            &sm70_fp8_moe_direct_prepare);
+  ops.def(
+      "sm70_mxfp4_moe_direct_prepare(Tensor weight, Tensor weight_scale, "
+      "bool interleave_gated_silu) -> Tensor[]");
+  ops.impl("sm70_mxfp4_moe_direct_prepare", torch::kCUDA,
+           &sm70_mxfp4_moe_direct_prepare);
 
   ops.def(
       "awq_gemm_sm70(Tensor _in_feats, Tensor _kernel, Tensor "
@@ -365,6 +370,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, "
       "int num_experts, int k, int n, int group_size, bool gated_silu) -> ()");
   ops.impl("sm70_fp8_moe_gemm_out", torch::kCUDA, &sm70_fp8_moe_gemm_out);
+  ops.def(
+      "sm70_mxfp4_moe_gemm_out(Tensor(a!) out, Tensor sorted_input, "
+      "Tensor expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, "
+      "int num_experts, int k, int n, int group_size, bool gated_silu) -> ()");
+  ops.impl("sm70_mxfp4_moe_gemm_out", torch::kCUDA,
+           &sm70_mxfp4_moe_gemm_out);
+  ops.def(
+      "sm70_moe_add_bias_out(Tensor(a!) out, Tensor expert_offsets, "
+      "Tensor bias, int num_experts) -> ()");
+  ops.impl("sm70_moe_add_bias_out", torch::kCUDA, &sm70_moe_add_bias_out);
 
   // Dequantization for AWQ.
   ops.def(

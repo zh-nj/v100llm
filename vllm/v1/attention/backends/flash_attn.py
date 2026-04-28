@@ -195,8 +195,6 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> str | None:
         if head_size > 256 and device_capability != DeviceCapability(7, 0):
             return "head_size > 256 is only supported by SM70 FlashAttention kernels"
-        if has_sink and device_capability < DeviceCapability(9, 0):
-            return "sink not supported on compute capability < 9.0"
         return None
 
 
@@ -659,7 +657,7 @@ class FlashAttentionImpl(AttentionImpl):
         self.sinks = sinks
         if self.sinks is not None:
             assert flash_attn_supports_sinks(), (
-                "Sinks are only supported in FlashAttention 3"
+                "Sinks are only supported in FlashAttention 2/3"
             )
             assert self.sinks.shape[0] == num_heads, (
                 "Sinks must have the same number of heads as the number of "

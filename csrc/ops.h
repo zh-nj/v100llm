@@ -230,6 +230,11 @@ std::vector<torch::Tensor> sm70_fp8_moe_direct_prepare(
     int64_t block_k,
     bool interleave_gated_silu);
 
+std::vector<torch::Tensor> sm70_mxfp4_moe_direct_prepare(
+    torch::Tensor weight,
+    torch::Tensor weight_scale,
+    bool interleave_gated_silu);
+
 torch::Tensor awq_gemm_sm70(torch::Tensor _in_feats,
                             torch::Tensor _kernel,
                             torch::Tensor _scaling_factors,
@@ -292,6 +297,22 @@ void sm70_fp8_moe_gemm_out(torch::Tensor out,
                            int64_t n,
                            int64_t group_size,
                            bool gated_silu);
+
+void sm70_mxfp4_moe_gemm_out(torch::Tensor out,
+                             torch::Tensor sorted_input,
+                             torch::Tensor expert_offsets,
+                             torch::Tensor strided_ptrs_w,
+                             torch::Tensor strided_ptrs_s,
+                             int64_t num_experts,
+                             int64_t k,
+                             int64_t n,
+                             int64_t group_size,
+                             bool gated_silu);
+
+void sm70_moe_add_bias_out(torch::Tensor out,
+                           torch::Tensor expert_offsets,
+                           torch::Tensor bias,
+                           int64_t num_experts);
 
 void sm70_f16_gate_mul_out(torch::Tensor out,
                            torch::Tensor _in_feats,

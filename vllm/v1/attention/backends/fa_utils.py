@@ -177,7 +177,7 @@ def flash_attn_supports_sinks() -> bool:
     if current_platform.is_xpu():
         return True
     else:
-        return get_flash_attn_version() == 3
+        return get_flash_attn_version() in (2, 3)
 
 
 def flash_attn_supports_mla():
