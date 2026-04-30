@@ -49,6 +49,8 @@ def create_fused_moe_router(
     # eplb parameters
     enable_eplb: bool = False,
     eplb_state: EplbLayerState = EMPTY_EPLB_STATE,
+    # DeepSeek V4 hash routing table.
+    hash_indices_table: torch.Tensor | None = None,
 ) -> FusedMoERouter:
     """
     Factory function to create the appropriate FusedMoERouter subclass based on
@@ -58,7 +60,7 @@ def create_fused_moe_router(
     1. RoutingSimulatorRouter - if VLLM_MOE_ROUTING_SIMULATION_STRATEGY env var is set
     2. GroupedTopKRouter - if use_grouped_topk is True
     3. CustomRoutingRouter - if custom_routing_function is not None
-    4. FusedTopKBiasRouter - if e_score_correction_bias is not None
+    4. FusedTopKBiasRouter - if e_score_correction_bias or hash table is set
     5. FusedTopKRouter - default fallback
 
     Common arguments:
@@ -145,7 +147,9 @@ def create_fused_moe_router(
             indices_type_getter=indices_type_getter,
         )
 
-    if e_score_correction_bias is not None:
+    assert scoring_func in ["sigmoid", "softmax", "sqrtsoftplus"]
+
+    if e_score_correction_bias is not None or hash_indices_table is not None:
         return FusedTopKBiasRouter(
             top_k=top_k,
             global_num_experts=global_num_experts,
@@ -156,6 +160,7 @@ def create_fused_moe_router(
             routed_scaling_factor=routed_scaling_factor,
             enable_eplb=enable_eplb,
             indices_type_getter=indices_type_getter,
+            hash_indices_table=hash_indices_table,
         )
 
     return FusedTopKRouter(

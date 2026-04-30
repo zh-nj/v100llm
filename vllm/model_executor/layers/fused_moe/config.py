@@ -121,8 +121,10 @@ class RoutingMethodType(IntEnum):
     Custom = (6,)
     # Simulated
     Simulated = (7,)
+    # Deepseek V4: sqrtsoftplus + optional bias/hash + normalize
+    DeepseekV4 = (8,)
     # Unspecified
-    Unspecified = 8.0
+    Unspecified = 9.0
 
 
 def get_routing_method_type(
@@ -132,12 +134,10 @@ def get_routing_method_type(
     num_expert_group: int | None,
     has_e_score_bias: bool,
 ) -> RoutingMethodType:
-    """Map router settings onto the fused-MoE routing method enum.
-
-    This preserves the routing-method assignments used by the legacy router
-    implementations before the helper was introduced.
-    """
     del top_k, has_e_score_bias
+
+    if scoring_func == "sqrtsoftplus":
+        return RoutingMethodType.DeepseekV4 if renormalize else RoutingMethodType.Unspecified
 
     if num_expert_group not in (None, 0):
         return (
@@ -233,6 +233,9 @@ class FusedMoEQuantConfig:
     _w1: FusedMoEQuantDesc
     _w2: FusedMoEQuantDesc
     is_nvfp4_scale_swizzled: bool = True
+    gemm1_alpha: float | None = None
+    gemm1_beta: float | None = None
+    gemm1_clamp_limit: float | None = None
 
     def __post_init__(self):
         assert not self.per_act_token_quant or self.block_shape is None, (
@@ -246,6 +249,10 @@ class FusedMoEQuantConfig:
     @property
     def quant_dtype(self) -> torch.dtype | str | None:
         return self._a1.dtype
+
+    @property
+    def weight_quant_dtype(self) -> torch.dtype | str | None:
+        return self._w1.dtype
 
     @property
     def is_quantized(self) -> bool:
@@ -399,6 +406,10 @@ class FusedMoEQuantConfig:
     def use_nvfp4_w4a4(self) -> bool:
         return self.quant_dtype == "nvfp4"
 
+    @property
+    def use_mxfp4_w4a8(self) -> bool:
+        return self._a1.dtype == "fp8" and self._w1.dtype == "mxfp4"
+
     def config_name(self, dtype: torch.dtype) -> str | None:
         """
         Return a string used to construct the filename that contains the
@@ -473,6 +484,9 @@ class FusedMoEQuantConfig:
         w2_zp: torch.Tensor | None = None,
         weight_dtype: torch.dtype | str | None = None,
         is_nvfp4_scale_swizzled: bool = True,
+        gemm1_alpha: float | None = None,
+        gemm1_beta: float | None = None,
+        gemm1_clamp_limit: float | None = None,
     ) -> "FusedMoEQuantConfig":
         """
         General builder function for a FusedMoEQuantConfig.
@@ -502,6 +516,9 @@ class FusedMoEQuantConfig:
         - w2_bias: Optional biases for w1 (GPT OSS Triton).
         - w1_zp: Optional w1 zero points for int4/int8 quantization.
         - w2_zp: Optional w2 zero points for int4/int8 quantization.
+        - gemm1_alpha: Optional SwiGLU alpha parameter.
+        - gemm1_beta: Optional SwiGLU beta parameter.
+        - gemm1_clamp_limit: Optional SwiGLU clamp limit.
         """
         assert not isinstance(quant_dtype, str) or quant_dtype in {
             "nvfp4",
@@ -534,6 +551,9 @@ class FusedMoEQuantConfig:
                 weight_dtype, w_shape, w2_scale, g2_alphas, w2_zp, w2_bias
             ),
             is_nvfp4_scale_swizzled=is_nvfp4_scale_swizzled,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
         )
         assert quant_config.per_act_token_quant == per_act_token_quant
         assert quant_config.per_out_ch_quant == per_out_ch_quant

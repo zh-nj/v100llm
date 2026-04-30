@@ -99,6 +99,11 @@ void fused_qk_norm_rope(torch::Tensor& qkv, int64_t num_heads_q,
                         torch::Tensor& k_weight, torch::Tensor& cos_sin_cache,
                         bool is_neox, torch::Tensor& position_ids);
 
+void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    torch::Tensor& q, torch::Tensor const& kv, torch::Tensor& k_cache,
+    torch::Tensor const& slot_mapping, torch::Tensor const& position_ids,
+    torch::Tensor const& cos_sin_cache, double eps, int64_t cache_block_size);
+
 void apply_repetition_penalties_(torch::Tensor& logits,
                                  const torch::Tensor& prompt_mask,
                                  const torch::Tensor& output_mask,
@@ -114,6 +119,10 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
                           const torch::Tensor& seqLens, torch::Tensor& indices,
                           int64_t numRows, int64_t stride0, int64_t stride1,
                           int64_t topK);
+
+void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
+                     torch::Tensor& output, torch::Tensor& workspace, int64_t k,
+                     int64_t max_seq_len);
 
 void large_context_topk(const torch::Tensor& logits, torch::Tensor& indices,
                         const torch::Tensor& seq_lens,
@@ -146,9 +155,12 @@ void rms_norm_per_block_quant(torch::Tensor& out, torch::Tensor const& input,
 
 void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
                       std::optional<torch::Tensor> key, int64_t head_size,
-                      torch::Tensor& cos_sin_cache, bool is_neox);
+                      torch::Tensor& cos_sin_cache, bool is_neox,
+                      int64_t rope_dim_offset, bool inverse);
 
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
+
+void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double limit);
 
 void silu_and_mul_quant(torch::Tensor& out, torch::Tensor& input,
                         torch::Tensor& scale);

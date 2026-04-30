@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 import warnings
 from collections.abc import Callable
 from dataclasses import InitVar, field
@@ -82,7 +83,7 @@ logger = init_logger(__name__)
 RunnerOption = Literal["auto", RunnerType]
 ConvertType = Literal["none", "embed", "classify"]
 ConvertOption = Literal["auto", ConvertType]
-TokenizerMode = Literal["auto", "hf", "slow", "mistral", "deepseek_v32"]
+TokenizerMode = Literal["auto", "hf", "slow", "mistral", "deepseek_v32", "deepseek_v4"]
 ModelDType = Literal["auto", "half", "float16", "bfloat16", "float", "float32"]
 LogprobsMode = Literal[
     "raw_logits", "raw_logprobs", "processed_logits", "processed_logprobs"
@@ -132,6 +133,7 @@ class ModelConfig:
     - "slow" will always use the slow tokenizer.\n
     - "mistral" will always use the tokenizer from `mistral_common`.\n
     - "deepseek_v32" will always use the tokenizer from `deepseek_v32`.\n
+    - "deepseek_v4" will always use the tokenizer from `deepseek_v4`.\n
     - Other custom values can be supported via plugins."""
     trust_remote_code: bool = False
     """Trust remote code (e.g., from HuggingFace) when downloading the model
@@ -540,6 +542,14 @@ class ModelConfig:
         self._architecture = arch
         logger.info("Resolved architecture: %s", arch)
 
+        if self.tokenizer_mode == "auto" and arch == "DeepseekV4ForCausalLM":
+            self.tokenizer_mode = "deepseek_v4"
+            logger.info(
+                "Defaulting to tokenizer_mode=%r for %s",
+                self.tokenizer_mode,
+                arch,
+            )
+
         # Init pooler config if needed
         if self.runner_type == "pooling":
             if self.pooler_config is None:
@@ -895,6 +905,7 @@ class ModelConfig:
                 "petit_nvfp4",
                 # Ensure heavy backends are probed last to avoid unnecessary
                 # imports during override detection (e.g., MXFP4 imports Triton)
+                "deepseek_v4_fp8",
                 "mxfp4",
                 "cpu_awq",
             ]
@@ -909,9 +920,15 @@ class ModelConfig:
             # Detect which checkpoint is it
             for name in quantization_methods:
                 method = me_quant.get_quantization_config(name)
-                quantization_override = method.override_quantization_method(
-                    quant_cfg, self.quantization
-                )
+                override_sig = inspect.signature(method.override_quantization_method)
+                if "hf_config" in override_sig.parameters:
+                    quantization_override = method.override_quantization_method(
+                        quant_cfg, self.quantization, hf_config=self.hf_config
+                    )
+                else:
+                    quantization_override = method.override_quantization_method(
+                        quant_cfg, self.quantization
+                    )
                 if quantization_override is not None:
                     # Raise error if the override is not custom (custom would
                     # be in QUANTIZATION_METHODS but not QuantizationMethods)

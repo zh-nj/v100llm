@@ -46,6 +46,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
 
+from .utils import swiglu_limit_func
+
 
 def _fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -84,6 +86,7 @@ def _fused_marlin_moe(
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     is_k_full: bool = True,
+    clamp_limit: float | None = None,
 ) -> torch.Tensor:
     assert hidden_states.ndim == 2
     M, K = hidden_states.size()
@@ -151,11 +154,18 @@ def _fused_marlin_moe(
         use_fp32_reduce=True,
         is_zp_float=False,
     )
-    activation_func(
-        activation,
-        intermediate_cache2,
-        intermediate_cache1.view(-1, w13_num_shards * N),
-    )
+    if clamp_limit is not None and activation == MoEActivation.SILU:
+        swiglu_limit_func(
+            intermediate_cache2,
+            intermediate_cache1.view(-1, w13_num_shards * N),
+            clamp_limit,
+        )
+    else:
+        activation_func(
+            activation,
+            intermediate_cache2,
+            intermediate_cache1.view(-1, w13_num_shards * N),
+        )
 
     if output is None:
         output = intermediate_cache3
@@ -243,6 +253,7 @@ def fused_marlin_moe(
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     inplace: bool = False,
+    clamp_limit: float | None = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -359,6 +370,7 @@ def fused_marlin_moe(
         output=None,
         input_dtype=input_dtype,
         is_k_full=is_k_full,
+        clamp_limit=clamp_limit,
     ).view(-1, topk, K)
 
     if output is None:
@@ -553,6 +565,7 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         self.w2_g_idx_sort_indices = w2_g_idx_sort_indices
         self.is_k_full = is_k_full
         self.input_dtype = get_marlin_input_dtype()
+        self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
 
         super().__init__(
             moe_config=moe_config,
@@ -745,6 +758,7 @@ class MarlinExperts(MarlinExpertsBase):
             sort_indices2=self.w2_g_idx_sort_indices,
             is_k_full=self.is_k_full,
             input_dtype=self.input_dtype,
+            clamp_limit=self.gemm1_clamp_limit,
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:

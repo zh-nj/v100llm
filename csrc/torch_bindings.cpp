@@ -105,6 +105,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("silu_and_mul(Tensor! result, Tensor input) -> ()");
   ops.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
 
+  // SwiGLU with DeepSeek V4 pre-activation clamp.
+  ops.def("silu_and_mul_with_clamp(Tensor! result, Tensor input, float limit) -> ()");
+  ops.impl("silu_and_mul_with_clamp", torch::kCUDA, &silu_and_mul_clamp);
+
   ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
   ops.impl("silu_and_mul_quant", torch::kCUDA, &silu_and_mul_quant);
@@ -170,6 +174,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool is_neox, Tensor position_ids) -> ()");
   ops.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
 
+#ifndef USE_ROCM
+  // Horizontally-fused DeepseekV4-MLA: per-head RMSNorm + GPT-J RoPE for Q, and
+  // GPT-J RoPE + UE8M0 FP8 quant + paged cache insert for KV, all in one
+  // kernel launch.
+  ops.def(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
+      "Tensor! q, Tensor kv, Tensor! k_cache, "
+      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+      "float eps, int cache_block_size) -> ()");
+  ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert", torch::kCUDA,
+           &fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert);
+#endif
+
   // Apply repetition penalties to logits in-place
   ops.def(
       "apply_repetition_penalties_(Tensor! logits, Tensor prompt_mask, "
@@ -189,6 +206,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor seq_lens, Tensor! indices, "
       "int numRows, int stride0, int stride1, int topK) -> ()");
   ops.impl("top_k_per_row_decode", torch::kCUDA, &top_k_per_row_decode);
+
+  ops.def(
+      "persistent_topk(Tensor logits, Tensor lengths, Tensor! output, "
+      "Tensor workspace, int k, int max_seq_len) -> ()");
+  ops.impl("persistent_topk", torch::kCUDA, &persistent_topk);
 
   ops.def(
       "large_context_topk(Tensor score, Tensor indices, Tensor lengths, "
@@ -234,7 +256,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "rotary_embedding(Tensor positions, Tensor! query,"
       "                 Tensor!? key, int head_size,"
-      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
+      "                 Tensor cos_sin_cache, bool is_neox, int "
+      "rope_dim_offset=0, bool inverse=False) -> ()");
   ops.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
 
   // Quantization ops

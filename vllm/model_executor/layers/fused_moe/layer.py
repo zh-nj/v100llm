@@ -258,6 +258,7 @@ class FusedMoE(CustomOp):
         custom_routing_function: Callable | None = None,
         scoring_func: str = "softmax",
         routed_scaling_factor: float = 1.0,
+        swiglu_limit: float | None = None,
         e_score_correction_bias: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -272,6 +273,7 @@ class FusedMoE(CustomOp):
         gate: torch.nn.Module | None = None,
         shared_experts: torch.nn.Module | None = None,
         routed_input_transform: torch.nn.Module | None = None,
+        hash_indices_table: torch.Tensor | None = None,
     ):
         super().__init__()
 
@@ -438,6 +440,8 @@ class FusedMoE(CustomOp):
         self.scoring_func = scoring_func
         self.routed_scaling_factor = routed_scaling_factor
         self.e_score_correction_bias = e_score_correction_bias
+        self.swiglu_limit = swiglu_limit
+        self.hash_indices_table = hash_indices_table
         # TODO(bnell): end attributes
 
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -462,6 +466,7 @@ class FusedMoE(CustomOp):
             # TODO(bnell): once we can construct the MK at init time, we
             # can make this a value.
             indices_type_getter=lambda: self.quant_method.topk_indices_dtype,
+            hash_indices_table=self.hash_indices_table,
         )
         self.routing_method_type: RoutingMethodType = self.router.routing_method_type
 

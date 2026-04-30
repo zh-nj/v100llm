@@ -462,11 +462,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         device=self.device,
                     ),
                 )
+            spec_hidden_states = hidden_states
+            if hasattr(self.model, "get_mtp_target_hidden_states"):
+                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             self.speculator.propose(
                 input_batch=input_batch,
                 attn_metadata=attn_metadata,
                 slot_mappings=slot_mappings_by_layer,
-                last_hidden_states=hidden_states,
+                last_hidden_states=spec_hidden_states,
                 aux_hidden_states=aux_hidden_states,
                 num_sampled=torch.ones(
                     input_batch.num_reqs, dtype=torch.int32, device=self.device
@@ -775,6 +779,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_logits,
         )
 
+        # CPU upper bound on seq_lens; padded entries remain zero. DeepSeek V4
+        # sparse indexer uses this for CPU-side prefill chunking.
+        seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_padded, dtype=np.int32)
+        np.add(
+            self.req_states.num_computed_tokens_np[idx_mapping_np],
+            num_scheduled_tokens,
+            out=seq_lens_cpu_upper_bound_np[:num_reqs],
+        )
+        seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
+
         return InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -790,6 +804,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=dcp_local_seq_lens,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
@@ -902,6 +917,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         computed_prefill[idx_mapping_np] += input_batch.num_scheduled_tokens
         np.minimum(
             computed_prefill, self.req_states.prefill_len.np, out=computed_prefill
+        )
+        self.req_states.num_computed_tokens_np[idx_mapping_np] += (
+            input_batch.num_scheduled_tokens
         )
 
     @torch.inference_mode()
@@ -1203,11 +1221,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
+            spec_hidden_states = hidden_states
+            if hasattr(self.model, "get_mtp_target_hidden_states"):
+                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
                 slot_mappings_by_layer,
-                hidden_states,
+                spec_hidden_states,
                 aux_hidden_states,
                 num_sampled,
                 num_rejected,
@@ -1283,6 +1305,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         computed_prefill[idx_mapping_np] += input_batch.num_scheduled_tokens
         np.minimum(
             computed_prefill, self.req_states.prefill_len.np, out=computed_prefill
+        )
+        self.req_states.num_computed_tokens_np[idx_mapping_np] += (
+            input_batch.num_scheduled_tokens
         )
 
     ########### EPLB methods start ###########

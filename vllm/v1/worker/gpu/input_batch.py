@@ -61,6 +61,8 @@ class InputBatch:
     # [num_reqs]
     seq_lens: torch.Tensor
     # [num_reqs]
+    seq_lens_cpu_upper_bound: torch.Tensor | None
+    # [num_reqs]
     dcp_local_seq_lens: torch.Tensor | None
 
     # [num_tokens_after_padding]
@@ -136,6 +138,7 @@ class InputBatch:
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
+            seq_lens_cpu_upper_bound=None,
             dcp_local_seq_lens=None,
             input_ids=input_ids,
             positions=positions,

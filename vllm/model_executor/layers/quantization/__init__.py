@@ -29,6 +29,7 @@ QuantizationMethods = Literal[
     "torchao",
     "inc",
     "mxfp4",
+    "deepseek_v4_fp8",
     "petit_nvfp4",
     "cpu_awq",
 ]
@@ -103,6 +104,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
 
     # lazy import to avoid triggering `torch.compile` too early
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+    from vllm.model_executor.models.deepseek_v4 import DeepseekV4FP8Config
 
     from .awq import AWQConfig
     from .awq_marlin import AWQMarlinConfig
@@ -148,6 +150,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "auto-round": INCConfig,
         "inc": INCConfig,
         "mxfp4": Mxfp4Config,
+        "deepseek_v4_fp8": DeepseekV4FP8Config,
         "petit_nvfp4": PetitNvFp4Config,
         "cpu_awq": CPUAWQConfig,
     }
