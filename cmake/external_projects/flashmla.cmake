@@ -14,6 +14,9 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
     list(APPEND SUPPORT_ARCHS "10.0a")
 endif()
+if(DEFINED ENV{FLASH_MLA_ENABLE_SM70} AND "$ENV{FLASH_MLA_ENABLE_SM70}" MATCHES "^(1|true|TRUE|yes|YES|on|ON)$")
+    list(APPEND SUPPORT_ARCHS "7.0")
+endif()
 
 cuda_archs_loose_intersection(FLASH_MLA_ARCHS "${SUPPORT_ARCHS}" "${CUDA_ARCHS}")
 
@@ -52,6 +55,17 @@ endif()
 FetchContent_MakeAvailable(flashmla)
 message(STATUS "FlashMLA is available at ${flashmla_SOURCE_DIR}")
 
+set(FLASHMLA_HAS_SM70 FALSE)
+set(FLASHMLA_HAS_DENSE_EXTENSION_ARCH FALSE)
+if("7.0" IN_LIST FLASH_MLA_ARCHS)
+    set(FLASHMLA_HAS_SM70 TRUE)
+endif()
+foreach(_FLASHMLA_ARCH ${FLASH_MLA_ARCHS})
+    if("${_FLASHMLA_ARCH}" MATCHES "^(9\\.0a|10\\.0a|10\\.0f)$")
+        set(FLASHMLA_HAS_DENSE_EXTENSION_ARCH TRUE)
+    endif()
+endforeach()
+
 # Vendor FlashMLA interface into vLLM with torch-ops shim.
 set(FLASHMLA_VENDOR_DIR "${CMAKE_SOURCE_DIR}/vllm/third_party/flashmla")
 file(MAKE_DIRECTORY "${FLASHMLA_VENDOR_DIR}")
@@ -78,12 +92,22 @@ if(FLASH_MLA_ARCHS)
     set(VLLM_FLASHMLA_GPU_FLAGS ${VLLM_GPU_FLAGS})
     list(APPEND VLLM_FLASHMLA_GPU_FLAGS "--expt-relaxed-constexpr" "--expt-extended-lambda" "--use_fast_math")
 
+    set(FlashMLA_SM70_SOURCES)
+    if(FLASHMLA_HAS_SM70)
+        list(APPEND FlashMLA_SM70_SOURCES
+            ${flashmla_SOURCE_DIR}/csrc/sm70/decode/dense/instantiations/fp16.cu
+            ${flashmla_SOURCE_DIR}/csrc/sm70/decode/sparse_fp8/instantiations/v32_fp8.cu
+            ${flashmla_SOURCE_DIR}/csrc/sm70/decode/sparse_fp8/instantiations/model1_fp8.cu
+            ${flashmla_SOURCE_DIR}/csrc/sm70/prefill/sparse/instantiations/bf16.cu)
+    endif()
+
     set(FlashMLA_SOURCES
         ${flashmla_SOURCE_DIR}/csrc/torch_api.cpp
 
         # Misc kernels for decoding
         ${flashmla_SOURCE_DIR}/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu
         ${flashmla_SOURCE_DIR}/csrc/smxx/decode/combine/combine.cu
+        ${FlashMLA_SM70_SOURCES}
 
         # sm90 dense decode
         ${flashmla_SOURCE_DIR}/csrc/sm90/decode/dense/instantiations/fp16.cu
@@ -168,22 +192,28 @@ if(FLASH_MLA_ARCHS)
         $<$<COMPILE_LANGUAGE:CXX>:-std=c++20>
         $<$<COMPILE_LANGUAGE:CUDA>:-std=c++20>)
 
-    define_extension_target(
-        _flashmla_extension_C
-        DESTINATION vllm
-        LANGUAGE ${VLLM_GPU_LANG}
-        SOURCES ${FlashMLA_Extension_SOURCES}
-        COMPILE_FLAGS ${VLLM_FLASHMLA_GPU_FLAGS}
-        ARCHITECTURES ${VLLM_GPU_ARCHES}
-        INCLUDE_DIRECTORIES ${FlashMLA_Extension_INCLUDES}
-        USE_SABI 3
-        WITH_SOABI)
+    set(FLASHMLA_BUILD_DENSE_EXTENSION ${FLASHMLA_HAS_DENSE_EXTENSION_ARCH})
+    if(FLASHMLA_BUILD_DENSE_EXTENSION)
+        define_extension_target(
+            _flashmla_extension_C
+            DESTINATION vllm
+            LANGUAGE ${VLLM_GPU_LANG}
+            SOURCES ${FlashMLA_Extension_SOURCES}
+            COMPILE_FLAGS ${VLLM_FLASHMLA_GPU_FLAGS}
+            ARCHITECTURES ${VLLM_GPU_ARCHES}
+            INCLUDE_DIRECTORIES ${FlashMLA_Extension_INCLUDES}
+            USE_SABI 3
+            WITH_SOABI)
 
-    # Keep Stable ABI for the module, but *not* for CUDA/C++ files.
-    # This prevents Py_LIMITED_API from affecting nvcc and C++ compiles.
-    target_compile_options(_flashmla_extension_C PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:-UPy_LIMITED_API>
-        $<$<COMPILE_LANGUAGE:CXX>:-UPy_LIMITED_API>)
+        # Keep Stable ABI for the module, but *not* for CUDA/C++ files.
+        # This prevents Py_LIMITED_API from affecting nvcc and C++ compiles.
+        target_compile_options(_flashmla_extension_C PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-UPy_LIMITED_API>
+            $<$<COMPILE_LANGUAGE:CXX>:-UPy_LIMITED_API>)
+    else()
+        message(STATUS "FlashMLA dense extension skipped for CUDA architectures: ${FLASH_MLA_ARCHS}")
+        add_custom_target(_flashmla_extension_C)
+    endif()
 else()
     message(STATUS "FlashMLA will not compile: unsupported CUDA architecture ${CUDA_ARCHS}")
     # Create empty targets for setup.py on unsupported systems

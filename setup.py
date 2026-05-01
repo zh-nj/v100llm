@@ -980,6 +980,15 @@ def get_nvcc_cuda_version() -> Version:
     return nvcc_cuda_version
 
 
+def _flashmla_sm70_enabled() -> bool:
+    return os.getenv("FLASH_MLA_ENABLE_SM70", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 DEFAULT_VLLM_RELEASE_VERSION = "0.19.1"
 
 
@@ -1076,10 +1085,17 @@ if _is_cuda():
                 "TORCH_CUDA_ARCH_LIST=%r does not target SM90a.",
                 os.getenv("TORCH_CUDA_ARCH_LIST"),
             )
-    if envs.VLLM_USE_PRECOMPILED or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.9")
-    ):
-        # FlashMLA requires CUDA 12.9 or later
+    nvcc_cuda_version = get_nvcc_cuda_version() if CUDA_HOME else Version("0")
+    build_flashmla = envs.VLLM_USE_PRECOMPILED or (
+        CUDA_HOME
+        and (
+            nvcc_cuda_version >= Version("12.9")
+            or (_flashmla_sm70_enabled() and nvcc_cuda_version >= Version("12.8"))
+        )
+    )
+    if build_flashmla:
+        # FlashMLA requires CUDA 12.9 or later upstream; local SM70 sparse
+        # builds can opt in with CUDA 12.8 and FLASH_MLA_ENABLE_SM70=1.
         # Optional since this doesn't get built (produce an .so file) when
         # not targeting a hopper system
         ext_modules.append(CMakeExtension(name="vllm._flashmla_C", optional=True))
