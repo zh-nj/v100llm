@@ -836,7 +836,7 @@ git commit -m "新增 DeepSeek V4 FlashMLA SM70 检查脚本"
 - Verify: `tests/kernels/attention/test_flashmla_sparse.py`
 - Verify: `tests/v1/attention/test_sparse_mla_backends.py`
 
-- [ ] **Step 1: Run the low-level sparse FlashMLA smoke on a V100**
+- [x] **Step 1: Run the low-level sparse FlashMLA smoke on a V100**
 
 Run:
 
@@ -850,7 +850,7 @@ pytest tests/kernels/attention/test_flashmla_sparse.py::test_sparse_flashmla_dec
 
 Expected: the decode smoke passes or reaches a concrete `_flashmla_C::sparse_decode_fwd` kernel error. If it reaches a kernel error, record the full stack and compare against `/mnt/data/apps/FlashMLA/benchmark/bench_sm70_sparse_decode.py --cases quick`.
 
-- [ ] **Step 2: Run the sparse prefill smoke on a V100**
+- [x] **Step 2: Run the sparse prefill smoke on a V100**
 
 Run:
 
@@ -864,7 +864,7 @@ pytest tests/kernels/attention/test_flashmla_sparse.py::test_sparse_flashmla_pre
 
 Expected: the prefill smoke passes. If the test fails because it calls the old name `flash_mla_sparse_prefill`, change that test call to `flash_mla_sparse_fwd` and rerun this same command.
 
-- [ ] **Step 3: Run a small v1 sparse MLA backend case**
+- [x] **Step 3: Run a small v1 sparse MLA backend case**
 
 Run:
 
@@ -879,7 +879,7 @@ pytest tests/v1/attention/test_sparse_mla_backends.py::test_sparse_backend_decod
 
 Expected: the selected FlashMLA sparse backend case passes or reveals the first vLLM metadata mismatch after the Python gates are open.
 
-- [ ] **Step 4: Commit any test compatibility fix from this task**
+- [x] **Step 4: Commit any test compatibility fix from this task**
 
 If Step 2 required renaming `flash_mla_sparse_prefill` to `flash_mla_sparse_fwd`, run:
 

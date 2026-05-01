@@ -3266,6 +3266,14 @@ def concat_and_cache_mla(
     )
 
 
+def concat_mla_q(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    q_out: torch.Tensor,
+) -> None:
+    torch.ops._C_cache_ops.concat_mla_q(ql_nope, q_pe, q_out)
+
+
 def concat_and_cache_mla_rope_fused(
     positions: torch.Tensor,
     q_pe: torch.Tensor,
