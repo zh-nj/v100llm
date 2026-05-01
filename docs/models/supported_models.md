@@ -385,6 +385,14 @@ th {
 | `DeepseekV2ForCausalLM` | DeepSeek-V2 | `deepseek-ai/DeepSeek-V2`, `deepseek-ai/DeepSeek-V2-Chat`, etc. | ✅︎ | ✅︎ |
 | `DeepseekV3ForCausalLM` | DeepSeek-V3 | `deepseek-ai/DeepSeek-V3`, `deepseek-ai/DeepSeek-R1`, `deepseek-ai/DeepSeek-V3.1`, etc. | ✅︎ | ✅︎ |
 | `DeepseekV4ForCausalLM` | DeepSeek-V4 | `deepseek-ai/DeepSeek-V4-Flash`, `deepseek-ai/DeepSeek-V4-Pro`, etc. | | |
+
+> Local SM70 note: `DeepseekV4ForCausalLM` on V100-class GPUs requires the
+> FlashMLA SM70 opt-in build (`FLASH_MLA_SRC_DIR=/mnt/data/apps/FlashMLA`,
+> `FLASH_MLA_ENABLE_SM70=1`, `FLASH_MLA_DISABLE_SM100=1`,
+> `TORCH_CUDA_ARCH_LIST=7.0`). The supported SM70 attention path is the
+> sparse FlashMLA path for `fp8_ds_mla` MODEL1 layout; dense FlashMLA remains
+> Hopper-only.
+
 | `Dots1ForCausalLM` | dots.llm1 | `rednote-hilab/dots.llm1.base`, `rednote-hilab/dots.llm1.inst`, etc. | | ✅︎ |
 | `DotsOCRForCausalLM` | dots_ocr | `rednote-hilab/dots.ocr` | ✅︎ | ✅︎ |
 | `Ernie4_5ForCausalLM` | Ernie4.5 | `baidu/ERNIE-4.5-0.3B-PT`, etc. | ✅︎ | ✅︎ |

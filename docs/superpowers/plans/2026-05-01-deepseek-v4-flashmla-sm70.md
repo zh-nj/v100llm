@@ -982,7 +982,7 @@ git commit -m "记录 DeepSeek V4 Flash SM70 smoke 结果"
 - Modify: `docs/models/supported_models.md`
 - Test: `git diff --check`
 
-- [ ] **Step 1: Add a support-boundary note**
+- [x] **Step 1: Add a support-boundary note**
 
 In `docs/models/supported_models.md`, near the `DeepseekV4ForCausalLM` row or immediately below the table, add:
 
@@ -995,7 +995,7 @@ In `docs/models/supported_models.md`, near the `DeepseekV4ForCausalLM` row or im
 > Hopper-only.
 ```
 
-- [ ] **Step 2: Run markdown diff hygiene**
+- [x] **Step 2: Run markdown diff hygiene**
 
 Run:
 
@@ -1006,7 +1006,7 @@ git diff --check docs/models/supported_models.md
 
 Expected: no whitespace errors.
 
-- [ ] **Step 3: Commit Task 7**
+- [x] **Step 3: Commit Task 7**
 
 Run:
 
