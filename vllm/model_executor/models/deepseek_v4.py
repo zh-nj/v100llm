@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -17,6 +18,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.deepseek_v4_attention import (
     DeepseekV4Indexer,
@@ -40,7 +42,7 @@ from vllm.model_executor.layers.quantization import (
     QuantizationMethods,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
@@ -64,6 +66,50 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
+_SM70_FP16_HC_OUTPUT_MAX = float(torch.finfo(torch.float16).max)
+
+
+def _trace_nonfinite_tensor(label: str, tensor: torch.Tensor) -> None:
+    if os.getenv("VLLM_DEEPSEEK_V4_NAN_TRACE", "0") != "1":
+        return
+    if torch.isfinite(tensor).all():
+        return
+    finite = torch.isfinite(tensor)
+    finite_values = tensor[finite]
+    if finite_values.numel() == 0:
+        min_value = max_value = float("nan")
+    else:
+        stats = finite_values.float()
+        min_value = float(stats.min().item())
+        max_value = float(stats.max().item())
+    logger.error(
+        "DeepSeek V4 nonfinite tensor at %s: shape=%s dtype=%s "
+        "nan=%d inf=%d finite_min=%s finite_max=%s",
+        label,
+        tuple(tensor.shape),
+        tensor.dtype,
+        int(torch.isnan(tensor).sum().item()),
+        int(torch.isinf(tensor).sum().item()),
+        min_value,
+        max_value,
+    )
+
+
+def _should_clamp_sm70_fp16_hc_output(x: torch.Tensor) -> bool:
+    if not x.is_cuda or x.dtype != torch.float16:
+        return False
+    capability = torch.cuda.get_device_capability(x.device)
+    return capability[0] < 8
+
+
+def _clamp_sm70_fp16_hc_output_(x: torch.Tensor) -> torch.Tensor:
+    return x.clamp_(
+        min=-_SM70_FP16_HC_OUTPUT_MAX,
+        max=_SM70_FP16_HC_OUTPUT_MAX,
+    )
+
 
 
 class DeepseekV4MLP(nn.Module):
@@ -157,7 +203,7 @@ class DeepseekV4FP8Config(Fp8Config):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
-            return Mxfp4MoEMethod(layer.moe_config)
+            return Mxfp4Config().get_quant_method(layer, prefix)
         return super().get_quant_method(layer, prefix)
 
     def is_mxfp4_quant(self, prefix, layer):
@@ -840,6 +886,13 @@ class DeepseekV4MoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
             final_hidden_states += shared_output
 
+        if self.tp_size > 1:
+            final_hidden_states = (
+                self.experts.maybe_all_reduce_tensor_model_parallel(
+                    final_hidden_states
+                )
+            )
+
         return final_hidden_states.view(org_shape)
 
     def _forward_fused_moe(
@@ -859,6 +912,21 @@ class DeepseekV4MoE(nn.Module):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 input_ids=input_ids,
+            )
+
+        if isinstance(final_hidden_states, tuple):
+            shared_output, final_hidden_states = final_hidden_states
+            if self.shared_experts is None:
+                assert shared_output is None
+            else:
+                assert shared_output is not None
+                final_hidden_states += shared_output
+
+        if self.tp_size > 1:
+            final_hidden_states = (
+                self.experts.maybe_all_reduce_tensor_model_parallel(
+                    final_hidden_states
+                )
             )
 
         return final_hidden_states.view(org_shape)
@@ -1047,6 +1115,7 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         super().__init__()
         config = vllm_config.model_config.hf_config
+        self.prefix = prefix
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -1155,17 +1224,33 @@ class DeepseekV4DecoderLayer(nn.Module):
         x, post, comb = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
+        _trace_nonfinite_tensor(f"{self.prefix}.attn_hc_pre", x)
+        _trace_nonfinite_tensor(f"{self.prefix}.attn_hc_post_mix", post)
+        _trace_nonfinite_tensor(f"{self.prefix}.attn_hc_res_mix", comb)
         x = self.attn_norm(x)
+        _trace_nonfinite_tensor(f"{self.prefix}.attn_norm", x)
         x = self.attn(positions, x, None)
+        _trace_nonfinite_tensor(f"{self.prefix}.attn", x)
         x = self.hc_post(x, residual, post, comb)
+        if _should_clamp_sm70_fp16_hc_output(x):
+            _clamp_sm70_fp16_hc_output_(x)
+        _trace_nonfinite_tensor(f"{self.prefix}.attn_hc_post", x)
 
         residual = x
         x, post, comb = self.hc_pre(
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
+        _trace_nonfinite_tensor(f"{self.prefix}.ffn_hc_pre", x)
+        _trace_nonfinite_tensor(f"{self.prefix}.ffn_hc_post_mix", post)
+        _trace_nonfinite_tensor(f"{self.prefix}.ffn_hc_res_mix", comb)
         x = self.ffn_norm(x)
+        _trace_nonfinite_tensor(f"{self.prefix}.ffn_norm", x)
         x = self.ffn(x, input_ids)
+        _trace_nonfinite_tensor(f"{self.prefix}.ffn", x)
         x = self.hc_post(x, residual, post, comb)
+        if _should_clamp_sm70_fp16_hc_output(x):
+            _clamp_sm70_fp16_hc_output_(x)
+        _trace_nonfinite_tensor(f"{self.prefix}.ffn_hc_post", x)
         return x
 
 
@@ -1176,6 +1261,7 @@ class DeepseekV4Model(nn.Module):
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        self.prefix = prefix
         self.config = config
 
         self.vocab_size = config.vocab_size
@@ -1259,6 +1345,7 @@ class DeepseekV4Model(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.embed_input_ids(input_ids)
+        _trace_nonfinite_tensor(f"{self.prefix}.embed", hidden_states)
         hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
@@ -1280,7 +1367,9 @@ class DeepseekV4Model(nn.Module):
             self.rms_norm_eps,
             self.hc_eps,
         )
+        _trace_nonfinite_tensor(f"{self.prefix}.hc_head", hidden_states)
         hidden_states = self.norm(hidden_states)
+        _trace_nonfinite_tensor(f"{self.prefix}.norm", hidden_states)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1463,7 +1552,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        _trace_nonfinite_tensor("lm_head.input", hidden_states)
         logits = self.logits_processor(self.lm_head, hidden_states)
+        if logits is not None:
+            _trace_nonfinite_tensor("lm_head.logits", logits)
         return logits
 
     def forward(
