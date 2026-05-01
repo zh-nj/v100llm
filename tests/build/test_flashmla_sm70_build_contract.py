@@ -35,3 +35,11 @@ def test_flashmla_cmake_skips_dense_extension_for_sm70_only_build() -> None:
 
     assert "FLASHMLA_BUILD_DENSE_EXTENSION" in text
     assert "add_custom_target(_flashmla_extension_C)" in text
+
+
+def test_flashmla_cmake_mirrors_sm70_feature_and_tuning_defines() -> None:
+    text = _read("cmake/external_projects/flashmla.cmake")
+
+    assert "KERUTILS_ALLOW_SM70_STUB_COMPILE" in text
+    assert "FLASH_MLA_SM70_SPARSE_DECODE_USE_MMA_884_ONLINE" in text
+    assert "FLASH_MLA_SM70_SPARSE_PREFILL_USE_MMA_884_ONLINE" in text

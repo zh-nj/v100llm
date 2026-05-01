@@ -75,7 +75,7 @@ The build must not rely on root-repo `PYTHONPATH`. Use the worktree path as the 
 - Modify: `vllm/v1/attention/ops/flashmla.py`
 - Test: `tests/v1/attention/test_flashmla_sm70_sparse_support.py`
 
-- [ ] **Step 1: Write the failing backend/runtime gate tests**
+- [x] **Step 1: Write the failing backend/runtime gate tests**
 
 Create `tests/v1/attention/test_flashmla_sm70_sparse_support.py`:
 
@@ -131,7 +131,7 @@ def test_flashmla_dense_runtime_probe_stays_rejected_on_sm70(
     assert reason == "FlashMLA Dense is only supported on Hopper devices."
 ```
 
-- [ ] **Step 2: Run the tests and verify the expected red state**
+- [x] **Step 2: Run the tests and verify the expected red state**
 
 Run:
 
@@ -148,7 +148,7 @@ Expected:
 - `test_flashmla_sparse_runtime_probe_accepts_sm70_core_extension` fails because `is_flashmla_sparse_supported()` still rejects SM70 and still depends on `_flashmla_extension_C_AVAILABLE`.
 - The dense rejection test should pass or continue failing only if the helper split has not been implemented yet.
 
-- [ ] **Step 3: Implement the sparse backend SM70 gate**
+- [x] **Step 3: Implement the sparse backend SM70 gate**
 
 In `vllm/v1/attention/backends/mla/flashmla_sparse.py`, replace the current capability check:
 
@@ -166,7 +166,7 @@ with:
         return capability.major in [7, 9, 10]
 ```
 
-- [ ] **Step 4: Split core and extension availability in `ops/flashmla.py`**
+- [x] **Step 4: Split core and extension availability in `ops/flashmla.py`**
 
 In `vllm/v1/attention/ops/flashmla.py`, replace `_is_flashmla_available()` with these helpers:
 
@@ -249,7 +249,7 @@ to:
 if _is_flashmla_core_available()[0]:
 ```
 
-- [ ] **Step 5: Run the focused gate tests**
+- [x] **Step 5: Run the focused gate tests**
 
 Run:
 
@@ -262,7 +262,7 @@ pytest tests/v1/attention/test_flashmla_sm70_sparse_support.py -q
 
 Expected: `3 passed`.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 Run:
 
@@ -282,7 +282,7 @@ git commit -m "支持 SM70 选择 FlashMLA sparse 后端"
 - Modify: `cmake/external_projects/flashmla.cmake`
 - Test: `tests/build/test_flashmla_sm70_build_contract.py`
 
-- [ ] **Step 1: Write static build-contract red tests**
+- [x] **Step 1: Write static build-contract red tests**
 
 Create `tests/build/test_flashmla_sm70_build_contract.py`:
 
@@ -324,9 +324,17 @@ def test_flashmla_cmake_skips_dense_extension_for_sm70_only_build() -> None:
 
     assert "FLASHMLA_BUILD_DENSE_EXTENSION" in text
     assert "add_custom_target(_flashmla_extension_C)" in text
+
+
+def test_flashmla_cmake_mirrors_sm70_feature_and_tuning_defines() -> None:
+    text = _read("cmake/external_projects/flashmla.cmake")
+
+    assert "KERUTILS_ALLOW_SM70_STUB_COMPILE" in text
+    assert "FLASH_MLA_SM70_SPARSE_DECODE_USE_MMA_884_ONLINE" in text
+    assert "FLASH_MLA_SM70_SPARSE_PREFILL_USE_MMA_884_ONLINE" in text
 ```
 
-- [ ] **Step 2: Run the tests and verify the expected red state**
+- [x] **Step 2: Run the tests and verify the expected red state**
 
 Run:
 
@@ -337,9 +345,9 @@ cd /mnt/data/apps/1Cat-vLLM/.worktrees/vllm-0190-upstream-split
 pytest tests/build/test_flashmla_sm70_build_contract.py -q
 ```
 
-Expected: all three tests fail because `setup.py` still requires CUDA 12.9 for FlashMLA and the CMake file still only lists SM90/SM100 sources.
+Expected: the tests fail because `setup.py` still requires CUDA 12.9 for FlashMLA, the CMake file still only lists SM90/SM100 sources, and the SM70 feature/tuning defines are not mirrored from the local FlashMLA build.
 
-- [ ] **Step 3: Add the setup.py SM70 opt-in helper**
+- [x] **Step 3: Add the setup.py SM70 opt-in helper**
 
 In `setup.py`, add this helper near `get_nvcc_cuda_version()`:
 
@@ -375,7 +383,7 @@ with:
     if build_flashmla:
 ```
 
-- [ ] **Step 4: Add SM70 source selection in CMake**
+- [x] **Step 4: Add SM70 source selection in CMake**
 
 In `cmake/external_projects/flashmla.cmake`, add this after the CUDA 12.8/12.9 `SUPPORT_ARCHS` logic and before `cuda_archs_loose_intersection(...)`:
 
@@ -444,7 +452,7 @@ Replace the unconditional `_flashmla_extension_C` `define_extension_target(...)`
     endif()
 ```
 
-- [ ] **Step 5: Run the build-contract tests**
+- [x] **Step 5: Run the build-contract tests**
 
 Run:
 
@@ -455,9 +463,9 @@ cd /mnt/data/apps/1Cat-vLLM/.worktrees/vllm-0190-upstream-split
 pytest tests/build/test_flashmla_sm70_build_contract.py -q
 ```
 
-Expected: `3 passed`.
+Expected: `4 passed`.
 
-- [ ] **Step 6: Commit Task 2**
+- [x] **Step 6: Commit Task 2**
 
 Run:
 
@@ -474,7 +482,7 @@ git commit -m "接入本地 FlashMLA SM70 sparse 构建"
 - Verify: `vllm/_flashmla_C*.so`
 - Test: focused import commands below
 
-- [ ] **Step 1: Clean only stale FlashMLA build outputs from this worktree**
+- [x] **Step 1: Clean only stale FlashMLA build outputs from this worktree**
 
 Run:
 
@@ -490,7 +498,7 @@ cd /mnt/data/apps/1Cat-vLLM/.worktrees/vllm-0190-upstream-split
 find ./vllm -maxdepth 1 -name '_flashmla*.so' -delete
 ```
 
-- [ ] **Step 2: Build and install the worktree with local FlashMLA**
+- [x] **Step 2: Build and install the worktree with local FlashMLA**
 
 Run:
 
@@ -514,7 +522,7 @@ Expected:
 - `_flashmla_extension_C` may be skipped for an SM70-only build.
 - Installation completes without using the root checkout as `PYTHONPATH`.
 
-- [ ] **Step 3: Verify imports come from this worktree**
+- [x] **Step 3: Verify imports come from this worktree**
 
 Run:
 
@@ -539,7 +547,7 @@ Expected:
 - On a visible SM70 device, `sparse_supported (True, None)` is printed.
 - Dense may report unsupported if `_flashmla_extension_C` is not built or the visible GPU is not Hopper.
 
-- [ ] **Step 4: Run the focused Python tests after installation**
+- [x] **Step 4: Run the focused Python tests after installation**
 
 Run:
 
@@ -553,7 +561,7 @@ pytest tests/v1/attention/test_flashmla_sm70_sparse_support.py \
 
 Expected: all focused tests pass.
 
-- [ ] **Step 5: Commit generated vendored interface only if CMake changed it**
+- [x] **Step 5: Commit generated vendored interface only if CMake changed it**
 
 Run:
 
