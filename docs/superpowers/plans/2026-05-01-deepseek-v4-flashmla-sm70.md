@@ -586,7 +586,7 @@ If the file did not change, record no commit for this step.
 - Create: `benchmarks/deepseek_v4_flashmla_sm70.py`
 - Test: `python benchmarks/deepseek_v4_flashmla_sm70.py --mode inspect --json`
 
-- [ ] **Step 1: Create the inspect and OpenAI-stream helper**
+- [x] **Step 1: Create the inspect and OpenAI-stream helper**
 
 Create `benchmarks/deepseek_v4_flashmla_sm70.py`:
 
@@ -807,7 +807,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **Step 2: Run inspect before committing**
+- [x] **Step 2: Run inspect before committing**
 
 Run:
 
@@ -820,7 +820,7 @@ python benchmarks/deepseek_v4_flashmla_sm70.py --mode inspect --json
 
 Expected after Tasks 1-2: JSON prints `"static_ready": true`.
 
-- [ ] **Step 3: Commit Task 4**
+- [x] **Step 3: Commit Task 4**
 
 Run:
 
