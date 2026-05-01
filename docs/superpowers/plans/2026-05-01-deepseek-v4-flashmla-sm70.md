@@ -897,7 +897,39 @@ If no file changed, record no commit for this task.
 - Verify: `benchmarks/deepseek_v4_flashmla_sm70.py`
 - Runtime target: `/mnt/data6/models/DeepSeek-V4-Flash`
 
-- [ ] **Step 1: Start the OpenAI-compatible server on the requested GPUs**
+Current status as of 2026-05-01 14:23 CST:
+
+- Server startup on `CUDA_VISIBLE_DEVICES=2,3,4,5,6,8,7,9` succeeds on port
+  `18080`: `DeepseekV4ForCausalLM` is resolved, `kv_cache_dtype` is normalized
+  to `fp8_ds_mla`, FlashMLA sparse block size is forced to 64, 46 checkpoint
+  shards load, KV cache initializes, and Uvicorn reaches application startup.
+- Fixed one concrete SM70 cache bug found after the first semantic failure:
+  `indexer_k_quant_and_cache` wrote correct scales but zero FP8 value bytes on
+  SM70, and `quantize_and_insert_k_cache` still used Triton `tl.float8e4nv`.
+  SM70 now uses torch correctness fallbacks for DeepSeek V4 attention/indexer
+  K-cache quant insert and indexer gather.
+- **Root cause found and fixed (2026-05-01 22:40 CST):**
+  `DeepseekV4MoE.forward` and `_forward_fused_moe` were missing
+  `tensor_model_parallel_all_reduce` on the non-MegaMoE (FusedMoE) path.
+  MegaMoE handles reduce internally, but FusedMoE's `reduce_results` defaults
+  to `False`, so MoE output was never synchronized across TP ranks. Each rank
+  had only its partial sum, causing hidden-state divergence from layer 0 onward
+  and garbled output. Fix: add `experts.maybe_all_reduce_tensor_model_parallel`
+  after MoE forward, matching the DeepSeek V2 implementation.
+- OpenAI stream now returns semantically correct output:
+  `你好！我是DeepSeek，由深度求索公司创造的AI助手，乐于为你提供热情、细腻的帮助。`
+  `TTFT=2.4s`, `decode_tokens_per_s=1.6`, `finish_reason=stop`,
+  `completion_tokens=25`.
+- Latest OpenAI-stream result after the cache fallback fix: `TTFT=2.688s`,
+  `completion_tokens=29`, `decode_tokens_per_s=1.351`, `finish_reason=stop`;
+  `output_preview` still contains `Banay...<|end_of_repo_name|>...`-style
+  invalid content.
+- Quick LM-head check after the failed smoke: `sm70_f16_prepare` +
+  `sm70_f16_gemm_out` matches `x @ weight.T` on random fp16 shapes
+  (`max_diff <= 0.03125` for the checked shapes), so the default SM70 LM-head
+  fast path is not the current lead suspect.
+
+- [x] **Step 1: Start the OpenAI-compatible server on the requested GPUs**
 
 Run:
 
@@ -929,7 +961,7 @@ Expected server log evidence:
 - `_flashmla_C` imports successfully.
 - No fallback to a root checkout appears in Python file paths.
 
-- [ ] **Step 2: Run OpenAI-stream smoke and compute decode throughput from streaming timestamps**
+- [x] **Step 2: Run OpenAI-stream smoke and compute decode throughput from streaming timestamps**
 
 In a second shell:
 
@@ -953,7 +985,7 @@ Expected:
 - `finish_reason` is `stop` or `length`.
 - The output preview is semantically coherent for a one-sentence identity prompt.
 
-- [ ] **Step 3: If startup fails, classify the first blocker**
+- [x] **Step 3: If startup fails, classify the first blocker**
 
 Use this classification:
 
@@ -964,7 +996,7 @@ Use this classification:
 
 Record the first failing stack frame and the exact launch command before changing code.
 
-- [ ] **Step 4: Commit the smoke helper result documentation**
+- [x] **Step 4: Commit the smoke helper result documentation**
 
 If the smoke succeeds, append the command and JSON result to `docs/models/supported_models.md` under the `DeepseekV4ForCausalLM` note added in Task 7. If it fails, append only the first blocker classification and command to the same note.
 
