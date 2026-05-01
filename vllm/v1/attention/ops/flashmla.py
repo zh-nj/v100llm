@@ -30,7 +30,7 @@ else:
     _flashmla_extension_C_AVAILABLE = False
 
 
-def _is_flashmla_available() -> tuple[bool, str | None]:
+def _is_flashmla_core_available() -> tuple[bool, str | None]:
     if not _flashmla_C_AVAILABLE:
         return (
             False,
@@ -38,14 +38,24 @@ def _is_flashmla_available() -> tuple[bool, str | None]:
             "compiled due to insufficient nvcc version or a supported arch "
             "was not in the list of target arches to compile for.",
         )
+    return True, None
+
+
+def _is_flashmla_extension_available() -> tuple[bool, str | None]:
     if not _flashmla_extension_C_AVAILABLE:
         return (
             False,
             "vllm._flashmla_extension_C is not available, likely "
             "was not compiled due to a build error.",
         )
-
     return True, None
+
+
+def _is_flashmla_available() -> tuple[bool, str | None]:
+    is_available, maybe_reason = _is_flashmla_core_available()
+    if not is_available:
+        return False, maybe_reason
+    return _is_flashmla_extension_available()
 
 
 def is_flashmla_dense_supported() -> tuple[bool, str | None]:
@@ -64,16 +74,18 @@ def is_flashmla_sparse_supported() -> tuple[bool, str | None]:
     """
     Return: is_supported_flag, unsupported_reason (optional).
     """
-    is_available, maybe_reason = _is_flashmla_available()
+    is_available, maybe_reason = _is_flashmla_core_available()
     if not is_available:
         return False, maybe_reason
     if not (
-        current_platform.is_device_capability_family(90)
+        current_platform.is_device_capability_family(70)
+        or current_platform.is_device_capability_family(90)
         or current_platform.is_device_capability_family(100)
     ):
         return (
             False,
-            "FlashMLA Sparse is only supported on Hopper and Blackwell devices.",
+            "FlashMLA Sparse is only supported on Volta, Hopper and Blackwell "
+            "devices.",
         )
     return True, None
 
@@ -83,7 +95,7 @@ def _raise_flashmla_unavailable(*_args, **_kwargs):
     raise RuntimeError(reason or "FlashMLA is not available")
 
 
-if _is_flashmla_available()[0]:
+if _is_flashmla_core_available()[0]:
     from vllm.third_party.flashmla.flash_mla_interface import (  # noqa: F401
         FlashMLASchedMeta,
         flash_attn_varlen_func,
