@@ -880,9 +880,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_FP8_DIRECT_GEMM", "1"))
     ),
     # If set to 1, SM70 mHC uses the fused Triton fast path instead of the
-    # torch correctness fallback. Keep opt-in until full-model semantics are
-    # validated for the fused path.
-    "VLLM_SM70_MHC_FAST": lambda: bool(int(os.getenv("VLLM_SM70_MHC_FAST", "0"))),
+    # torch correctness fallback.
+    "VLLM_SM70_MHC_FAST": lambda: bool(int(os.getenv("VLLM_SM70_MHC_FAST", "1"))),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (
         os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "0").strip().lower()

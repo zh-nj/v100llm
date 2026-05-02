@@ -17,6 +17,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import fp8_einsum
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops import (
@@ -250,6 +251,114 @@ def _build_decode_prefill_fallback_indices(
     return local_indices.unsqueeze(1), local_lens
 
 
+@triton.jit
+def _gather_decode_kv_triton_kernel(
+    # Output: [num_tokens, topk, 512] viewed as uint16
+    out_ptr,
+    out_stride0,
+    out_stride1,
+    # KV cache: [num_blocks, block_bytes] uint8
+    k_cache_ptr,
+    block_stride,
+    # Slots: [num_tokens, topk] int32
+    slots_ptr,
+    slots_stride0,
+    # Lens: [num_tokens] int32
+    lens_ptr,
+    num_tokens,
+    topk,
+    cache_block_size: tl.constexpr,
+    FP8_DIM: tl.constexpr = 448,
+    ROPE_DIM: tl.constexpr = 64,
+    SCALE_DIM: tl.constexpr = 8,
+    QUANT_BLOCK: tl.constexpr = 64,
+    TOKEN_DATA_BYTES: tl.constexpr = 576,
+    N_QUANT_BLOCKS: tl.constexpr = 7,
+    OUTPUT_DIM: tl.constexpr = 512,
+):
+    """Triton kernel to gather and dequantize KV from paged FP8 cache.
+
+    Replaces the pure-torch _gather_decode_prefill_fallback_kv_ for SM70.
+    FP8 decode logic matches _dequantize_and_gather_k_kernel exactly.
+    """
+    pid_token = tl.program_id(0).to(tl.int64)
+    pid_topk = tl.program_id(1).to(tl.int64)
+
+    if pid_token >= num_tokens:
+        return
+
+    out_row = out_ptr + pid_token * out_stride0 + pid_topk * out_stride1
+
+    tok_len = tl.load(lens_ptr + pid_token)
+    if pid_topk >= tok_len:
+        zero_offsets = tl.arange(0, OUTPUT_DIM)
+        tl.store(out_row + zero_offsets, tl.zeros((OUTPUT_DIM,), dtype=tl.uint16))
+        return
+
+    slot_idx = tl.load(
+        slots_ptr + pid_token * slots_stride0 + pid_topk
+    ).to(tl.int64)
+
+    if slot_idx < 0:
+        zero_offsets = tl.arange(0, OUTPUT_DIM)
+        tl.store(out_row + zero_offsets, tl.zeros((OUTPUT_DIM,), dtype=tl.uint16))
+        return
+
+    block_idx = slot_idx // cache_block_size
+    pos_in_block = slot_idx % cache_block_size
+
+    cache_block_base = k_cache_ptr + block_idx * block_stride
+    token_data_base = cache_block_base + pos_in_block * TOKEN_DATA_BYTES
+    token_scale_base = (
+        cache_block_base
+        + cache_block_size * TOKEN_DATA_BYTES
+        + pos_in_block * SCALE_DIM
+    )
+
+    # FP8 dequant: identical to _dequantize_and_gather_k_kernel
+    for qb_idx in tl.static_range(N_QUANT_BLOCKS):
+        qb_start = qb_idx * QUANT_BLOCK
+        fp8_offsets = tl.arange(0, QUANT_BLOCK)
+
+        x_uint8 = tl.load(token_data_base + qb_start + fp8_offsets)
+
+        # FP8 e4m3fn → float32 (same bit manipulation as gather kernel)
+        sign = ((x_uint8 >> 7) & 1).to(tl.int32)
+        exp_bits = ((x_uint8 >> 3) & 0xF).to(tl.int32)
+        mant_bits = (x_uint8 & 0x7).to(tl.int32)
+        fp32_exp = exp_bits + 120
+        fp32_bits = (sign << 31) | (fp32_exp << 23) | (mant_bits << 20)
+        is_zero = (exp_bits == 0) & (mant_bits == 0)
+        fp32_bits = tl.where(is_zero, 0, fp32_bits)
+        is_subnorm = (exp_bits == 0) & (mant_bits != 0)
+        subnorm_val = mant_bits.to(tl.float32) * 1.953125e-3
+        subnorm_val = tl.where(sign == 1, -subnorm_val, subnorm_val)
+        x_float = tl.where(
+            is_subnorm, subnorm_val, fp32_bits.to(tl.float32, bitcast=True)
+        )
+
+        # UE8M0 scale
+        encoded_scale = tl.load(token_scale_base + qb_idx)
+        exponent = encoded_scale.to(tl.float32) - 127.0
+        scale = tl.exp2(exponent)
+
+        x_dequant = x_float * scale
+
+        # float32 → bf16 as uint16 (same rounding as gather kernel)
+        x_u32 = x_dequant.to(tl.int32, bitcast=True)
+        bf16_bits = ((x_u32 + 0x7FFF + ((x_u32 >> 16) & 1)) >> 16).to(
+            tl.uint16
+        )
+        tl.store(out_row + qb_start + fp8_offsets, bf16_bits)
+
+    # BF16 RoPE portion: copy as uint16
+    rope_u16_ptr = (token_data_base + FP8_DIM).to(tl.pointer_type(tl.uint16))
+    for chunk_idx in tl.static_range(ROPE_DIM // 16):
+        offsets = chunk_idx * 16 + tl.arange(0, 16)
+        rope_u16 = tl.load(rope_u16_ptr + offsets)
+        tl.store(out_row + FP8_DIM + offsets, rope_u16)
+
+
 def _gather_decode_prefill_fallback_kv_(
     out: torch.Tensor,
     k_cache: torch.Tensor,
@@ -266,45 +375,27 @@ def _gather_decode_prefill_fallback_kv_(
             f"out={tuple(out.shape)} indices={tuple(global_indices.shape)}"
         )
 
-    out.zero_()
     if slots.numel() == 0:
+        out.zero_()
         return out
 
-    offsets = torch.arange(topk, device=slots.device, dtype=torch.int32)
-    valid = (offsets.unsqueeze(0) < lens.unsqueeze(1)) & (slots >= 0)
-    if not valid.any():
-        return out
+    num_tokens = slots.shape[0]
+    block_stride = k_cache.stride(0)
 
-    safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
-    block_indices = torch.div(
-        safe_slots, block_size, rounding_mode="floor"
-    ).to(torch.long)
-    pos_in_block = (safe_slots % block_size).to(torch.long)
-
-    k_cache_2d = k_cache.reshape(k_cache.shape[0], -1)
-    token_offsets = (
-        pos_in_block.unsqueeze(-1) * _QK_TOKEN_DATA_BYTES
-        + torch.arange(_QK_TOKEN_DATA_BYTES, device=k_cache.device)
+    out_u16 = out.view(torch.uint16)
+    _gather_decode_kv_triton_kernel[(num_tokens, topk)](
+        out_u16,
+        out_u16.stride(0),
+        out_u16.stride(1),
+        k_cache,
+        block_stride,
+        slots,
+        slots.stride(0),
+        lens,
+        num_tokens,
+        topk,
+        block_size,
     )
-    token_bytes = k_cache_2d[block_indices.unsqueeze(-1), token_offsets]
-
-    fp8_values = token_bytes[..., :_QK_NOPE_DIM].contiguous().view(
-        torch.float8_e4m3fn
-    )
-    scale_offsets = (
-        block_size * _QK_TOKEN_DATA_BYTES
-        + pos_in_block.unsqueeze(-1) * _QK_SCALE_BYTES
-        + torch.arange(_QK_NOPE_DIM // _QK_QUANT_BLOCK, device=k_cache.device)
-    )
-    scales = torch.exp2(
-        k_cache_2d[block_indices.unsqueeze(-1), scale_offsets].to(torch.float32)
-        - 127.0
-    ).repeat_interleave(_QK_QUANT_BLOCK, dim=-1)
-    out[..., :_QK_NOPE_DIM] = (fp8_values.float() * scales).to(out.dtype)
-
-    rope_values = token_bytes[..., _QK_NOPE_DIM:].contiguous().view(torch.bfloat16)
-    out[..., _QK_NOPE_DIM:] = rope_values.to(out.dtype)
-    out[~valid] = 0
     return out
 
 

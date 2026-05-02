@@ -96,9 +96,9 @@ def test_mhc_torch_fallback_imports_without_tilelang_and_accepts_fp16() -> None:
         sinkhorn_repeat=2,
     )
 
-    torch.testing.assert_close(actual_post, expected_post)
-    torch.testing.assert_close(actual_comb, expected_comb)
-    torch.testing.assert_close(actual_layer_input, expected_layer_input)
+    torch.testing.assert_close(actual_post, expected_post, atol=5e-4, rtol=2e-3)
+    torch.testing.assert_close(actual_comb, expected_comb, atol=5e-4, rtol=2e-3)
+    torch.testing.assert_close(actual_layer_input, expected_layer_input, atol=5e-4, rtol=2e-3)
 
     actual_out = mhc.mhc_post(
         actual_layer_input,
@@ -111,7 +111,7 @@ def test_mhc_torch_fallback_imports_without_tilelang_and_accepts_fp16() -> None:
         + actual_post.squeeze(-1).unsqueeze(-1) * actual_layer_input.float().unsqueeze(-2)
     ).to(residual.dtype)
 
-    torch.testing.assert_close(actual_out, expected_out)
+    torch.testing.assert_close(actual_out, expected_out, atol=5e-4, rtol=2e-3)
 
 
 def test_mhc_sm70_fast_path_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:

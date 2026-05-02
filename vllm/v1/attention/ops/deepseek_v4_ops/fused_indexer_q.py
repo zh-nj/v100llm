@@ -80,6 +80,33 @@ def _quantize_mxfp4_pair(x_lo, x_hi):
 
 
 @triton.jit
+def _sm70_fp32_to_fp8e4m3_u8(x):
+    """Convert float32 values to FP8 e4m3fn encoded as uint8 (SM70 compatible)."""
+    x_f16_bits = x.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32)
+    fp16_sign = (x_f16_bits >> 15) & 1
+    fp16_exp = (x_f16_bits >> 10) & 0x1F
+    fp16_mant = x_f16_bits & 0x3FF
+    exp_fp8 = fp16_exp - 8
+    mant_fp8 = (fp16_mant >> 7) & 0x7
+    round_bit = (fp16_mant >> 6) & 1
+    sticky = fp16_mant & 0x3F
+    do_round = round_bit & (sticky | (mant_fp8 & 1))
+    mant_fp8 = mant_fp8 + do_round
+    carry = mant_fp8 > 7
+    mant_fp8 = tl.where(carry, 0, mant_fp8)
+    exp_fp8 = tl.where(carry, exp_fp8 + 1, exp_fp8)
+    is_max_exceeded = (exp_fp8 == 15) & (mant_fp8 > 6)
+    mant_fp8 = tl.where(is_max_exceeded, 6, mant_fp8)
+    is_overflow = exp_fp8 > 15
+    exp_fp8 = tl.where(is_overflow, 15, exp_fp8)
+    mant_fp8 = tl.where(is_overflow, 6, mant_fp8)
+    is_underflow = (exp_fp8 <= 0) | (fp16_exp == 0)
+    exp_fp8 = tl.where(is_underflow, 0, exp_fp8)
+    mant_fp8 = tl.where(is_underflow, 0, mant_fp8)
+    return ((fp16_sign << 7) | (exp_fp8 << 3) | mant_fp8).to(tl.uint8)
+
+
+@triton.jit
 def _fused_indexer_q_rope_quant_kernel(
     pos_ptr,
     # Index Q RoPE
@@ -101,6 +128,7 @@ def _fused_indexer_q_rope_quant_kernel(
     index_weights_head_scale,
     index_weights_out_ptr,
     index_weights_out_stride,
+    USE_SM70_FP8_ENCODE: tl.constexpr = False,
 ):
     # Layout matches the unfused reference (DeepseekV4ScalingRotaryEmbedding
     # + per_token_group_quant_fp8): GPT-J interleaved RoPE applied to the
@@ -138,8 +166,10 @@ def _fused_indexer_q_rope_quant_kernel(
 
     amax = tl.maximum(tl.max(tl.abs(r_even)), tl.max(tl.abs(r_odd)))
     if INDEX_Q_NOPE_DIM > 0:
-        nope_offset = tl.arange(0, INDEX_Q_NOPE_DIM)
-        x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
+        NOPE_PAD: tl.constexpr = INDEX_Q_HEAD_DIM  # power-of-2 superset
+        nope_offset = tl.arange(0, NOPE_PAD)
+        nope_mask = nope_offset < INDEX_Q_NOPE_DIM
+        x_nope = tl.load(base_ptr + nope_offset, mask=nope_mask, other=0.0).to(tl.float32)
         amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
     index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), 448.0)
     index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
@@ -149,19 +179,37 @@ def _fused_indexer_q_rope_quant_kernel(
         index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
     )
     if INDEX_Q_NOPE_DIM > 0:
-        tl.store(
-            fp8_base_ptr + nope_offset,
-            tl.div_rn(x_nope, index_q_scale).to(tl.float8e4nv),
-        )
+        if USE_SM70_FP8_ENCODE:
+            tl.store(
+                fp8_base_ptr + nope_offset,
+                _sm70_fp32_to_fp8e4m3_u8(tl.div_rn(x_nope, index_q_scale)),
+                mask=nope_mask,
+            )
+        else:
+            tl.store(
+                fp8_base_ptr + nope_offset,
+                tl.div_rn(x_nope, index_q_scale).to(tl.float8e4nv),
+                mask=nope_mask,
+            )
     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
-    tl.store(
-        fp8_rot_base + half_offset * 2,
-        tl.div_rn(r_even, index_q_scale).to(tl.float8e4nv),
-    )
-    tl.store(
-        fp8_rot_base + half_offset * 2 + 1,
-        tl.div_rn(r_odd, index_q_scale).to(tl.float8e4nv),
-    )
+    if USE_SM70_FP8_ENCODE:
+        tl.store(
+            fp8_rot_base + half_offset * 2,
+            _sm70_fp32_to_fp8e4m3_u8(tl.div_rn(r_even, index_q_scale)),
+        )
+        tl.store(
+            fp8_rot_base + half_offset * 2 + 1,
+            _sm70_fp32_to_fp8e4m3_u8(tl.div_rn(r_odd, index_q_scale)),
+        )
+    else:
+        tl.store(
+            fp8_rot_base + half_offset * 2,
+            tl.div_rn(r_even, index_q_scale).to(tl.float8e4nv),
+        )
+        tl.store(
+            fp8_rot_base + half_offset * 2 + 1,
+            tl.div_rn(r_odd, index_q_scale).to(tl.float8e4nv),
+        )
 
     # FP8 weight-fold contract:
     #   index_weights_out = index_weights * q_scale * softmax_scale * head_scale
@@ -392,18 +440,10 @@ def fused_indexer_q_rope_quant(
         ), index_weights_out
 
     index_q_fp8 = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
-    if _should_use_torch_fp8_fallback(index_q):
-        _torch_indexer_q_rope_fp8_fallback(
-            positions,
-            index_q,
-            index_q_cos_sin_cache,
-            index_weights,
-            index_weights_softmax_scale,
-            index_weights_head_scale,
-            index_q_fp8,
-            index_weights_out,
-        )
-        return index_q_fp8, index_weights_out
+    use_sm70_fp8 = _should_use_torch_fp8_fallback(index_q)
+
+    # On SM70, pass fp8 output as uint8 view to avoid Triton fp8 pointer issues
+    fp8_kernel_buf = index_q_fp8.view(torch.uint8) if use_sm70_fp8 else index_q_fp8
 
     _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
         positions,
@@ -413,9 +453,9 @@ def fused_indexer_q_rope_quant(
         index_q_cos_sin_cache,
         index_q_cos_sin_cache.stride(0),
         index_q_cos_sin_cache.shape[-1] // 2,
-        index_q_fp8,
-        index_q_fp8.stride(0),
-        index_q_fp8.stride(1),
+        fp8_kernel_buf,
+        fp8_kernel_buf.stride(0),
+        fp8_kernel_buf.stride(1),
         index_q_head_dim,
         index_weights,
         index_weights.stride(0),
@@ -423,6 +463,7 @@ def fused_indexer_q_rope_quant(
         index_weights_head_scale,
         index_weights_out,
         index_weights_out.stride(0),
+        USE_SM70_FP8_ENCODE=use_sm70_fp8,
         num_warps=1,  # TODO: Tune this
     )
     return index_q_fp8, index_weights_out

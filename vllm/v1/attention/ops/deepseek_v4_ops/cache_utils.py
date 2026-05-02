@@ -175,6 +175,7 @@ def quantize_and_insert_k_kernel(
     block_stride: tl.constexpr,  # total bytes per block (padded)
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
+    USE_SM70_FP8_ENCODE: tl.constexpr = False,
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -248,9 +249,34 @@ def quantize_and_insert_k_kernel(
             x_scaled = x / scale
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
-            # Convert to fp8, then bitcast to uint8 for storage
-            x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+            if USE_SM70_FP8_ENCODE:
+                # SM70: manual FP8 e4m3fn encode via fp16 bit manipulation
+                x_f16_bits = x_clamped.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32)
+                fp16_sign = (x_f16_bits >> 15) & 1
+                fp16_exp = (x_f16_bits >> 10) & 0x1F
+                fp16_mant = x_f16_bits & 0x3FF
+                exp_fp8 = fp16_exp - 8
+                mant_fp8 = (fp16_mant >> 7) & 0x7
+                round_bit = (fp16_mant >> 6) & 1
+                sticky = fp16_mant & 0x3F
+                do_round = round_bit & (sticky | (mant_fp8 & 1))
+                mant_fp8 = mant_fp8 + do_round
+                carry = mant_fp8 > 7
+                mant_fp8 = tl.where(carry, 0, mant_fp8)
+                exp_fp8 = tl.where(carry, exp_fp8 + 1, exp_fp8)
+                is_max_exceeded = (exp_fp8 == 15) & (mant_fp8 > 6)
+                mant_fp8 = tl.where(is_max_exceeded, 6, mant_fp8)
+                is_overflow = exp_fp8 > 15
+                exp_fp8 = tl.where(is_overflow, 15, exp_fp8)
+                mant_fp8 = tl.where(is_overflow, 6, mant_fp8)
+                is_underflow = (exp_fp8 <= 0) | (fp16_exp == 0)
+                exp_fp8 = tl.where(is_underflow, 0, exp_fp8)
+                mant_fp8 = tl.where(is_underflow, 0, mant_fp8)
+                x_uint8 = ((fp16_sign << 7) | (exp_fp8 << 3) | mant_fp8).to(tl.uint8)
+            else:
+                # SM80+: native FP8 conversion
+                x_fp8 = x_clamped.to(tl.float8e4nv)
+                x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -312,9 +338,7 @@ def quantize_and_insert_k_cache(
 
     grid = (num_tokens,)
 
-    if _should_use_torch_fp8_cache_fallback(k_cache):
-        _torch_quantize_and_insert_k_cache(k, k_cache, slot_mapping, block_size)
-        return
+    use_sm70_fp8 = _should_use_torch_fp8_cache_fallback(k_cache)
 
     quantize_and_insert_k_kernel[grid](
         k,
@@ -331,6 +355,7 @@ def quantize_and_insert_k_cache(
         block_stride=block_stride,
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
+        USE_SM70_FP8_ENCODE=use_sm70_fp8,
     )
 
 

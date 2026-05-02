@@ -122,7 +122,7 @@ def test_sm70_decode_prefill_fallback_builds_local_indices():
 
 def test_sm70_decode_prefill_fallback_gathers_v4_cache_layout():
     block_size = 64
-    k_cache = torch.zeros(1, block_size, 584, dtype=torch.uint8)
+    k_cache = torch.zeros(1, block_size, 584, dtype=torch.uint8, device="cuda")
     cache_2d = k_cache.reshape(1, -1)
 
     def store(slot: int, nope_value: float, rope_offset: float) -> None:
@@ -133,38 +133,38 @@ def test_sm70_decode_prefill_fallback_gathers_v4_cache_layout():
         rope = torch.arange(64, dtype=torch.float32) + rope_offset
         cache_2d[0, token_offset:token_offset + 448] = (
             nope.to(torch.float8_e4m3fn).contiguous().view(torch.uint8)
-        )
+        ).cuda()
         cache_2d[0, token_offset + 448:token_offset + 576] = (
             rope.to(torch.bfloat16).contiguous().view(torch.uint8)
-        )
+        ).cuda()
         cache_2d[0, scale_offset:scale_offset + 7] = 127
 
     store(1, 2.0, 100.0)
     store(3, -3.0, 200.0)
 
-    out = torch.empty(1, 4, 512, dtype=torch.bfloat16)
-    indices = torch.tensor([[[1, 3, -1, -1]]], dtype=torch.int32)
-    lens = torch.tensor([2], dtype=torch.int32)
+    out = torch.empty(1, 4, 512, dtype=torch.bfloat16, device="cuda")
+    indices = torch.tensor([[[1, 3, -1, -1]]], dtype=torch.int32, device="cuda")
+    lens = torch.tensor([2], dtype=torch.int32, device="cuda")
 
     d4a._gather_decode_prefill_fallback_kv_(
         out, k_cache, indices, lens, block_size
     )
 
     torch.testing.assert_close(
-        out[0, 0, :448], torch.full((448,), 2.0, dtype=torch.bfloat16)
+        out[0, 0, :448].cpu(), torch.full((448,), 2.0, dtype=torch.bfloat16)
     )
     torch.testing.assert_close(
-        out[0, 1, :448], torch.full((448,), -3.0, dtype=torch.bfloat16)
+        out[0, 1, :448].cpu(), torch.full((448,), -3.0, dtype=torch.bfloat16)
     )
     torch.testing.assert_close(
-        out[0, 0, 448:],
+        out[0, 0, 448:].cpu(),
         (torch.arange(64, dtype=torch.float32) + 100.0).to(torch.bfloat16),
     )
     torch.testing.assert_close(
-        out[0, 1, 448:],
+        out[0, 1, 448:].cpu(),
         (torch.arange(64, dtype=torch.float32) + 200.0).to(torch.bfloat16),
     )
-    torch.testing.assert_close(out[0, 2:], torch.zeros(2, 512, dtype=torch.bfloat16))
+    torch.testing.assert_close(out[0, 2:].cpu(), torch.zeros(2, 512, dtype=torch.bfloat16))
 
 
 def test_qnorm_rope_kv_insert_fallback_stores_fp16_rope_tail_as_bf16():
