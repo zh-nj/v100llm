@@ -371,11 +371,7 @@ def _mhc_pre_sm70_fast(
     if _use_tm is None:
         # Decide once: use TurboMind if sm70_f16_prepare is available and
         # K dimension satisfies alignment (K%16==0).
-        _use_tm = (
-            hasattr(torch.ops, "_C")
-            and hasattr(torch.ops._C, "sm70_f16_prepare")
-            and hc_hidden_size % 16 == 0
-        )
+        _use_tm = False  # DISABLED: TurboMind MMA_884 has precision issues
         fn._sm70_use_turbomind = _use_tm  # type: ignore[attr-defined]
 
     if _use_tm:

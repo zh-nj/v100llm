@@ -314,9 +314,30 @@ __global__ void fusedDeepseekV4QNormRopeKVRopeQuantInsertKernel(
       for (int i = 0; i < kElemsPerLane; i++) {
         float scaled = elements[i] * inv_scale;
         scaled = fminf(fmaxf(scaled, -kFp8Max), kFp8Max);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
         __nv_fp8_storage_t s =
             __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
         out_bytes[i] = static_cast<uint8_t>(s);
+#else
+        // SM70 manual fp8 e4m3fn encoding via fp16 bit manipulation
+        __half h = __float2half_rn(scaled);
+        uint16_t fp16_bits = *reinterpret_cast<uint16_t*>(&h);
+        uint16_t fp16_sign = (fp16_bits >> 15) & 1;
+        int fp16_exp = (fp16_bits >> 10) & 0x1F;
+        int fp16_mant = fp16_bits & 0x3FF;
+        int exp_fp8 = fp16_exp - 8;       // bias 15→7
+        int mant_fp8 = (fp16_mant >> 7) & 0x7;
+        int round_bit = (fp16_mant >> 6) & 1;
+        int sticky = fp16_mant & 0x3F;
+        if (round_bit && (sticky || (mant_fp8 & 1))) {
+          mant_fp8++;
+          if (mant_fp8 > 7) { mant_fp8 = 0; exp_fp8++; }
+        }
+        if (exp_fp8 == 15 && mant_fp8 > 6) mant_fp8 = 6;
+        if (exp_fp8 > 15) { exp_fp8 = 15; mant_fp8 = 6; }
+        if (exp_fp8 <= 0 || fp16_exp == 0) { exp_fp8 = 0; mant_fp8 = 0; }
+        out_bytes[i] = (uint8_t)((fp16_sign << 7) | (exp_fp8 << 3) | mant_fp8);
+#endif
       }
       // One 16-byte STG per lane.
       *reinterpret_cast<uint4*>(token_fp8_ptr + dim_base) =
@@ -333,7 +354,23 @@ __global__ void fusedDeepseekV4QNormRopeKVRopeQuantInsertKernel(
         token_scale_ptr[kNumQuantBlocks] = 0;  // pad
       }
     } else {
-      // ── RoPE lane: cast back to bf16 and store to cache bf16 tail ────────
+      // ── RoPE lane: cast to bf16 and store to cache bf16 tail ────────
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
+      // SM70: no native bf16. Convert fp32→bf16 via bit manipulation.
+      uint16_t bf16_vals[kElemsPerLane];
+#pragma unroll
+      for (int i = 0; i < kElemsPerLane; i++) {
+        // fp16 intermediate truncation to match torch reference path
+        float fp16_rounded = __half2float(__float2half_rn(elements[i]));
+        uint32_t fp32_bits = __float_as_uint(fp16_rounded);
+        // Round-to-nearest-even bf16
+        bf16_vals[i] = (uint16_t)((fp32_bits + 0x7FFF + ((fp32_bits >> 16) & 1)) >> 16);
+      }
+      int const rope_local_base = dim_base - kNopeDim;
+      uint16_t* bf16_dst = reinterpret_cast<uint16_t*>(token_bf16_ptr) + rope_local_base;
+      *reinterpret_cast<uint4*>(bf16_dst) = *reinterpret_cast<uint4 const*>(bf16_vals);
+      *reinterpret_cast<uint4*>(bf16_dst + 8) = *reinterpret_cast<uint4 const*>(bf16_vals + 8);
+#else
       uint4 out0, out1;
       typename Converter::packed_hip_type* po0 =
           reinterpret_cast<typename Converter::packed_hip_type*>(&out0);
@@ -354,6 +391,7 @@ __global__ void fusedDeepseekV4QNormRopeKVRopeQuantInsertKernel(
           reinterpret_cast<scalar_t_in*>(token_bf16_ptr) + rope_local_base;
       *reinterpret_cast<uint4*>(bf16_dst) = out0;
       *reinterpret_cast<uint4*>(bf16_dst + 8) = out1;
+#endif  // SM70 vs SM80+ rope store
     }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     cudaTriggerProgrammaticLaunchCompletion();
@@ -385,14 +423,11 @@ void launchFusedDeepseekV4QNormRopeKVRopeQuantInsert(
   // supports it (SM90+).  On pre-Hopper GPUs the attribute is unavailable,
   // so leave numAttrs = 0 and launch as a regular kernel.
   static int const sm_version = getSMVersion();
-  // Host-side guard: the device kernel body is compiled as a no-op for
-  // bf16 on pre-Ampere (sm_70/sm_75) because _typeConvert<BFloat16> is
-  // unavailable there.  Refuse the launch loudly instead of silently
-  // skipping the work.
+  // Host-side guard: SM70 uses manual FP8 encoding (no __nv_cvt_float_to_fp8).
+  // fp16 inputs work on SM70+; bf16 inputs require SM80+.
   TORCH_CHECK(
-      sm_version >= 80,
-      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert requires sm_80+ "
-      "(Ampere or newer); got sm_",
+      sm_version >= 70,
+      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert requires sm_70+; got sm_",
       sm_version);
   cudaLaunchConfig_t config;
   config.gridDim = dim3(grid);
