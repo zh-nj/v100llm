@@ -400,11 +400,12 @@ th {
 > Startup is through the FlashMLA sparse SM70 gate. A SM70 FP8 cache insert
 > issue was fixed locally (`indexer_k_quant_and_cache` wrote zero FP8 value
 > bytes on SM70; DeepSeek V4 attention/indexer K-cache insert/gather now uses
-> torch correctness fallbacks on SM70), and the focused regression floor is
-> `79 passed`. The stream output for the one-line identity prompt is still
-> semantically invalid, so the remaining blocker is runtime semantic corruption
-> after successful startup rather than build/import, gate, or immediate
-> FlashMLA sparse kernel failure.
+> torch correctness fallbacks on SM70), and the routed MoE TP all-reduce bug
+> was fixed. The no-TileLang/no-DeepGEMM SM70 mHC fused Triton path is opt-in
+> only via `VLLM_SM70_MHC_FAST=1`; the default torch correctness fallback is
+> required for semantic correctness. With the default mHC path, the identity
+> prompt returns a coherent DeepSeek answer with `finish_reason=stop`, and the
+> exact-output prompt `ZX-42` returns `ZX-42` followed by EOS.
 
 | `Dots1ForCausalLM` | dots.llm1 | `rednote-hilab/dots.llm1.base`, `rednote-hilab/dots.llm1.inst`, etc. | | ✅︎ |
 | `DotsOCRForCausalLM` | dots_ocr | `rednote-hilab/dots.ocr` | ✅︎ | ✅︎ |

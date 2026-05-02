@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_deep_gemm, has_tilelang
@@ -51,6 +52,8 @@ else:
 # ---------------------------------------------------------------------------
 def _is_sm70_fast_path_available() -> bool:
     """Return True when SM70 Triton path can replace the torch fallback."""
+    if not envs.VLLM_SM70_MHC_FAST:
+        return False
     if not current_platform.is_cuda_alike():
         return False
     cap = current_platform.get_device_capability()

@@ -928,6 +928,15 @@ Current status as of 2026-05-01 14:23 CST:
   `sm70_f16_gemm_out` matches `x @ weight.T` on random fp16 shapes
   (`max_diff <= 0.03125` for the checked shapes), so the default SM70 LM-head
   fast path is not the current lead suspect.
+- **MHC fast-path semantic regression isolated (2026-05-02 14:38 CST):**
+  `08398d167` made the no-TileLang/no-DeepGEMM SM70 mHC fused Triton path the
+  default. With that fast path enabled, the exact prompt
+  `请只输出这五个字符，不要输出其它内容：ZX-42` starts with `已为您...` and mutates
+  `42` into `4.2`; the identity prompt also reaches `finish_reason=length`.
+  Restarting the same 8xV100 server with `VLLM_SM70_MHC_FAST=0` restores
+  `ZX-42` with EOS at logprob 0.0 and restores the identity smoke to
+  `finish_reason=stop`. The fused mHC path is now opt-in only until its
+  full-model semantics are fixed.
 
 - [x] **Step 1: Start the OpenAI-compatible server on the requested GPUs**
 

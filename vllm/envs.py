@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
+    VLLM_SM70_MHC_FAST: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -878,6 +879,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_DIRECT_GEMM": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_DIRECT_GEMM", "1"))
     ),
+    # If set to 1, SM70 mHC uses the fused Triton fast path instead of the
+    # torch correctness fallback. Keep opt-in until full-model semantics are
+    # validated for the fused path.
+    "VLLM_SM70_MHC_FAST": lambda: bool(int(os.getenv("VLLM_SM70_MHC_FAST", "0"))),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (
         os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "0").strip().lower()

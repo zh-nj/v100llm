@@ -6,6 +6,8 @@ import importlib.util
 import pytest
 import torch
 
+from vllm.platforms.interface import DeviceCapability
+
 
 def _reference_mhc_pre(
     residual: torch.Tensor,
@@ -110,3 +112,37 @@ def test_mhc_torch_fallback_imports_without_tilelang_and_accepts_fp16() -> None:
     ).to(residual.dtype)
 
     torch.testing.assert_close(actual_out, expected_out)
+
+
+def test_mhc_sm70_fast_path_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.model_executor.layers import mhc
+
+    monkeypatch.setattr(mhc.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(
+        mhc.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(7, 0),
+    )
+    monkeypatch.setenv("VLLM_SM70_MHC_FAST", "0")
+
+    assert not mhc._is_sm70_fast_path_available()
+
+
+def test_mhc_sm70_fast_path_requires_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers import mhc
+
+    monkeypatch.setattr(mhc.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(
+        mhc.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(7, 0),
+    )
+    monkeypatch.delenv("VLLM_SM70_MHC_FAST", raising=False)
+
+    assert not mhc._is_sm70_fast_path_available()
+
+    monkeypatch.setenv("VLLM_SM70_MHC_FAST", "1")
+
+    assert mhc._is_sm70_fast_path_available()
