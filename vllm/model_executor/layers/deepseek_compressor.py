@@ -584,34 +584,6 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
 
-        if _should_use_torch_fused_compressor_fallback(
-            kv_cache, self.use_fp4_cache
-        ):
-            _torch_fused_compress_norm_rope_insert_fp8_fallback(
-                state_cache,
-                token_to_req_indices,
-                positions,
-                slot_mapping,
-                block_table,
-                block_size,
-                self.norm.weight,
-                self.rms_norm_eps,
-                cos_sin_cache,
-                kv_cache,
-                k_cache_metadata.slot_mapping,
-                kv_cache.shape[1],
-                self.head_dim,
-                state_width,
-                self.compress_ratio,
-                self.overlap,
-                self.rope_head_dim,
-                448.0,
-                self._quant_block,
-                self._token_stride,
-                self._scale_dim,
-            )
-            return
-
         self._fused_kernel[(num_actual,)](
             # state cache
             state_cache,

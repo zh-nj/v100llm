@@ -157,7 +157,13 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     N_NOPE_BLOCKS: tl.constexpr = NOPE_HEAD_DIM // QUANT_BLOCK  # 7
     INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
 
-    quant_input = normed.to(tl.bfloat16).to(tl.float32)
+    # bf16 roundtrip via bit manipulation (SM70 compatible)
+    normed_u32 = normed.to(tl.int32, bitcast=True)
+    # Round-to-nearest-even then truncate lower 16 bits
+    normed_rounded = normed_u32 + 0x7FFF + ((normed_u32 >> 16) & 1)
+    quant_bf16_u32 = (normed_rounded >> 16) << 16
+    quant_input = quant_bf16_u32.to(tl.float32, bitcast=True)
+
     quant_2d = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK))
     abs_2d = tl.abs(quant_2d)
     block_absmax = tl.max(abs_2d, axis=1)  # [N_QUANT_BLOCKS] fp32
@@ -169,8 +175,30 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
     x_scaled = quant_2d * inv_scales_col
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+
+    # Manual FP8 e4m3fn encode via fp16 bit manipulation (SM70 compatible)
+    x_f16_bits = x_clamped.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32)
+    fp16_sign = (x_f16_bits >> 15) & 1
+    fp16_exp = (x_f16_bits >> 10) & 0x1F
+    fp16_mant = x_f16_bits & 0x3FF
+    exp_fp8 = fp16_exp - 8
+    mant_fp8 = (fp16_mant >> 7) & 0x7
+    round_bit = (fp16_mant >> 6) & 1
+    sticky = fp16_mant & 0x3F
+    do_round = round_bit & (sticky | (mant_fp8 & 1))
+    mant_fp8 = mant_fp8 + do_round
+    carry = mant_fp8 > 7
+    mant_fp8 = tl.where(carry, 0, mant_fp8)
+    exp_fp8 = tl.where(carry, exp_fp8 + 1, exp_fp8)
+    is_max_exceeded = (exp_fp8 == 15) & (mant_fp8 > 6)
+    mant_fp8 = tl.where(is_max_exceeded, 6, mant_fp8)
+    is_overflow = exp_fp8 > 15
+    exp_fp8 = tl.where(is_overflow, 15, exp_fp8)
+    mant_fp8 = tl.where(is_overflow, 6, mant_fp8)
+    is_underflow = (exp_fp8 <= 0) | (fp16_exp == 0)
+    exp_fp8 = tl.where(is_underflow, 0, exp_fp8)
+    mant_fp8 = tl.where(is_underflow, 0, mant_fp8)
+    x_uint8 = ((fp16_sign << 7) | (exp_fp8 << 3) | mant_fp8).to(tl.uint8)
     x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
 
     nope_mask = block < NOPE_HEAD_DIM
@@ -207,11 +235,14 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     new_odd = odd * cos_v + even * sin_v
     result = tl.interleave(new_even, new_odd)  # [TRITON_BLOCK_SIZE] fp32
 
-    # Store rotated rope portion as bf16 into the cache's bf16 area.
-    bf16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
+    # Store rotated rope portion as bf16 bits (uint16) into the cache's bf16 area.
+    bf16_u16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.uint16))
     rope_local = block - NOPE_HEAD_DIM
     is_rope = (block >= NOPE_HEAD_DIM) & mask
-    tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
+    # fp32 → bf16 via bit manipulation
+    result_u32 = result.to(tl.int32, bitcast=True)
+    result_bf16_bits = ((result_u32 + 0x7FFF + ((result_u32 >> 16) & 1)) >> 16).to(tl.uint16)
+    tl.store(bf16_u16_ptr + rope_local, result_bf16_bits, mask=is_rope)
 
 
 # =============================================================================
@@ -372,7 +403,12 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     )
     INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
 
-    result_bf16 = result.to(tl.bfloat16).to(tl.float32)
+    # bf16 roundtrip via bit manipulation (SM70 compatible)
+    result_u32 = result.to(tl.int32, bitcast=True)
+    result_rounded = result_u32 + 0x7FFF + ((result_u32 >> 16) & 1)
+    result_bf16_u32 = (result_rounded >> 16) << 16
+    result_bf16 = result_bf16_u32.to(tl.float32, bitcast=True)
+
     absmax = tl.max(tl.abs(result_bf16), axis=0)  # scalar
     absmax = tl.maximum(absmax, 1e-4)
     raw_scale = absmax * INV_FP8_MAX
@@ -381,8 +417,30 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
 
     x_scaled = result_bf16 * inv_scale
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+
+    # Manual FP8 e4m3fn encode via fp16 bit manipulation (SM70 compatible)
+    x_f16_bits = x_clamped.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32)
+    fp16_sign = (x_f16_bits >> 15) & 1
+    fp16_exp = (x_f16_bits >> 10) & 0x1F
+    fp16_mant = x_f16_bits & 0x3FF
+    exp_fp8 = fp16_exp - 8
+    mant_fp8 = (fp16_mant >> 7) & 0x7
+    round_bit = (fp16_mant >> 6) & 1
+    sticky = fp16_mant & 0x3F
+    do_round = round_bit & (sticky | (mant_fp8 & 1))
+    mant_fp8 = mant_fp8 + do_round
+    carry = mant_fp8 > 7
+    mant_fp8 = tl.where(carry, 0, mant_fp8)
+    exp_fp8 = tl.where(carry, exp_fp8 + 1, exp_fp8)
+    is_max_exceeded = (exp_fp8 == 15) & (mant_fp8 > 6)
+    mant_fp8 = tl.where(is_max_exceeded, 6, mant_fp8)
+    is_overflow = exp_fp8 > 15
+    exp_fp8 = tl.where(is_overflow, 15, exp_fp8)
+    mant_fp8 = tl.where(is_overflow, 6, mant_fp8)
+    is_underflow = (exp_fp8 <= 0) | (fp16_exp == 0)
+    exp_fp8 = tl.where(is_underflow, 0, exp_fp8)
+    mant_fp8 = tl.where(is_underflow, 0, mant_fp8)
+    x_uint8 = ((fp16_sign << 7) | (exp_fp8 << 3) | mant_fp8).to(tl.uint8)
 
     tl.store(fp8_ptr + block, x_uint8, mask=mask)
 
@@ -546,8 +604,13 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     new_odd = odd * cos_v + even * sin_v
 
     # bf16 roundtrip for parity with reference / Q-side kernel numerics.
-    new_even = new_even.to(tl.bfloat16).to(tl.float32)
-    new_odd = new_odd.to(tl.bfloat16).to(tl.float32)
+    # Use bit manipulation for SM70 compatibility.
+    new_even_u32 = new_even.to(tl.int32, bitcast=True)
+    new_even_rounded = new_even_u32 + 0x7FFF + ((new_even_u32 >> 16) & 1)
+    new_even = ((new_even_rounded >> 16) << 16).to(tl.float32, bitcast=True)
+    new_odd_u32 = new_odd.to(tl.int32, bitcast=True)
+    new_odd_rounded = new_odd_u32 + 0x7FFF + ((new_odd_u32 >> 16) & 1)
+    new_odd = ((new_odd_rounded >> 16) << 16).to(tl.float32, bitcast=True)
 
     # ── MXFP4 quant: tile even/odd halves into (N_BLOCKS, HALF_BLOCK) ──
     # Each MXFP4 block of QUANT_BLOCK elements = HALF_BLOCK consecutive pairs,
