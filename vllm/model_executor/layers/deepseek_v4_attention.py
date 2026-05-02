@@ -509,6 +509,10 @@ def _gather_decode_prefill_fallback_kv_(
     if slots.numel() == 0:
         return out
 
+    # Use Triton kernel for SM70 if available
+    if out.is_cuda and torch.cuda.get_device_capability(out.device)[0] == 7:
+        return _sm70_gather_kv_triton(out, k_cache, slots, lens, block_size)
+
     offsets = torch.arange(topk, device=slots.device, dtype=torch.int32)
     valid = (offsets.unsqueeze(0) < lens.unsqueeze(1)) & (slots >= 0)
     if not valid.any():
@@ -544,6 +548,120 @@ def _gather_decode_prefill_fallback_kv_(
     rope_values = token_bytes[..., _QK_NOPE_DIM:].contiguous().view(torch.bfloat16)
     out[..., _QK_NOPE_DIM:] = rope_values.to(out.dtype)
     out[~valid] = 0
+    return out
+
+
+@triton.jit
+def _sm70_gather_kv_kernel(
+    # out: [num_reqs, topk, head_dim] fp16
+    out_ptr,
+    # k_cache: [num_blocks, block_bytes] uint8
+    k_cache_ptr,
+    # slots: [num_reqs, topk] int32 (global slot indices)
+    slots_ptr,
+    # lens: [num_reqs] int32
+    lens_ptr,
+    # Params
+    topk: tl.constexpr,
+    block_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    quant_block: tl.constexpr,
+    token_data_bytes: tl.constexpr,
+    scale_bytes: tl.constexpr,
+    block_stride: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+):
+    """Gather and dequantize KV entries from paged FP8 cache.
+
+    One program per (req, slot). Reads FP8 + scales from cache,
+    dequantizes to fp16, writes to output.
+    """
+    pid = tl.program_id(0)
+    req_idx = pid // topk
+    slot_local = pid % topk
+
+    # Check validity
+    length = tl.load(lens_ptr + req_idx)
+    if slot_local >= length:
+        return
+
+    slot_val = tl.load(slots_ptr + req_idx * topk + slot_local)
+    if slot_val < 0:
+        return
+
+    block_idx = slot_val // block_size
+    pos_in_block = slot_val % block_size
+
+    cache_base = k_cache_ptr + block_idx.to(tl.int64) * block_stride
+    token_data_ptr = cache_base + pos_in_block * token_data_bytes
+    token_scale_ptr = cache_base + block_size * token_data_bytes + pos_in_block * scale_bytes
+
+    out_base = out_ptr + (req_idx * topk + slot_local) * head_dim
+
+    # Dequantize FP8 nope part (448 bytes → 448 fp16)
+    for qb in range(nope_dim // quant_block):
+        qb_offsets = qb * quant_block + tl.arange(0, 64)
+        qb_mask = qb_offsets < nope_dim
+
+        # Load FP8 bytes
+        fp8_bytes = tl.load(token_data_ptr + qb_offsets, mask=qb_mask, other=0)
+
+        # Load and decode UE8M0 scale
+        encoded_scale = tl.load(token_scale_ptr + qb).to(tl.float32)
+        scale = tl.exp2(encoded_scale - 127.0)
+
+        # Dequant fp8 e4m3fn → float using bit manipulation
+        u = fp8_bytes.to(tl.uint16)
+        sign = ((u >> 7) & 1).to(tl.float32)
+        exp = ((u >> 3) & 0xF).to(tl.int32)
+        mant = (u & 0x7).to(tl.float32)
+        normal = tl.exp2((exp - 7).to(tl.float32)) * (1.0 + mant / 8.0)
+        denorm_scale = tl.exp2(tl.full([64], -6.0, dtype=tl.float32))
+        denorm = denorm_scale * (mant / 8.0)
+        val = tl.where(exp > 0, normal, denorm)
+        val = tl.where(sign > 0.5, -val, val)
+        val = tl.where((u == 0) | (u == 128), 0.0, val)
+        val = val * scale
+
+        tl.store(out_base + qb_offsets, val.to(tl.float16), mask=qb_mask)
+
+    # Load BF16 rope part (128 bytes → 64 bf16 → fp16)
+    rope_ptr = (token_data_ptr + nope_dim).to(tl.pointer_type(tl.bfloat16))
+    rope_offsets = tl.arange(0, 64)
+    rope_mask = rope_offsets < rope_dim
+    rope_vals = tl.load(rope_ptr + rope_offsets, mask=rope_mask, other=0.0)
+    tl.store(out_base + nope_dim + rope_offsets, rope_vals.to(tl.float16), mask=rope_mask)
+
+
+def _sm70_gather_kv_triton(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    slots: torch.Tensor,
+    lens: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """SM70 Triton kernel for gathering and dequantizing KV from paged cache."""
+    num_reqs = slots.shape[0]
+    topk = slots.shape[1]
+    head_dim = out.shape[2]
+    block_stride = k_cache.shape[1]
+
+    grid = (num_reqs * topk,)
+    _sm70_gather_kv_kernel[grid](
+        out, k_cache, slots, lens,
+        topk=topk,
+        block_size=block_size,
+        head_dim=head_dim,
+        nope_dim=_QK_NOPE_DIM,
+        rope_dim=_QK_ROPE_DIM,
+        quant_block=_QK_QUANT_BLOCK,
+        token_data_bytes=_QK_TOKEN_DATA_BYTES,
+        scale_bytes=_QK_SCALE_BYTES,
+        block_stride=block_stride,
+        NOPE_BLOCK=128,
+    )
     return out
 
 
