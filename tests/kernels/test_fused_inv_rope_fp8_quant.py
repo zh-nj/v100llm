@@ -405,6 +405,52 @@ def test_per_group_contiguity(num_tokens):
 
 
 @torch.inference_mode()
+def test_sm70_fallback_matches_reference():
+    """SM70 cannot compile Triton fp8e4nv; use the torch fallback."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for fused_inv_rope_fp8_quant")
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 fallback coverage")
+
+    num_tokens = 3
+    num_heads = 8
+    n_groups = 2
+    heads_per_group = num_heads // n_groups
+    max_pos = 256
+    device = "cuda"
+    torch.manual_seed(0)
+
+    o = torch.randn(
+        num_tokens, num_heads, HEAD_DIM, device=device, dtype=torch.float16
+    )
+    positions = torch.randint(
+        0, max_pos, (num_tokens,), device=device, dtype=torch.long
+    )
+    cos_sin_cache = make_cos_sin_cache(max_pos, device=device)
+
+    ref_fp8, ref_scale = reference_inv_rope_fp8_quant(
+        o.clone(),
+        positions,
+        cos_sin_cache,
+        n_groups,
+        heads_per_group,
+    )
+    fused_fp8, fused_scale = fused_inv_rope_fp8_quant(
+        o.clone(),
+        positions,
+        cos_sin_cache,
+        n_groups,
+        heads_per_group,
+    )
+
+    assert fused_fp8.shape == ref_fp8.shape
+    assert fused_fp8.dtype == ref_fp8.dtype
+    assert fused_fp8.stride() == ref_fp8.stride()
+    assert torch.equal(fused_scale, ref_scale)
+    assert_dequant_close(ref_fp8, ref_scale, fused_fp8, fused_scale)
+
+
+@torch.inference_mode()
 def test_scales_are_power_of_two():
     """Verify all scales are exact powers of 2 (UE8M0 property)."""
     num_tokens, num_heads, n_groups = 32, 64, 8

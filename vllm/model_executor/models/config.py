@@ -69,6 +69,16 @@ class Gemma4Config(VerifyAndUpdateConfig):
 
 class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        cache_config = vllm_config.cache_config
+        cache_dtype = cache_config.cache_dtype
+        if cache_dtype == "auto" or (
+            cache_dtype.startswith("fp8") and cache_dtype != "fp8_ds_mla"
+        ):
+            cache_config.cache_dtype = "fp8_ds_mla"
+            logger.info("Using DeepSeek V4 fp8_ds_mla KV cache format.")
+
+    @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
         if quant_config is not None and quant_config.get("quant_method") == "fp8":

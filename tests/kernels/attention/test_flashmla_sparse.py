@@ -120,3 +120,110 @@ def test_sparse_flashmla_prefill_smoke():
     assert out.shape == (s_q, h_q, d_v)
     assert max_logits.shape == (s_q, h_q)
     assert lse.shape == (s_q, h_q)
+
+
+def test_sparse_flashmla_prefill_matches_torch_reference():
+    import vllm.v1.attention.ops.flashmla as fm
+
+    ok, reason = fm.is_flashmla_sparse_supported()
+    if not ok:
+        pytest.skip(reason)
+
+    device = torch.device("cuda")
+    s_q = 1
+    h_q = 64
+    d = 512
+    topk = 128
+    sm_scale = 0.25
+
+    q = torch.zeros((s_q, h_q, d), dtype=torch.bfloat16, device=device)
+    q[:, :, 0] = 2.0
+    q[:, :, 1] = -1.0
+
+    kv = torch.zeros((3, 1, d), dtype=torch.bfloat16, device=device)
+    kv[0, 0, 0] = 1.0
+    kv[0, 0, 2] = 10.0
+    kv[1, 0, 1] = -2.0
+    kv[1, 0, 2] = -4.0
+    kv[2, 0, 0] = -3.0
+    kv[2, 0, 2] = 7.0
+
+    indices = torch.full((s_q, 1, topk), -1, dtype=torch.int32, device=device)
+    indices[0, 0, :3] = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    topk_length = torch.tensor([3], dtype=torch.int32, device=device)
+
+    out, max_logits, lse = fm.flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d,
+        topk_length=topk_length,
+    )
+
+    q_ref = q.float()
+    kv_ref = kv[:, 0, :].float()
+    scores = torch.einsum("shd,kd->shk", q_ref, kv_ref) * sm_scale
+    weights = torch.softmax(scores, dim=-1)
+    expected = torch.einsum("shk,kd->shd", weights, kv_ref).to(out.dtype)
+    expected_max = scores.max(dim=-1).values
+    expected_lse = torch.logsumexp(scores, dim=-1)
+
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(max_logits, expected_max, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(lse, expected_lse, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("magnitude", [448.0, 1024.0])
+def test_sparse_flashmla_prefill_matches_reference_for_large_values(
+    magnitude: float,
+):
+    import vllm.v1.attention.ops.flashmla as fm
+
+    ok, reason = fm.is_flashmla_sparse_supported()
+    if not ok:
+        pytest.skip(reason)
+
+    device = torch.device("cuda")
+    s_q = 1
+    h_q = 64
+    d = 512
+    topk = 128
+    sm_scale = d**-0.5
+
+    q = torch.zeros((s_q, h_q, d), dtype=torch.bfloat16, device=device)
+    q[:, :, 0] = magnitude
+    q[:, :, 1] = -magnitude / 2
+
+    kv = torch.zeros((3, 1, d), dtype=torch.bfloat16, device=device)
+    kv[0, 0, 0] = magnitude
+    kv[0, 0, 2] = magnitude
+    kv[1, 0, 1] = -magnitude
+    kv[1, 0, 2] = -magnitude
+    kv[2, 0, 0] = -magnitude
+    kv[2, 0, 2] = magnitude / 2
+
+    indices = torch.full((s_q, 1, topk), -1, dtype=torch.int32, device=device)
+    indices[0, 0, :3] = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    topk_length = torch.tensor([3], dtype=torch.int32, device=device)
+
+    out, max_logits, lse = fm.flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d,
+        topk_length=topk_length,
+    )
+
+    q_ref = q.float()
+    kv_ref = kv[:, 0, :].float()
+    scores = torch.einsum("shd,kd->shk", q_ref, kv_ref) * sm_scale
+    weights = torch.softmax(scores, dim=-1)
+    expected = torch.einsum("shk,kd->shd", weights, kv_ref).to(out.dtype)
+    expected_max = scores.max(dim=-1).values
+    expected_lse = torch.logsumexp(scores, dim=-1)
+
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(max_logits, expected_max, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(lse, expected_lse, rtol=1e-4, atol=1e-4)

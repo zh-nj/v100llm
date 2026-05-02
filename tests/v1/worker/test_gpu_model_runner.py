@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -171,6 +173,84 @@ def _is_sampling_metadata_changed(
     model_runner, sampling_metadata_before: SamplingMetadata
 ):
     return model_runner.input_batch.sampling_metadata is not (sampling_metadata_before)
+
+
+def test_build_attention_metadata_passes_seq_lens_cpu_upper_bound():
+    class FakeBlockTable:
+        def __init__(self, tensor: torch.Tensor) -> None:
+            self.tensor = tensor
+
+        def get_device_tensor(self, num_reqs: int) -> torch.Tensor:
+            return self.tensor[:num_reqs]
+
+    class RecordingBuilder:
+        supports_update_block_table = False
+
+        def __init__(self) -> None:
+            self.common_attn_metadata = None
+
+        def build(self, common_prefix_len, common_attn_metadata, **kwargs):
+            self.common_attn_metadata = common_attn_metadata
+            return object()
+
+    builder = RecordingBuilder()
+    kv_cache_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.float16,
+    )
+    runner = object.__new__(GPUModelRunner)
+    runner.kv_cache_config = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["layer.0"], kv_cache_spec=kv_cache_spec)
+        ],
+    )
+    runner.attn_groups = [
+        [
+            SimpleNamespace(
+                layer_names=["layer.0"],
+                get_metadata_builder=lambda ubid=0: builder,
+            )
+        ]
+    ]
+    runner.input_batch = SimpleNamespace(
+        block_table=[FakeBlockTable(torch.tensor([[0], [1]], dtype=torch.int32))],
+        num_computed_tokens_cpu_tensor=torch.tensor([0, 2], dtype=torch.int32),
+        num_prompt_tokens_cpu_tensor=torch.tensor([3, 4], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([3, 5], dtype=torch.int32),
+    )
+    runner.query_start_loc = SimpleNamespace(
+        gpu=torch.tensor([0, 2, 3], dtype=torch.int32),
+        cpu=torch.tensor([0, 2, 3], dtype=torch.int32),
+    )
+    runner.seq_lens = torch.tensor([3, 5], dtype=torch.int32)
+    runner.optimistic_seq_lens_cpu = torch.tensor([3, 5], dtype=torch.int32)
+    runner.positions = torch.tensor([0, 1, 2], dtype=torch.int64)
+    runner.max_model_len = 16
+    runner.routed_experts_initialized = False
+    runner.use_async_spec_decode = False
+    runner.dcp_world_size = 1
+    runner.cache_config = SimpleNamespace(kv_sharing_fast_prefill=False)
+    runner.speculative_config = None
+    runner.is_mm_prefix_lm = False
+    runner._get_encoder_seq_lens = lambda *args, **kwargs: (None, None)
+
+    GPUModelRunner._build_attention_metadata(
+        runner,
+        num_tokens=3,
+        num_reqs=2,
+        max_query_len=2,
+        slot_mappings={0: torch.arange(3, dtype=torch.int64)},
+    )
+
+    assert builder.common_attn_metadata is not None
+    torch.testing.assert_close(
+        builder.common_attn_metadata.seq_lens_cpu_upper_bound,
+        runner.input_batch.seq_lens_cpu_upper_bound,
+    )
 
 
 def _is_req_state_block_table_match(model_runner, req_id: str) -> bool:

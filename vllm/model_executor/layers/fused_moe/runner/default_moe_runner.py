@@ -79,6 +79,7 @@ def _moe_forward(
     router_logits: torch.Tensor,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
+    input_ids: torch.Tensor | None,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     # TODO(bnell): this can be removed after MK migration is complete.
@@ -91,6 +92,7 @@ def _moe_forward(
                 hidden_states,
                 router_logits,
                 shared_experts_input,
+                input_ids,
             )
         else:
             return runner.forward_impl(
@@ -98,6 +100,7 @@ def _moe_forward(
                 hidden_states,
                 router_logits,
                 shared_experts_input,
+                input_ids,
             )
 
 
@@ -106,7 +109,9 @@ def _moe_forward_fake(
     router_logits: torch.Tensor,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
+    input_ids: torch.Tensor | None,
 ) -> torch.Tensor:
+    del router_logits, shared_experts_input, layer_name, input_ids
     return torch.empty_like(hidden_states)
 
 
@@ -115,6 +120,7 @@ def _moe_forward_shared(
     router_logits: torch.Tensor,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
+    input_ids: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     # TODO(bnell): this can be removed after MK migration is complete.
@@ -127,6 +133,7 @@ def _moe_forward_shared(
                 hidden_states,
                 router_logits,
                 shared_experts_input,
+                input_ids,
             )
         else:
             return runner.forward_impl(
@@ -134,6 +141,7 @@ def _moe_forward_shared(
                 hidden_states,
                 router_logits,
                 shared_experts_input,
+                input_ids,
             )
 
 
@@ -142,7 +150,9 @@ def _moe_forward_shared_fake(
     router_logits: torch.Tensor,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
+    input_ids: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    del router_logits, layer_name, input_ids
     # Output shapes:
     # - fused_out: same as hidden_states (routed experts use transformed size)
     # - shared_out: same as shared_experts_input if provided, else same as
@@ -480,6 +490,7 @@ class DefaultMoERunner(MoERunner):
         router_logits: torch.Tensor,
         shared_input: torch.Tensor | None,
         run_shared_experts_before: bool = True,
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         shared_input = shared_input if shared_input is not None else hidden_states
         shared_output: torch.Tensor | None = None
@@ -498,6 +509,7 @@ class DefaultMoERunner(MoERunner):
             topk_weights, topk_ids = self.router.select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
+                input_ids=input_ids,
             )
 
             result = self.quant_method.apply(
@@ -636,6 +648,7 @@ class DefaultMoERunner(MoERunner):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # For latent MoE: save ORIGINAL hidden_states before transform
         # (shared_experts need original dimension, routed experts use transformed)
@@ -657,6 +670,7 @@ class DefaultMoERunner(MoERunner):
             router_logits,
             original_hidden_states,
             self._encode_layer_name(),
+            input_ids,
         )
 
         return self._maybe_reduce_output(fused_output, og_hidden_dims)
@@ -687,6 +701,7 @@ class DefaultMoERunner(MoERunner):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # Gate overlap not supported when chunking is enabled. Run the
         # gate first.
@@ -742,12 +757,16 @@ class DefaultMoERunner(MoERunner):
                     if shared_input is not None
                     else None
                 )
+                input_ids_chunk = (
+                    input_ids[chunk_start:chunk_end] if input_ids is not None else None
+                )
 
                 shared_output_chunk, hidden_states_chunk = self._apply_quant_method(
                     layer=layer,
                     hidden_states=hidden_states_chunk,
                     router_logits=router_logits_chunk,
                     shared_input=shared_input_chunk,
+                    input_ids=input_ids_chunk,
                 )
 
                 # Store outputs
@@ -775,6 +794,7 @@ class DefaultMoERunner(MoERunner):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         self.use_shared_experts_stream = (
             current_platform.is_cuda()
@@ -818,6 +838,7 @@ class DefaultMoERunner(MoERunner):
             router_logits=router_logits,
             shared_input=shared_input,
             run_shared_experts_before=run_shared_experts_before,
+            input_ids=input_ids,
         )
 
         return self._maybe_combine(

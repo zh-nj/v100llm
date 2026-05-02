@@ -392,6 +392,19 @@ def fused_indexer_q_rope_quant(
         ), index_weights_out
 
     index_q_fp8 = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
+    if _should_use_torch_fp8_fallback(index_q):
+        _torch_indexer_q_rope_fp8_fallback(
+            positions,
+            index_q,
+            index_q_cos_sin_cache,
+            index_weights,
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+            index_q_fp8,
+            index_weights_out,
+        )
+        return index_q_fp8, index_weights_out
+
     _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
         positions,
         index_q,
@@ -413,3 +426,56 @@ def fused_indexer_q_rope_quant(
         num_warps=1,  # TODO: Tune this
     )
     return index_q_fp8, index_weights_out
+
+
+def _should_use_torch_fp8_fallback(index_q: torch.Tensor) -> bool:
+    if not index_q.is_cuda:
+        return False
+    capability = torch.cuda.get_device_capability(index_q.device)
+    return capability[0] < 8
+
+
+def _torch_indexer_q_rope_fp8_fallback(
+    positions: torch.Tensor,
+    index_q: torch.Tensor,
+    index_q_cos_sin_cache: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_weights_softmax_scale: float,
+    index_weights_head_scale: float,
+    index_q_fp8: torch.Tensor,
+    index_weights_out: torch.Tensor,
+) -> None:
+    """Torch correctness fallback for SM70, where tl.float8e4nv is unsupported."""
+    head_dim = index_q.shape[-1]
+    rope_dim = index_q_cos_sin_cache.shape[-1]
+    half_rot_dim = rope_dim // 2
+    nope_dim = head_dim - rope_dim
+    assert nope_dim >= 0
+    assert rope_dim % 2 == 0
+
+    q = index_q.float()
+    cos_sin = index_q_cos_sin_cache[positions].float()
+    cos = cos_sin[:, :half_rot_dim].view(-1, 1, half_rot_dim)
+    sin = cos_sin[:, half_rot_dim:].view(-1, 1, half_rot_dim)
+
+    q_rot = q.clone()
+    rope = q_rot[..., nope_dim:].clone()
+    even = rope[..., ::2]
+    odd = rope[..., 1::2]
+    rotated = torch.empty_like(rope)
+    rotated[..., ::2] = (even * cos - odd * sin).to(torch.bfloat16).float()
+    rotated[..., 1::2] = (odd * cos + even * sin).to(torch.bfloat16).float()
+    q_rot[..., nope_dim:] = rotated
+
+    fp8_max = torch.finfo(index_q_fp8.dtype).max
+    scales = torch.exp2(
+        torch.ceil(torch.log2(q_rot.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+                              * (1.0 / fp8_max)))
+    )
+    index_q_fp8.copy_((q_rot / scales).clamp(-fp8_max, fp8_max).to(index_q_fp8.dtype))
+    index_weights_out.copy_(
+        index_weights.float()
+        * scales.squeeze(-1)
+        * index_weights_softmax_scale
+        * index_weights_head_scale
+    )

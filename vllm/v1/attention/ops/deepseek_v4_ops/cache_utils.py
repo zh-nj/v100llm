@@ -19,6 +19,143 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+def _should_use_torch_fp8_cache_fallback(k_cache: torch.Tensor) -> bool:
+    if not k_cache.is_cuda:
+        return False
+    capability = torch.cuda.get_device_capability(k_cache.device)
+    return capability[0] < 8
+
+
+def _torch_dequantize_and_gather_k_cache(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+) -> None:
+    token_fp8_dim = 448
+    token_bf16_dim = 64
+    token_scale_dim = 8
+    quant_block_size = 64
+    token_data_size = token_fp8_dim + token_bf16_dim * 2
+
+    k_cache_2d = k_cache.reshape(k_cache.shape[0], -1)
+    for req_idx in range(seq_lens.shape[0]):
+        seq_len = int(seq_lens[req_idx].item())
+        gather_len = (
+            int(gather_lens[req_idx].item()) if gather_lens is not None else seq_len
+        )
+        start_pos = seq_len - gather_len
+
+        for i in range(gather_len):
+            pos = start_pos + i
+            block_in_seq = pos // block_size
+            pos_in_block = pos % block_size
+            physical_block_idx = int(block_table[req_idx, block_in_seq].item())
+
+            token_data_offset = pos_in_block * token_data_size
+            token_scale_offset = block_size * token_data_size + (
+                pos_in_block * token_scale_dim
+            )
+
+            fp8_bytes = k_cache_2d[
+                physical_block_idx,
+                token_data_offset : token_data_offset + token_fp8_dim,
+            ].contiguous()
+            fp8_vals = fp8_bytes.view(torch.float8_e4m3fn).to(torch.float32)
+            encoded_scales = k_cache_2d[
+                physical_block_idx,
+                token_scale_offset : token_scale_offset + 7,
+            ].to(torch.float32)
+            scales = torch.exp2(encoded_scales - 127.0).repeat_interleave(
+                quant_block_size
+            )
+            out[req_idx, offset + i, :token_fp8_dim] = (fp8_vals * scales).to(
+                out.dtype
+            )
+
+            bf16_bytes = k_cache_2d[
+                physical_block_idx,
+                token_data_offset
+                + token_fp8_dim : token_data_offset
+                + token_fp8_dim
+                + token_bf16_dim * 2,
+            ].contiguous()
+            out[req_idx, offset + i, token_fp8_dim:] = bf16_bytes.view(
+                torch.bfloat16
+            ).to(out.dtype)
+
+
+def _torch_quantize_and_insert_k_cache(
+    k: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    token_fp8_dim = 448
+    token_bf16_dim = 64
+    token_scale_dim = 8
+    quant_block_size = 64
+    fp8_max = 448.0
+    token_data_size = token_fp8_dim + token_bf16_dim * 2
+
+    k_cache_2d = k_cache.reshape(k_cache.shape[0], -1)
+    num_tokens = slot_mapping.shape[0]
+    for token_idx in range(num_tokens):
+        slot_idx = int(slot_mapping[token_idx].item())
+        if slot_idx < 0:
+            continue
+
+        block_idx = slot_idx // block_size
+        pos_in_block = slot_idx % block_size
+        token_data_offset = pos_in_block * token_data_size
+        token_scale_offset = block_size * token_data_size + (
+            pos_in_block * token_scale_dim
+        )
+
+        quant_input = k[token_idx, :token_fp8_dim].float()
+        blocks = quant_input.view(
+            token_fp8_dim // quant_block_size, quant_block_size
+        )
+        absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+        exponents = torch.ceil(torch.log2(absmax / fp8_max))
+        scales = torch.exp2(exponents)
+        fp8_bytes = (
+            (blocks / scales)
+            .clamp(-fp8_max, fp8_max)
+            .to(torch.float8_e4m3fn)
+            .contiguous()
+            .view(torch.uint8)
+            .view(-1)
+        )
+        rope_bytes = (
+            k[token_idx, token_fp8_dim:]
+            .to(torch.bfloat16)
+            .contiguous()
+            .view(torch.uint8)
+            .view(-1)
+        )
+        token_data = torch.cat((fp8_bytes, rope_bytes))
+        k_cache_2d[
+            block_idx,
+            token_data_offset:token_data_offset + token_data.shape[0],
+        ] = token_data
+
+        encoded_scales = (exponents.flatten() + 127.0).clamp(0, 255).to(
+            torch.uint8
+        )
+        scale_data = torch.zeros(
+            token_scale_dim, dtype=torch.uint8, device=k_cache.device
+        )
+        scale_data[:encoded_scales.shape[0]] = encoded_scales
+        k_cache_2d[
+            block_idx,
+            token_scale_offset:token_scale_offset + token_scale_dim,
+        ] = scale_data
+
+
 @triton.jit
 def quantize_and_insert_k_kernel(
     # Input tensors
@@ -175,6 +312,10 @@ def quantize_and_insert_k_cache(
 
     grid = (num_tokens,)
 
+    if _should_use_torch_fp8_cache_fallback(k_cache):
+        _torch_quantize_and_insert_k_cache(k, k_cache, slot_mapping, block_size)
+        return
+
     quantize_and_insert_k_kernel[grid](
         k,
         slot_mapping,
@@ -323,6 +464,18 @@ def dequantize_and_gather_k_cache(
     QUANT_BLOCK_SIZE = 64
     FP8_MAX = 448.0
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
+
+    if _should_use_torch_fp8_cache_fallback(k_cache):
+        _torch_dequantize_and_gather_k_cache(
+            out,
+            k_cache,
+            seq_lens,
+            gather_lens,
+            block_table,
+            block_size,
+            offset,
+        )
+        return
 
     num_reqs = seq_lens.shape[0]
     NUM_WORKERS = 128

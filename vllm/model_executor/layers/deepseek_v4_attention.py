@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -51,6 +52,7 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
 )
+from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
@@ -68,7 +70,10 @@ from vllm.v1.attention.ops.flashmla import (
     flash_mla_with_kvcache,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
-from vllm.v1.worker.workspace import current_workspace_manager
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 logger = init_logger(__name__)
 
@@ -76,6 +81,359 @@ logger = init_logger(__name__)
 # workspace allocated at _forward_prefill (and the matching profile-time
 # reservation in attention_impl's dummy-run branch).
 PREFILL_CHUNK_SIZE = 4
+_QK_NOPE_DIM = 448
+_QK_ROPE_DIM = 64
+_QK_FP8_MAX = 448.0
+_QK_QUANT_BLOCK = 64
+_QK_TOKEN_DATA_BYTES = _QK_NOPE_DIM + _QK_ROPE_DIM * 2
+_QK_SCALE_BYTES = 8
+_SM70_FP16_ATTENTION_OUTPUT_MAX = float(torch.finfo(torch.float16).max)
+
+
+def _trace_nonfinite_tensor(label: str, tensor: torch.Tensor) -> None:
+    if os.getenv("VLLM_DEEPSEEK_V4_NAN_TRACE", "0") != "1":
+        return
+    if not torch.is_floating_point(tensor):
+        return
+    if torch.isfinite(tensor).all():
+        return
+    finite = torch.isfinite(tensor)
+    finite_values = tensor[finite]
+    if finite_values.numel() == 0:
+        min_value = max_value = float("nan")
+    else:
+        stats = finite_values.float()
+        min_value = float(stats.min().item())
+        max_value = float(stats.max().item())
+    logger.error(
+        "DeepSeek V4 attention nonfinite tensor at %s: shape=%s dtype=%s "
+        "nan=%d inf=%d finite_min=%s finite_max=%s",
+        label,
+        tuple(tensor.shape),
+        tensor.dtype,
+        int(torch.isnan(tensor).sum().item()),
+        int(torch.isinf(tensor).sum().item()),
+        min_value,
+        max_value,
+    )
+
+
+def _trace_tensor_summary(label: str, tensor: torch.Tensor) -> None:
+    if os.getenv("VLLM_DEEPSEEK_V4_NAN_TRACE", "0") != "1":
+        return
+    if tensor.numel() == 0:
+        logger.error(
+            "DeepSeek V4 trace tensor at %s: shape=%s dtype=%s empty",
+            label,
+            tuple(tensor.shape),
+            tensor.dtype,
+        )
+        return
+    flat = tensor
+    if not torch.is_floating_point(flat):
+        flat = flat.to(torch.float32)
+    finite = torch.isfinite(flat)
+    finite_values = flat[finite]
+    if finite_values.numel() == 0:
+        min_value = max_value = float("nan")
+    else:
+        stats = finite_values.float()
+        min_value = float(stats.min().item())
+        max_value = float(stats.max().item())
+    logger.error(
+        "DeepSeek V4 trace tensor at %s: shape=%s dtype=%s "
+        "nan=%d inf=%d finite_min=%s finite_max=%s",
+        label,
+        tuple(tensor.shape),
+        tensor.dtype,
+        int(torch.isnan(flat).sum().item()),
+        int(torch.isinf(flat).sum().item()),
+        min_value,
+        max_value,
+    )
+
+
+def _trace_layer16_summary(prefix: str, label: str, tensor: torch.Tensor) -> None:
+    if prefix.endswith("layers.16.attn"):
+        _trace_tensor_summary(f"{prefix}.{label}", tensor)
+
+
+def _should_use_qnorm_rope_kv_insert_fallback(q: torch.Tensor) -> bool:
+    if not q.is_cuda:
+        return False
+    capability = torch.cuda.get_device_capability(q.device)
+    return capability[0] < 8
+
+
+def _normalize_flashmla_sm70_prefill_kv_(kv: torch.Tensor) -> torch.Tensor:
+    return kv
+
+
+def _normalize_sm70_fp8_cache_exponents(exponents: torch.Tensor) -> torch.Tensor:
+    return exponents
+
+
+def _should_clamp_sm70_fp16_attention_output(out: torch.Tensor) -> bool:
+    if not out.is_cuda or out.dtype != torch.float16:
+        return False
+    capability = torch.cuda.get_device_capability(out.device)
+    return capability[0] < 8
+
+
+def _clamp_sm70_fp16_attention_output_(out: torch.Tensor) -> torch.Tensor:
+    return out.clamp_(
+        min=-_SM70_FP16_ATTENTION_OUTPUT_MAX,
+        max=_SM70_FP16_ATTENTION_OUTPUT_MAX,
+    )
+
+
+def _should_use_sm70_decode_prefill_fallback(
+    q: torch.Tensor,
+    swa_only: bool,
+) -> bool:
+    if not q.is_cuda:
+        return False
+    capability = torch.cuda.get_device_capability(q.device)
+    return capability[0] < 8
+
+
+def _get_decode_prefill_fallback_workspace(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    if is_workspace_manager_initialized():
+        return current_workspace_manager().get_simultaneous((shape, dtype))[0]
+    return torch.empty(shape, dtype=dtype, device=device)
+
+
+def _decode_prefill_fallback_slots(
+    global_indices: torch.Tensor,
+) -> torch.Tensor:
+    if global_indices.ndim == 3:
+        assert global_indices.shape[1] == 1
+        return global_indices[:, 0, :]
+    if global_indices.ndim == 2:
+        return global_indices
+    raise ValueError(
+        "Decode fallback indices must have shape [tokens, topk] or "
+        f"[tokens, 1, topk], got {tuple(global_indices.shape)}"
+    )
+
+
+def _build_decode_prefill_fallback_indices(
+    global_indices: torch.Tensor,
+    global_lens: torch.Tensor,
+    *,
+    row_stride: int | None = None,
+    offset: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    slots = _decode_prefill_fallback_slots(global_indices)
+    local_lens = global_lens.reshape(-1)
+    topk = slots.shape[-1]
+    if row_stride is None:
+        row_stride = topk
+
+    offsets = torch.arange(topk, device=slots.device, dtype=torch.int32)
+    bases = (
+        torch.arange(slots.shape[0], device=slots.device, dtype=torch.int32)
+        .unsqueeze(1)
+        .mul_(row_stride)
+        .add_(offset)
+    )
+    valid = (offsets.unsqueeze(0) < local_lens.unsqueeze(1)) & (slots >= 0)
+    local_indices = torch.where(
+        valid,
+        bases + offsets.unsqueeze(0),
+        torch.full_like(slots, -1),
+    )
+    return local_indices.unsqueeze(1), local_lens
+
+
+def _gather_decode_prefill_fallback_kv_(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    global_indices: torch.Tensor,
+    global_lens: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    slots = _decode_prefill_fallback_slots(global_indices)
+    lens = global_lens.reshape(-1)
+    topk = slots.shape[-1]
+    if out.shape[0] != slots.shape[0] or out.shape[1] != topk:
+        raise ValueError(
+            "Decode fallback KV workspace shape must match indices, got "
+            f"out={tuple(out.shape)} indices={tuple(global_indices.shape)}"
+        )
+
+    out.zero_()
+    if slots.numel() == 0:
+        return out
+
+    offsets = torch.arange(topk, device=slots.device, dtype=torch.int32)
+    valid = (offsets.unsqueeze(0) < lens.unsqueeze(1)) & (slots >= 0)
+    if not valid.any():
+        return out
+
+    safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
+    block_indices = torch.div(
+        safe_slots, block_size, rounding_mode="floor"
+    ).to(torch.long)
+    pos_in_block = (safe_slots % block_size).to(torch.long)
+
+    k_cache_2d = k_cache.reshape(k_cache.shape[0], -1)
+    token_offsets = (
+        pos_in_block.unsqueeze(-1) * _QK_TOKEN_DATA_BYTES
+        + torch.arange(_QK_TOKEN_DATA_BYTES, device=k_cache.device)
+    )
+    token_bytes = k_cache_2d[block_indices.unsqueeze(-1), token_offsets]
+
+    fp8_values = token_bytes[..., :_QK_NOPE_DIM].contiguous().view(
+        torch.float8_e4m3fn
+    )
+    scale_offsets = (
+        block_size * _QK_TOKEN_DATA_BYTES
+        + pos_in_block.unsqueeze(-1) * _QK_SCALE_BYTES
+        + torch.arange(_QK_NOPE_DIM // _QK_QUANT_BLOCK, device=k_cache.device)
+    )
+    scales = torch.exp2(
+        k_cache_2d[block_indices.unsqueeze(-1), scale_offsets].to(torch.float32)
+        - 127.0
+    ).repeat_interleave(_QK_QUANT_BLOCK, dim=-1)
+    out[..., :_QK_NOPE_DIM] = (fp8_values.float() * scales).to(out.dtype)
+
+    rope_values = token_bytes[..., _QK_NOPE_DIM:].contiguous().view(torch.bfloat16)
+    out[..., _QK_NOPE_DIM:] = rope_values.to(out.dtype)
+    out[~valid] = 0
+    return out
+
+
+def _apply_gptj_rope_tail(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+) -> torch.Tensor:
+    rope_dim = cos_sin_cache.shape[-1]
+    half = rope_dim // 2
+    nope_dim = x.shape[-1] - rope_dim
+    assert nope_dim >= 0
+
+    out = x.clone().float()
+    rope = out[..., nope_dim:]
+    even = rope[..., ::2]
+    odd = rope[..., 1::2]
+
+    cos_sin = cos_sin_cache[positions].float()
+    view_shape = (positions.shape[0],) + (1,) * (x.ndim - 2) + (half,)
+    cos = cos_sin[..., :half].view(view_shape)
+    sin = cos_sin[..., half:].view(view_shape)
+
+    rotated = torch.empty_like(rope)
+    rotated[..., ::2] = even * cos - odd * sin
+    rotated[..., 1::2] = odd * cos + even * sin
+    out[..., nope_dim:] = rotated
+    return out.to(x.dtype)
+
+
+def _torch_qnorm_rope_kv_insert_fallback(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    block_size: int,
+) -> None:
+    """Torch correctness fallback for SM70, where the fused CUDA op is sm80+."""
+    q_float = q.float()
+    variance = q_float.pow(2).mean(dim=-1, keepdim=True)
+    q_norm = (q_float * torch.rsqrt(variance + eps)).to(q.dtype)
+    q.copy_(_apply_gptj_rope_tail(q_norm, positions, cos_sin_cache))
+
+    num_tokens = slot_mapping.shape[0]
+    if num_tokens == 0:
+        return
+
+    kv_rope = _apply_gptj_rope_tail(
+        kv[:num_tokens],
+        positions[:num_tokens],
+        cos_sin_cache,
+    )
+    valid_mask = slot_mapping >= 0
+    if not valid_mask.any():
+        return
+
+    kv_valid = kv_rope[valid_mask]
+    slots = slot_mapping[valid_mask]
+    block_indices = slots // block_size
+    pos_in_block = slots % block_size
+
+    nope = kv_valid[:, :_QK_NOPE_DIM].float()
+    blocks = nope.view(-1, _QK_NOPE_DIM // _QK_QUANT_BLOCK, _QK_QUANT_BLOCK)
+    absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+    exponents = _normalize_sm70_fp8_cache_exponents(
+        torch.ceil(torch.log2(absmax / _QK_FP8_MAX))
+    )
+    scales = torch.exp2(exponents)
+    fp8_data = (blocks / scales).clamp(-_QK_FP8_MAX, _QK_FP8_MAX)
+    fp8_bytes = (
+        fp8_data.to(torch.float8_e4m3fn)
+        .contiguous()
+        .view(torch.uint8)
+        .view(-1, _QK_NOPE_DIM)
+    )
+    rope_bytes = (
+        kv_valid[:, _QK_NOPE_DIM:]
+        .to(torch.bfloat16)
+        .contiguous()
+        .view(torch.uint8)
+        .view(-1, _QK_ROPE_DIM * 2)
+    )
+    token_data = torch.cat((fp8_bytes, rope_bytes), dim=-1)
+
+    num_valid = slots.shape[0]
+    data_offsets = (
+        pos_in_block[:, None] * _QK_TOKEN_DATA_BYTES
+        + torch.arange(_QK_TOKEN_DATA_BYTES, device=k_cache.device)
+    )
+    k_cache[block_indices[:, None], data_offsets] = token_data
+
+    encoded_scales = (exponents.squeeze(-1) + 127.0).clamp(0, 255).to(torch.uint8)
+    scale_data = torch.zeros(
+        num_valid,
+        _QK_SCALE_BYTES,
+        dtype=torch.uint8,
+        device=k_cache.device,
+    )
+    scale_data[:, : _QK_NOPE_DIM // _QK_QUANT_BLOCK] = encoded_scales
+    scale_offsets = (
+        block_size * _QK_TOKEN_DATA_BYTES
+        + pos_in_block[:, None] * _QK_SCALE_BYTES
+        + torch.arange(_QK_SCALE_BYTES, device=k_cache.device)
+    )
+    k_cache[block_indices[:, None], scale_offsets] = scale_data
+
+
+def _flashmla_bf16_io(
+    q: torch.Tensor,
+    output: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    flash_q = q if q.dtype is torch.bfloat16 else q.to(torch.bfloat16)
+    flash_output = (
+        output
+        if output.dtype is torch.bfloat16
+        else torch.empty_like(output, dtype=torch.bfloat16)
+    )
+    return flash_q, flash_output
+
+
+def _copy_flashmla_output(
+    flash_output: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    if flash_output.data_ptr() != output.data_ptr() or flash_output.dtype != output.dtype:
+        output.copy_(flash_output.to(output.dtype))
 
 
 @dataclass
@@ -277,8 +635,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        _trace_nonfinite_tensor(f"{self.prefix}.wrapper.input", hidden_states)
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        _trace_nonfinite_tensor(f"{self.prefix}.wrapper.qr", qr)
+        _trace_nonfinite_tensor(f"{self.prefix}.wrapper.kv", kv)
 
         # Pre-allocate attention output with FlashMLA-padded head count.
         # The op writes into `o_padded`; we slice to n_local_heads after.
@@ -298,7 +659,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             o_padded,
             self.layer_name,
         )
+        _trace_nonfinite_tensor(f"{self.prefix}.wrapper.o_padded", o_padded)
         o = o_padded[:, : self.n_local_heads, :]
+        _trace_nonfinite_tensor(f"{self.prefix}.wrapper.o", o)
+        _trace_layer16_summary(self.prefix, "wrapper.o", o)
 
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
         o_fp8, o_scale = fused_inv_rope_fp8_quant(
@@ -311,6 +675,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             rope_dim=self.rope_head_dim,
             tma_aligned_scales=self._tma_aligned_scales,
         )
+        _trace_nonfinite_tensor(f"{self.prefix}.wrapper.o_scale", o_scale)
+        _trace_layer16_summary(self.prefix, "wrapper.o_scale", o_scale)
 
         wo_a_fp8 = self.wo_a.weight
         wo_a_scale = self.wo_a.weight_scale_inv
@@ -318,7 +684,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         z = torch.empty(
             (num_tokens, self.n_local_groups, self.o_lora_rank),
             device=o.device,
-            dtype=torch.bfloat16,
+            dtype=hidden_states.dtype,
         )
         torch.ops.vllm.deepseek_v4_fp8_einsum(
             o_fp8,
@@ -329,8 +695,17 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             "bhr,hdr->bhd",
             list(self._einsum_recipe),
         )
+        _trace_nonfinite_tensor(f"{self.prefix}.wrapper.z", z)
+        _trace_layer16_summary(self.prefix, "wrapper.z", z)
 
-        return self.wo_b(z.flatten(1))
+        out = self.wo_b(z.flatten(1))
+        if isinstance(out, tuple):
+            out = out[0]
+        if _should_clamp_sm70_fp16_attention_output(out):
+            _clamp_sm70_fp16_attention_output_(out)
+        _trace_nonfinite_tensor(f"{self.prefix}.wrapper.wo_b", out)
+        _trace_layer16_summary(self.prefix, "wrapper.wo_b", out)
+        return out
 
     def attention_impl(
         self,
@@ -350,7 +725,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.kv_norm.weight.data,
             self.eps,
         )
+        _trace_nonfinite_tensor(f"{self.prefix}.impl.qr_norm", qr)
+        _trace_nonfinite_tensor(f"{self.prefix}.impl.kv_norm", kv)
         q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+        _trace_nonfinite_tensor(f"{self.prefix}.impl.q_proj", q)
 
         # Overlap kv_insert with whichever of indexer/compressor is present.
         # Indexer implies compressor; when both exist, compressor rides on the
@@ -387,6 +765,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         else:
             # SWA-only layer: no compressor, no overlap.
             self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+        _trace_nonfinite_tensor(f"{self.prefix}.impl.q_after_insert", q)
 
         # Handle dummy run (no metadata).
         if not isinstance(attn_metadata, dict):
@@ -415,6 +794,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
         self.mla_attn(q, kv, positions, output=out)
+        _trace_nonfinite_tensor(f"{self.prefix}.impl.mla_out", out)
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -441,6 +821,19 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE
         #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
         # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
+        if _should_use_qnorm_rope_kv_insert_fallback(q):
+            _torch_qnorm_rope_kv_insert_fallback(
+                q,
+                kv,
+                swa_kv_cache_2d,
+                swa_metadata.slot_mapping,
+                positions.to(torch.int64),
+                self.rotary_emb.cos_sin_cache,
+                self.eps,
+                swa_metadata.block_size,
+            )
+            return
+
         torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             q,
             kv,
@@ -494,7 +887,48 @@ def deepseek_v4_fp8_einsum(
     equation: str,
     recipe: list[int],
 ) -> None:
+    if _should_use_torch_fp8_einsum_fallback(a):
+        _deepseek_v4_fp8_einsum_torch_fallback(a, a_scale, b, b_scale, out, equation)
+        return
     fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
+
+
+def _should_use_torch_fp8_einsum_fallback(a: torch.Tensor) -> bool:
+    if not has_deep_gemm():
+        return True
+    if not a.is_cuda:
+        return False
+    return torch.cuda.get_device_capability(a.device)[0] < 8
+
+
+def _deepseek_v4_fp8_einsum_torch_fallback(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+    equation: str,
+) -> None:
+    if equation != "bhr,hdr->bhd":
+        raise RuntimeError(
+            "DeepSeek V4 torch fp8 einsum fallback only supports "
+            f"'bhr,hdr->bhd', got {equation!r}."
+        )
+
+    groups = a.shape[1]
+    hidden = a.shape[2]
+    rank = b.shape[1] if b.dim() == 3 else b.shape[0] // groups
+    b_3d = b.reshape(groups, rank, hidden)
+
+    a_blocks = a_scale.shape[-1]
+    weight_scale_shape = (groups, rank // 128, hidden // 128)
+    b_scale_3d = b_scale.reshape(weight_scale_shape)
+    a_deq = a.float() * a_scale.repeat_interleave(hidden // a_blocks, dim=-1)
+    b_deq = b_3d.float() * b_scale_3d.repeat_interleave(
+        128, dim=1
+    ).repeat_interleave(128, dim=2)
+    result = torch.einsum(equation, a_deq, b_deq)
+    out.copy_(result.to(out.dtype))
 
 
 def deepseek_v4_fp8_einsum_fake(
@@ -739,10 +1173,86 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
 
+        q, flash_output = _flashmla_bf16_io(q, output)
         # We treat queries in the same seq as different queries
         # and later we only attend by generated indices.
         # q arrives pre-padded to self.padded_heads by the outer wrapper.
         q = q.unsqueeze(1)
+
+        if _should_use_sm70_decode_prefill_fallback(q, swa_only):
+            if swa_only:
+                fallback_indices, fallback_lens = (
+                    _build_decode_prefill_fallback_indices(swa_indices, swa_lens)
+                )
+                fallback_topk_length: torch.Tensor | None = fallback_lens
+                fallback_kv = _get_decode_prefill_fallback_workspace(
+                    (num_decode_tokens, fallback_indices.shape[-1], q.shape[-1]),
+                    torch.bfloat16,
+                    q.device,
+                )
+                _gather_decode_prefill_fallback_kv_(
+                    fallback_kv,
+                    self.swa_cache_layer.kv_cache,
+                    swa_indices,
+                    fallback_lens,
+                    swa_metadata.block_size,
+                )
+            else:
+                assert kv_cache is not None
+                assert attn_metadata is not None
+                assert topk_indices is not None
+                assert topk_lens is not None
+                compressed_topk = topk_indices.shape[-1]
+                swa_topk = swa_indices.shape[-1]
+                total_topk = compressed_topk + swa_topk
+                fallback_topk_length = None
+                fallback_kv = _get_decode_prefill_fallback_workspace(
+                    (num_decode_tokens, total_topk, q.shape[-1]),
+                    torch.bfloat16,
+                    q.device,
+                )
+                compressed_kv = fallback_kv[:, :compressed_topk]
+                _gather_decode_prefill_fallback_kv_(
+                    compressed_kv,
+                    kv_cache,
+                    topk_indices,
+                    topk_lens,
+                    attn_metadata.block_size // self.compress_ratio,
+                )
+                swa_kv = fallback_kv[:, compressed_topk:]
+                _gather_decode_prefill_fallback_kv_(
+                    swa_kv,
+                    self.swa_cache_layer.kv_cache,
+                    swa_indices,
+                    swa_lens,
+                    swa_metadata.block_size,
+                )
+                compressed_indices, _ = _build_decode_prefill_fallback_indices(
+                    topk_indices,
+                    topk_lens,
+                    row_stride=total_topk,
+                )
+                swa_fallback_indices, _ = _build_decode_prefill_fallback_indices(
+                    swa_indices,
+                    swa_lens,
+                    row_stride=total_topk,
+                    offset=compressed_topk,
+                )
+                fallback_indices = torch.cat(
+                    (compressed_indices, swa_fallback_indices), dim=-1
+                )
+            _normalize_flashmla_sm70_prefill_kv_(fallback_kv)
+            flash_output, _, _ = flash_mla_sparse_fwd(
+                q=q.squeeze(1),
+                kv=fallback_kv.view(-1, 1, q.shape[-1]),
+                indices=fallback_indices,
+                sm_scale=self.scale,
+                attn_sink=self.attn_sink,
+                topk_length=fallback_topk_length,
+                out=flash_output,
+            )
+            _copy_flashmla_output(flash_output, output)
+            return
 
         # Prepare SWA cache (num_blocks, swa_block_size, 1, head_bytes)
         # Use unsqueeze to preserve strides (handles padded blocks correctly)
@@ -790,8 +1300,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             extra_k_cache=kv_cache if not swa_only else None,
             extra_indices_in_kvcache=topk_indices,
             extra_topk_length=topk_lens,
-            out=output.unsqueeze(1),
+            out=flash_output.unsqueeze(1),
         )
+        _copy_flashmla_output(out.squeeze(1), output)
 
     def _forward_prefill(
         self,
@@ -846,6 +1357,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         M = N + self.window_size + self.max_num_batched_tokens
         num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
+        trace_prefill = (
+            os.getenv("VLLM_DEEPSEEK_V4_NAN_TRACE", "0") == "1"
+            and self.prefix.endswith("layers.1.attn")
+        )
 
         workspace_manager = current_workspace_manager()
         kv = workspace_manager.get_simultaneous(
@@ -880,6 +1395,18 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 block_size=swa_metadata.block_size,
                 offset=N,
             )
+            kv_chunk = kv[:chunk_size]
+            _normalize_flashmla_sm70_prefill_kv_(kv_chunk)
+            if trace_prefill:
+                _trace_tensor_summary(f"{self.prefix}.prefill.kv", kv_chunk)
+                _trace_tensor_summary(
+                    f"{self.prefix}.prefill.seq_lens",
+                    seq_lens[chunk_start:chunk_end],
+                )
+                _trace_tensor_summary(
+                    f"{self.prefix}.prefill.gather_lens",
+                    gather_lens[chunk_start:chunk_end],
+                )
 
             # Combine the topk indices and SWA indices for gathered KV cache
             query_start = (
@@ -902,16 +1429,39 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 M,
                 N,
             )
+            if trace_prefill:
+                _trace_tensor_summary(
+                    f"{self.prefix}.prefill.combined_indices", combined_indices
+                )
+                _trace_tensor_summary(
+                    f"{self.prefix}.prefill.combined_lens", combined_lens
+                )
 
-            output_chunk, _, _ = flash_mla_sparse_fwd(
-                q=q[query_start:query_end],
+            output_slice = output[query_start:query_end]
+            q_chunk, output_chunk = _flashmla_bf16_io(
+                q[query_start:query_end],
+                output_slice,
+            )
+            if trace_prefill:
+                _trace_tensor_summary(f"{self.prefix}.prefill.q_chunk", q_chunk)
+            flash_output, max_logits, lse = flash_mla_sparse_fwd(
+                q=q_chunk,
                 kv=kv.view(-1, 1, q.shape[-1]),
                 indices=combined_indices.unsqueeze(1),
                 sm_scale=self.scale,
                 attn_sink=self.attn_sink,
                 topk_length=combined_lens,
-                out=output[query_start:query_end],
+                out=output_chunk,
             )
+            if trace_prefill:
+                _trace_tensor_summary(
+                    f"{self.prefix}.prefill.flash_output", flash_output
+                )
+                _trace_tensor_summary(
+                    f"{self.prefix}.prefill.max_logits", max_logits
+                )
+                _trace_tensor_summary(f"{self.prefix}.prefill.lse", lse)
+            _copy_flashmla_output(flash_output, output_slice)
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):

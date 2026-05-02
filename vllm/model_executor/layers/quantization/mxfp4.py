@@ -203,6 +203,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        w13_weight_scale.quant_method = "block"
 
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
@@ -228,6 +229,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        w2_weight_scale.quant_method = "block"
 
         if self.moe.has_bias:
             w13_bias = torch.nn.Parameter(

@@ -19,6 +19,9 @@ The kernel is imported via
 import pytest
 import torch
 
+from vllm.model_executor.layers.deepseek_v4_attention import (
+    _torch_qnorm_rope_kv_insert_fallback,
+)
 from vllm.v1.attention.ops.deepseek_v4_ops import (
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
@@ -122,6 +125,146 @@ pytestmark = pytest.mark.skipif(
 def _call_fused(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs):
     torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs
+    )
+
+
+def _torch_quantize_and_insert_k_cache_reference(
+    k: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    for token_idx, slot_idx in enumerate(slot_mapping.tolist()):
+        if slot_idx == -1:
+            continue
+
+        block_idx = slot_idx // block_size
+        pos_in_block = slot_idx % block_size
+        token_data_offset = pos_in_block * (HEAD_BYTES - 8)
+        token_scale_offset = block_size * (HEAD_BYTES - 8) + pos_in_block * 8
+
+        nope = k[token_idx, :NOPE_DIM].float()
+        for qblock_idx in range(NOPE_DIM // QUANT_BLOCK):
+            start = qblock_idx * QUANT_BLOCK
+            end = start + QUANT_BLOCK
+            vals = nope[start:end]
+            absmax = vals.abs().amax().clamp(min=1e-4)
+            exponent = torch.ceil(torch.log2(absmax / FP8_MAX))
+            scale = torch.exp2(exponent)
+            fp8_bytes = (
+                (vals / scale)
+                .clamp(-FP8_MAX, FP8_MAX)
+                .to(torch.float8_e4m3fn)
+                .contiguous()
+                .view(torch.uint8)
+            )
+            k_cache[block_idx, token_data_offset + start : token_data_offset + end] = (
+                fp8_bytes
+            )
+            k_cache[block_idx, token_scale_offset + qblock_idx] = (
+                exponent + 127.0
+            ).clamp(0, 255).to(torch.uint8)
+
+        rope_bytes = k[token_idx, NOPE_DIM:].contiguous().view(torch.uint8)
+        k_cache[
+            block_idx,
+            token_data_offset + NOPE_DIM : token_data_offset + NOPE_DIM + ROPE_DIM * 2,
+        ] = rope_bytes
+        k_cache[block_idx, token_scale_offset + 7] = 0
+
+
+def test_torch_fallback_matches_reference():
+    torch.manual_seed(4)
+    device = "cuda"
+    dtype = torch.bfloat16
+    eps = 1e-6
+    max_pos = 4096
+    num_tokens = 17
+    n_heads = 8
+    block_size = 16
+
+    q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
+    kv[:, :NOPE_DIM] *= 2048.0
+    kv[:, NOPE_DIM:] *= 2048.0
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+
+    q_ref = rmsnorm_no_weight(q, eps)
+    q_ref = apply_rope_gptj_last_k(q_ref, positions, cos_sin_cache)
+    kv_ref = apply_rope_gptj_last_k(kv, positions, cos_sin_cache)
+    k_cache_ref = torch.zeros(
+        num_blocks, block_size * HEAD_BYTES, dtype=torch.uint8, device=device
+    )
+    _torch_quantize_and_insert_k_cache_reference(
+        kv_ref, k_cache_ref, slot_mapping, block_size=block_size
+    )
+
+    q_fallback = q.clone()
+    k_cache_fallback = torch.zeros_like(k_cache_ref)
+    _torch_qnorm_rope_kv_insert_fallback(
+        q_fallback,
+        kv,
+        k_cache_fallback,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        eps,
+        block_size,
+    )
+
+    torch.testing.assert_close(q_fallback, q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k_cache_fallback, k_cache_ref, rtol=0, atol=0)
+
+
+def test_dequantize_sm70_fallback_matches_reference_cache():
+    torch.manual_seed(5)
+    device = "cuda"
+    dtype = torch.bfloat16
+    num_tokens = 19
+    block_size = 16
+    num_blocks = (num_tokens + block_size - 1) // block_size
+
+    kv_ref = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
+    kv_ref[:, :NOPE_DIM] *= 2048.0
+    kv_ref[:, NOPE_DIM:] *= 2048.0
+    k_cache = torch.zeros(
+        num_blocks, block_size, HEAD_BYTES, dtype=torch.uint8, device=device
+    )
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    _torch_quantize_and_insert_k_cache_reference(
+        kv_ref, k_cache.view(num_blocks, -1), slot_mapping, block_size=block_size
+    )
+
+    out = torch.zeros(1, num_tokens, HEAD_DIM, dtype=dtype, device=device)
+    seq_lens = torch.tensor([num_tokens], dtype=torch.int32, device=device)
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).view(1, -1)
+
+    dequantize_and_gather_k_cache(
+        out,
+        k_cache,
+        seq_lens=seq_lens,
+        gather_lens=None,
+        block_table=block_table,
+        block_size=block_size,
+        offset=0,
+    )
+
+    scales = _ue8m0_per_block_scales(kv_ref[:, :NOPE_DIM].float(), QUANT_BLOCK)
+    for token_idx in range(num_tokens):
+        max_allowed = 16.0 * scales[token_idx].max().item()
+        diff = (
+            (out[0, token_idx, :NOPE_DIM] - kv_ref[token_idx, :NOPE_DIM])
+            .abs()
+            .max()
+            .item()
+        )
+        assert diff <= max_allowed
+
+    torch.testing.assert_close(
+        out[0, :, NOPE_DIM:], kv_ref[:, NOPE_DIM:], rtol=0, atol=0
     )
 
 

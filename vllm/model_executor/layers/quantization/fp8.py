@@ -446,7 +446,9 @@ class Fp8SM70RuntimeDecodeLinearMethod(LinearMethodBase):
             weight=layer.weight,
             weight_scale=layer.weight_scale_inv,
             weight_block_size=tuple(self.weight_block_size),
-            direct_block_gemm_enabled=self._direct_gemm_enabled(),
+            direct_block_gemm_enabled=(
+                self._direct_gemm_enabled() and not getattr(layer, "is_bmm", False)
+            ),
             adopt_prepared_scale=False,
         )
         layer.input_scale = None

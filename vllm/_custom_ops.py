@@ -3395,6 +3395,94 @@ def cp_gather_and_upconvert_fp8_kv_cache(
     )
 
 
+def _should_use_sm70_indexer_cache_fallback(tensor: torch.Tensor) -> bool:
+    if not tensor.is_cuda:
+        return False
+    return torch.cuda.get_device_capability(tensor.device)[0] < 8
+
+
+def _torch_indexer_k_quant_and_cache(
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    quant_block_size: int,
+    kv_cache_dtype: str,
+) -> None:
+    head_dim = k.shape[1]
+    cache_block_size = kv_cache.shape[1]
+    scale_dim = head_dim * 4 // quant_block_size
+    fp8_max = 448.0
+    use_ue8m0 = kv_cache_dtype == "ue8m0"
+    kv_cache_2d = kv_cache.reshape(kv_cache.shape[0], -1)
+
+    for token_idx in range(slot_mapping.shape[0]):
+        slot_idx = int(slot_mapping[token_idx].item())
+        if slot_idx < 0:
+            continue
+
+        block_idx = slot_idx // cache_block_size
+        block_offset = slot_idx % cache_block_size
+        data_offset = block_offset * head_dim
+        scale_offset = cache_block_size * head_dim + block_offset * scale_dim
+
+        token = k[token_idx].float()
+        for qblock_idx in range(head_dim // quant_block_size):
+            start = qblock_idx * quant_block_size
+            end = start + quant_block_size
+            block = token[start:end]
+            scale = block.abs().amax().clamp(min=1e-4) / fp8_max
+            if use_ue8m0:
+                scale = torch.exp2(torch.ceil(torch.log2(scale)))
+
+            fp8_bytes = (
+                (block / scale)
+                .clamp(-fp8_max, fp8_max)
+                .to(torch.float8_e4m3fn)
+                .contiguous()
+                .view(torch.uint8)
+            )
+            kv_cache_2d[block_idx, data_offset + start:data_offset + end] = fp8_bytes
+            scale_start = scale_offset + qblock_idx * 4
+            scale_end = scale_start + 4
+            kv_cache_2d[block_idx, scale_start:scale_end] = (
+                scale.reshape(1).to(torch.float32).contiguous().view(torch.uint8)
+            )
+
+
+def _torch_cp_gather_indexer_k_quant_cache(
+    kv_cache: torch.Tensor,
+    dst_k: torch.Tensor,
+    dst_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+) -> None:
+    head_dim = dst_k.shape[1]
+    scale_dim = dst_scale.shape[1]
+    cache_block_size = kv_cache.shape[1]
+    kv_cache_2d = kv_cache.reshape(kv_cache.shape[0], -1)
+
+    batch_size = block_table.shape[0]
+    for batch_idx in range(batch_size):
+        seq_start = int(cu_seq_lens[batch_idx].item())
+        seq_end = int(cu_seq_lens[batch_idx + 1].item())
+        for token_idx in range(seq_start, seq_end):
+            inbatch_seq_idx = token_idx - seq_start
+            block_in_seq = inbatch_seq_idx // cache_block_size
+            pos_in_block = inbatch_seq_idx % cache_block_size
+            physical_block = int(block_table[batch_idx, block_in_seq].item())
+            if physical_block < 0:
+                continue
+
+            data_offset = pos_in_block * head_dim
+            scale_offset = cache_block_size * head_dim + pos_in_block * scale_dim
+            dst_k[token_idx].copy_(
+                kv_cache_2d[physical_block, data_offset:data_offset + head_dim]
+            )
+            dst_scale[token_idx].copy_(
+                kv_cache_2d[physical_block, scale_offset:scale_offset + scale_dim]
+            )
+
+
 def indexer_k_quant_and_cache(
     k: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -3402,6 +3490,12 @@ def indexer_k_quant_and_cache(
     quant_block_size: int,
     kv_cache_dtype: str,
 ) -> None:
+    if _should_use_sm70_indexer_cache_fallback(kv_cache):
+        _torch_indexer_k_quant_and_cache(
+            k, kv_cache, slot_mapping, quant_block_size, kv_cache_dtype
+        )
+        return
+
     torch.ops._C_cache_ops.indexer_k_quant_and_cache(
         k, kv_cache, slot_mapping, quant_block_size, kv_cache_dtype
     )
@@ -3414,6 +3508,12 @@ def cp_gather_indexer_k_quant_cache(
     block_table: torch.Tensor,
     cu_seq_lens: torch.Tensor,
 ) -> None:
+    if _should_use_sm70_indexer_cache_fallback(kv_cache):
+        _torch_cp_gather_indexer_k_quant_cache(
+            kv_cache, dst_k, dst_scale, block_table, cu_seq_lens
+        )
+        return
+
     torch.ops._C_cache_ops.cp_gather_indexer_k_quant_cache(
         kv_cache, dst_k, dst_scale, block_table, cu_seq_lens
     )

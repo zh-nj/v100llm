@@ -1474,10 +1474,12 @@ class FusedMoE(CustomOp):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.runner.forward(
             hidden_states,
             router_logits,
+            input_ids=input_ids,
         )
 
     @property
@@ -1490,8 +1492,9 @@ class FusedMoE(CustomOp):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(hidden_states, router_logits)
+        return self.forward_native(hidden_states, router_logits, input_ids=input_ids)
 
     @classmethod
     def make_expert_params_mapping(

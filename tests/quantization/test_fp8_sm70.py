@@ -204,6 +204,56 @@ def test_fp8_sm70_process_keeps_fp8_resident_and_records_runtime_meta(
     assert not hasattr(layer, "_awq_sm70_prepared")
 
 
+def test_fp8_sm70_bmm_weight_keeps_raw_layout_for_einsum(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8._get_current_capability_int",
+        lambda: 70,
+        raising=False,
+    )
+
+    layer = _make_linear(monkeypatch, output_size=384)
+    _populate_fp8_block_weights(layer)
+    raw_weight = layer.weight.detach().clone()
+    raw_scale = layer.weight_scale_inv.detach().clone()
+    layer.is_bmm = True
+    layer.bmm_batch_size = 3
+
+    ops_module = importlib.import_module("vllm._custom_ops")
+
+    monkeypatch.setattr(
+        ops_module,
+        "sm70_fp8_prepare",
+        lambda weight, scale, *args: [
+            weight,
+            scale,
+            torch.tensor([384, 256, 384, 256, 128, 2, -1, 128, 128]),
+            torch.tensor([128, 256, 384, 256, 4]),
+        ],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ops_module,
+        "sm70_fp8_direct_prepare",
+        lambda weight, scale, block_n, block_k: [
+            torch.empty_like(weight),
+            torch.empty((2, 384), dtype=torch.float16),
+            torch.tensor([384, 256, block_k, 8192, 384], dtype=torch.int64),
+        ],
+        raising=False,
+    )
+
+    layer.quant_method.process_weights_after_loading(layer)
+
+    assert layer._sm70_fp8_direct_prepared is False
+    assert torch.equal(layer.weight, raw_weight)
+    assert torch.equal(layer.weight_scale_inv, raw_scale)
+    assert layer._sm70_fp8_prepared_weight is layer.weight
+    assert layer._sm70_fp8_prepared_scale is layer.weight_scale_inv
+
+
 def test_select_sm70_fp8_panel_n_uses_wider_panels_for_decode_hot_shapes() -> None:
     assert select_sm70_fp8_panel_n(logical_n=384, logical_k=256, block_n=128) == 128
     assert select_sm70_fp8_panel_n(logical_n=1024, logical_k=3584, block_n=128) == 1024

@@ -207,6 +207,23 @@ def fused_inv_rope_fp8_quant(
             (num_scale_blocks * tma_aligned_T, 1, tma_aligned_T),
         )
 
+    if _should_use_torch_fallback(o):
+        assert not tma_aligned_scales, "SM70 fallback does not support SM100 scales"
+        _torch_inv_rope_fp8_quant_fallback(
+            o,
+            positions,
+            cos_sin_cache,
+            fp8_buf,
+            scale_buf,
+            n_groups=n_groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            quant_group_size=quant_group_size,
+            fp8_max=fp8_max,
+        )
+        return fp8_buf.transpose(0, 1), scale_buf.transpose(0, 1)
+
     common_args = dict(
         heads_per_group=heads_per_group,
         o_stride_token=o.stride(0),
@@ -240,3 +257,57 @@ def fused_inv_rope_fp8_quant(
     )
 
     return fp8_buf.transpose(0, 1), scale_buf.transpose(0, 1)
+
+
+def _should_use_torch_fallback(o: torch.Tensor) -> bool:
+    if not o.is_cuda:
+        return False
+    capability = torch.cuda.get_device_capability(o.device)
+    return capability[0] < 8
+
+
+def _torch_inv_rope_fp8_quant_fallback(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    fp8_buf: torch.Tensor,
+    scale_buf: torch.Tensor,
+    *,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    quant_group_size: int,
+    fp8_max: float,
+) -> None:
+    """Torch correctness fallback for SM70, where tl.float8e4nv is unsupported."""
+    num_tokens, _num_heads, head_dim = o.shape
+    half_rope = rope_dim // 2
+    d = heads_per_group * head_dim
+    num_scale_blocks = d // quant_group_size
+
+    x = o.reshape(num_tokens, n_groups, heads_per_group, head_dim).float()
+    cos_sin = cos_sin_cache[positions]
+    cos = cos_sin[:, :half_rope].view(num_tokens, 1, 1, half_rope)
+    sin = cos_sin[:, half_rope:].view(num_tokens, 1, 1, half_rope)
+
+    rope = x[..., nope_dim : nope_dim + rope_dim].clone()
+    x_vals = rope[..., ::2]
+    y_vals = rope[..., 1::2]
+    rotated = torch.empty_like(rope)
+    rotated[..., ::2] = x_vals * cos + y_vals * sin
+    rotated[..., 1::2] = y_vals * cos - x_vals * sin
+    x[..., nope_dim : nope_dim + rope_dim] = rotated
+
+    x_blocks = (
+        x.reshape(num_tokens, n_groups, d)
+        .permute(1, 0, 2)
+        .contiguous()
+        .view(n_groups, num_tokens, num_scale_blocks, quant_group_size)
+    )
+    absmax = x_blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+    scales = torch.exp2(torch.ceil(torch.log2(absmax * (1.0 / fp8_max))))
+    x_scaled = (x_blocks / scales).clamp(-fp8_max, fp8_max)
+
+    fp8_buf.copy_(x_scaled.to(fp8_buf.dtype).view(n_groups, num_tokens, d))
+    scale_buf.copy_(scales.squeeze(-1))

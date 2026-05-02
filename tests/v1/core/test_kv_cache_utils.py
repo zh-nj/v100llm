@@ -3,13 +3,14 @@
 import hashlib
 import importlib
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -1824,6 +1825,29 @@ def test_generate_uniform_type_kv_cache_specs():
     }
     uniform_spec = UniformTypeKVCacheSpecs.from_specs(kv_cache_specs)
     assert uniform_spec is None
+
+
+def test_resolve_kv_cache_block_sizes_uses_cache_config_hash_override():
+    vllm_config = SimpleNamespace(
+        cache_config=CacheConfig(block_size=64, hash_block_size=16),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        kv_transfer_config=None,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer_1"], new_kv_cache_spec(block_size=64)),
+            KVCacheGroupSpec(["layer_2"], new_kv_cache_spec(block_size=32)),
+        ],
+    )
+
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    ) == (64, 16)
 
 
 def test_generate_scheduler_kv_cache_config():

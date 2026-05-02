@@ -116,6 +116,17 @@ def parse_sse_line(raw_line: bytes) -> dict[str, Any] | None:
     return json.loads(payload)
 
 
+def choice_contains_generated_delta(choice: dict[str, Any]) -> bool:
+    token_ids = choice.get("token_ids")
+    if token_ids:
+        return True
+    delta = choice.get("delta") or {}
+    content = delta.get("content") or ""
+    if content:
+        return True
+    return "content" in delta and "role" not in delta
+
+
 def run_openai_stream(args: argparse.Namespace) -> int:
     endpoint = args.endpoint.rstrip("/") + "/chat/completions"
     payload = {
@@ -159,10 +170,11 @@ def run_openai_stream(args: argparse.Namespace) -> int:
                 choice = choices[0]
                 finish_reason = choice.get("finish_reason") or finish_reason
                 content = (choice.get("delta") or {}).get("content") or ""
-                if content:
+                if choice_contains_generated_delta(choice):
                     if first_token_time is None:
                         first_token_time = time.perf_counter()
                     delta_chunks += 1
+                if content:
                     pieces.append(content)
     except urllib.error.URLError as exc:
         print(json.dumps({"request_failed": str(exc)}, indent=2))

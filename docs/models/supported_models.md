@@ -392,6 +392,19 @@ th {
 > `TORCH_CUDA_ARCH_LIST=7.0`). The supported SM70 attention path is the
 > sparse FlashMLA path for `fp8_ds_mla` MODEL1 layout; dense FlashMLA remains
 > Hopper-only.
+>
+> Current local SM70 smoke boundary (2026-05-01): the 8xV100 OpenAI server
+> starts and streams for `/mnt/data6/models/DeepSeek-V4-Flash` with
+> `CUDA_VISIBLE_DEVICES=2,3,4,5,6,8,7,9`, `VLLM_USE_V1=1`, `--enforce-eager`,
+> `--tensor-parallel-size 8`, `--max-model-len 4096`, and port `18080`.
+> Startup is through the FlashMLA sparse SM70 gate. A SM70 FP8 cache insert
+> issue was fixed locally (`indexer_k_quant_and_cache` wrote zero FP8 value
+> bytes on SM70; DeepSeek V4 attention/indexer K-cache insert/gather now uses
+> torch correctness fallbacks on SM70), and the focused regression floor is
+> `79 passed`. The stream output for the one-line identity prompt is still
+> semantically invalid, so the remaining blocker is runtime semantic corruption
+> after successful startup rather than build/import, gate, or immediate
+> FlashMLA sparse kernel failure.
 
 | `Dots1ForCausalLM` | dots.llm1 | `rednote-hilab/dots.llm1.base`, `rednote-hilab/dots.llm1.inst`, etc. | | ✅︎ |
 | `DotsOCRForCausalLM` | dots_ocr | `rednote-hilab/dots.ocr` | ✅︎ | ✅︎ |

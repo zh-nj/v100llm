@@ -350,7 +350,19 @@ def cublas_gemm_bf16_bf16_fp32(
     x: torch.Tensor,
     weight: torch.Tensor,
 ):
-    return ops.router_gemm_bf16_fp32(x, weight)
+    router_gemm = getattr(ops, "router_gemm_bf16_fp32", None)
+    if (
+        router_gemm is not None
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+    ):
+        return router_gemm(x, weight)
+
+    logger.warning_once(
+        "router_gemm_bf16_fp32 custom op is unavailable or inputs are not "
+        "bfloat16; using torch fp32 matmul fallback."
+    )
+    return x.float() @ weight.float().t()
 
 
 def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:

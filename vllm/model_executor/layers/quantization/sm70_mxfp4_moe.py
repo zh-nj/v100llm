@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
 )
+from vllm.model_executor.layers.fused_moe.utils import swiglu_limit_func
 from vllm.model_executor.layers.quantization.awq_sm70_moe import (
     _DEFAULT_PERSISTENT_MAX_TOKENS,
     _moe_permute_accepts_scale_and_m_indices,
@@ -100,6 +101,7 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_scale)
         set_weight_attrs(w13_scale, extra_weight_attrs)
+        w13_scale.quant_method = "block"
 
         w2_weight = torch.nn.Parameter(
             torch.zeros(
@@ -124,6 +126,7 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_scale)
         set_weight_attrs(w2_scale, extra_weight_attrs)
+        w2_scale.quant_method = "block"
 
         bias_dtype = getattr(layer, "orig_dtype", params_dtype)
         if self.moe.has_bias:
@@ -370,7 +373,13 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
         activation = self._activation()
         w13_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
-        use_unfused_activation = activation != MoEActivation.SILU or w13_bias is not None
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
+        has_swiglu_limit = swiglu_limit is not None and swiglu_limit > 0
+        use_unfused_activation = (
+            activation != MoEActivation.SILU
+            or w13_bias is not None
+            or has_swiglu_limit
+        )
         if use_unfused_activation:
             ops.sm70_mxfp4_moe_gemm_out(
                 buffers["gate_up"],
@@ -391,11 +400,18 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
                     w13_bias,
                     layer.sm70_num_experts,
                 )
-            apply_moe_activation(
-                activation,
-                buffers["intermediate"],
-                buffers["gate_up"],
-            )
+            if activation == MoEActivation.SILU and has_swiglu_limit:
+                swiglu_limit_func(
+                    buffers["intermediate"],
+                    buffers["gate_up"],
+                    float(swiglu_limit),
+                )
+            else:
+                apply_moe_activation(
+                    activation,
+                    buffers["intermediate"],
+                    buffers["gate_up"],
+                )
         else:
             ops.sm70_mxfp4_moe_gemm_out(
                 buffers["intermediate"],

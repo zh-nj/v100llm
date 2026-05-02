@@ -85,7 +85,10 @@ class CacheConfig:
       Even if collisions are still very unlikely, it is important to consider your
       security risk tolerance against the performance benefits before turning this on.
     - "xxhash_cbor" combines canonical CBOR serialization with xxHash for
-      reproducible hashing. Requires the optional ``xxhash`` package."""
+    reproducible hashing. Requires the optional ``xxhash`` package."""
+    hash_block_size: int | None = Field(default=None, gt=0)
+    """Optional block-hash granularity for hybrid KV cache groups. If unset,
+    v1 KV cache initialization derives the granularity from group block sizes."""
     calculate_kv_scales: bool = False
     """Deprecated: This option is deprecated and will be removed in v0.19.
     It enables dynamic calculation of `k_scale` and `v_scale` when
@@ -176,6 +179,7 @@ class CacheConfig:
             "num_gpu_blocks_override",
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
+            "hash_block_size",
             "cpu_kvcache_space_bytes",
             "mamba_page_size_padded",
             "user_specified_block_size",

@@ -506,3 +506,19 @@ class TestVllmMaxNSequences:
 
         with pytest.raises(ValueError, match="n must be at most 128"):
             SamplingParams(n=129)
+
+
+class TestSparseIndexerMaxLogitsMb:
+    def test_default_value(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", raising=False)
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+
+        assert envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB == 512
+
+    def test_custom_value(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "128")
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+
+        assert envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB == 128

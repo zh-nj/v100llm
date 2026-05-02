@@ -93,6 +93,41 @@ def test_mxfp4_supported_act_dtypes_include_sm70_fp16() -> None:
     assert torch.float16 in Mxfp4Config.get_supported_act_dtypes()
 
 
+def test_mxfp4_moe_weight_scales_are_block_scales_for_loader(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_single_rank_params(monkeypatch)
+    mxfp4_module = importlib.import_module(
+        "vllm.model_executor.layers.quantization.mxfp4"
+    )
+    monkeypatch.setattr(
+        mxfp4_module,
+        "_is_sm70_mxfp4_moe_available",
+        lambda: False,
+        raising=False,
+    )
+
+    layer = FusedMoE(
+        num_experts=2,
+        top_k=1,
+        hidden_size=256,
+        intermediate_size=128,
+        tp_size=1,
+        dp_size=1,
+        pcp_size=1,
+        params_dtype=torch.float16,
+        quant_config=Mxfp4Config(),
+        prefix="model.layers.0.mlp.experts",
+        activation="swigluoai",
+        has_bias=False,
+    )
+
+    assert layer.quant_method.__class__.__name__ == "Mxfp4MoEMethod"
+    assert layer.w13_weight_scale.quant_method == "block"
+    assert layer.w2_weight_scale.quant_method == "block"
+
+
 def test_mxfp4_sm70_availability_requires_registered_cpp_ops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -185,6 +220,40 @@ def test_mxfp4_sm70_uses_turbomind_direct_moe_method(
     assert tuple(layer.w2_weight_scale.shape) == (2, 256, 4)
     assert layer.w13_weight.dtype == torch.uint8
     assert layer.w2_weight.dtype == torch.uint8
+    assert layer.w13_weight_scale.quant_method == "block"
+    assert layer.w2_weight_scale.quant_method == "block"
+
+
+def test_deepseek_v4_fp8_config_uses_sm70_turbomind_direct_moe_method(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_single_rank_params(monkeypatch)
+    _patch_sm70_mxfp4_available(monkeypatch)
+    deepseek_v4_module = importlib.import_module(
+        "vllm.model_executor.models.deepseek_v4"
+    )
+
+    layer = FusedMoE(
+        num_experts=2,
+        top_k=1,
+        hidden_size=256,
+        intermediate_size=128,
+        tp_size=1,
+        dp_size=1,
+        pcp_size=1,
+        params_dtype=torch.float16,
+        quant_config=deepseek_v4_module.DeepseekV4FP8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+        ),
+        prefix="model.layers.0.mlp.experts",
+        activation="swigluoai",
+        has_bias=True,
+    )
+
+    assert layer.quant_method.__class__.__name__ == "Mxfp4SM70MoEMethod"
 
 
 def test_mxfp4_sm70_rounds_intermediate_partition_for_tp4_gpt_oss(
@@ -425,6 +494,135 @@ def test_mxfp4_sm70_apply_uses_unfused_swigluoai_activation(
     assert torch.all(out == 5)
 
 
+def test_mxfp4_sm70_apply_honors_deepseek_v4_swiglu_limit(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del default_vllm_config
+    sm70_module = importlib.import_module(
+        "vllm.model_executor.layers.quantization.sm70_mxfp4_moe"
+    )
+    ops_module = importlib.import_module("vllm._custom_ops")
+    method_cls = getattr(sm70_module, "Mxfp4SM70MoEMethod")
+    dummy_moe_config = type(
+        "MoeCfg",
+        (),
+        {"experts_per_token": 1, "activation": "silu", "has_bias": False},
+    )()
+    method = method_cls(dummy_moe_config)
+
+    layer = torch.nn.Module()
+    layer.sm70_batched_ready = True
+    layer.sm70_num_experts = 2
+    layer.sm70_hidden_logical_size = 256
+    layer.sm70_w13_k_dim = 256
+    layer.sm70_w13_n_dim = 256
+    layer.sm70_w2_k_dim = 128
+    layer.sm70_w2_n_dim = 256
+    layer.sm70_intermediate_size = 128
+    layer.swiglu_limit = 10.0
+    layer._buf_max_tokens = 32
+    layer._buf_max_slots = 32
+    layer._buf_top_k = 1
+    layer._buf_output = torch.empty(32, 256, dtype=torch.float16)
+    layer._buf_permuted_input = torch.empty(32, 256, dtype=torch.float16)
+    layer._buf_sorted_output = torch.empty(32, 256, dtype=torch.float16)
+    layer._buf_gate_up = torch.empty(32, 256, dtype=torch.float16)
+    layer._buf_intermediate = torch.empty(32, 128, dtype=torch.float16)
+    layer._buf_expert_offsets = torch.empty(3, dtype=torch.int32)
+    layer._buf_expert_offsets64 = torch.empty(3, dtype=torch.int64)
+    layer._buf_inv_permuted_idx = torch.empty(32, 1, dtype=torch.int32)
+    layer._buf_topk_ids_i32 = torch.empty(32, 1, dtype=torch.int32)
+    layer._buf_token_expert_indices = torch.arange(32, dtype=torch.int32).view(32, 1)
+    layer._buf_permuted_idx = torch.empty(32, dtype=torch.int32)
+    layer._buf_m_indices = torch.empty(32, dtype=torch.int32)
+    layer.w13_strided_ptrs_w = torch.empty(32, dtype=torch.uint8)
+    layer.w13_strided_ptrs_s = torch.empty(32, dtype=torch.uint8)
+    layer.w2_strided_ptrs_w = torch.empty(32, dtype=torch.uint8)
+    layer.w2_strided_ptrs_s = torch.empty(32, dtype=torch.uint8)
+
+    def fake_permute(
+        x,
+        topk_ids,
+        token_expert_indices,
+        scales,
+        num_experts,
+        padded_num_experts,
+        top_k,
+        maybe_unused,
+        permuted_input,
+        expert_offsets64,
+        inv_permuted_idx,
+        permuted_idx,
+        m_indices,
+    ):
+        del topk_ids, token_expert_indices, scales, num_experts
+        del padded_num_experts, top_k, maybe_unused, permuted_idx, m_indices
+        permuted_input[: x.size(0)].copy_(x)
+        expert_offsets64.copy_(torch.tensor([0, x.size(0), x.size(0)]))
+        inv_permuted_idx.zero_()
+
+    def fake_unpermute(sorted_output, topk_weights, inv_idx, offsets, top_k, output):
+        del topk_weights, inv_idx, offsets, top_k
+        output.copy_(sorted_output[: output.size(0)])
+
+    events = []
+
+    def fake_mxfp4_moe_gemm_out(
+        out,
+        sorted_input,
+        expert_offsets,
+        ptrs_w,
+        ptrs_s,
+        num_experts,
+        k,
+        n,
+        group_size,
+        gated_silu=False,
+    ):
+        del sorted_input, expert_offsets, ptrs_w, ptrs_s, num_experts
+        events.append(("gemm", tuple(out.shape), k, n, group_size, gated_silu))
+        out.fill_(3 if k == 256 else 5)
+
+    def fake_swiglu_limit(output, input, swiglu_limit):
+        events.append(("swiglu_limit", tuple(output.shape), tuple(input.shape),
+                       swiglu_limit))
+        output.fill_(7)
+
+    monkeypatch.setattr(torch.ops._moe_C, "moe_permute", fake_permute)
+    monkeypatch.setattr(torch.ops._moe_C, "moe_unpermute", fake_unpermute)
+    monkeypatch.setattr(
+        sm70_module,
+        "_moe_permute_accepts_scale_and_m_indices",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        ops_module,
+        "sm70_mxfp4_moe_gemm_out",
+        fake_mxfp4_moe_gemm_out,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sm70_module,
+        "swiglu_limit_func",
+        fake_swiglu_limit,
+        raising=False,
+    )
+
+    x = torch.ones(2, 256, dtype=torch.float16)
+    topk_weights = torch.ones(2, 1, dtype=torch.float32)
+    topk_ids = torch.zeros(2, 1, dtype=torch.int64)
+    out = method.apply(layer, x, topk_weights, topk_ids, None)
+
+    assert events == [
+        ("gemm", (2, 256), 256, 256, 32, False),
+        ("swiglu_limit", (2, 128), (2, 256), 10.0),
+        ("gemm", (2, 256), 128, 256, 32, False),
+    ]
+    assert tuple(out.shape) == (2, 256)
+    assert torch.all(out == 5)
+
+
 def test_mxfp4_sm70_apply_adds_expert_biases(
     default_vllm_config,
     monkeypatch: pytest.MonkeyPatch,
@@ -628,6 +826,78 @@ def test_mxfp4_sm70_cuda_gemm_matches_unit_scale_reference() -> None:
     )
 
     torch.testing.assert_close(out, torch.full_like(out, float(k_dim)))
+
+
+@pytest.mark.parametrize(
+    "packed_value,scale_byte,expected",
+    [
+        (0x44, 128, 128.0),
+        (0x55, 126, 48.0),
+        (0x99, 128, -32.0),
+    ],
+)
+def test_mxfp4_sm70_cuda_gemm_applies_non_unit_scales_and_signed_nibbles(
+    packed_value: int,
+    scale_byte: int,
+    expected: float,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the SM70 MXFP4 GEMM smoke test.")
+    if torch.cuda.get_device_capability(0) != (7, 0):
+        pytest.skip("SM70 MXFP4 GEMM smoke test requires an SM70 CUDA device.")
+    c_ops = getattr(torch.ops, "_C", None)
+    if (
+        c_ops is None
+        or not hasattr(c_ops, "sm70_mxfp4_moe_direct_prepare")
+        or not hasattr(c_ops, "sm70_mxfp4_moe_gemm_out")
+    ):
+        pytest.skip("SM70 MXFP4 custom ops are not registered.")
+
+    from vllm import _custom_ops as ops
+
+    num_experts, num_tokens, k_dim, n_dim = 1, 4, 32, 64
+    weight = torch.full(
+        (num_experts, n_dim, k_dim // 2),
+        packed_value,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    scale = torch.full(
+        (num_experts, n_dim, k_dim // 32),
+        scale_byte,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    prepared_weight, prepared_scale, meta = ops.sm70_mxfp4_moe_direct_prepare(
+        weight,
+        scale,
+        False,
+    )
+    ptrs_w, ptrs_s = ops.awq_moe_build_strided_ptrs(
+        prepared_weight,
+        prepared_scale,
+        int(meta[3].item()),
+        int(meta[4].item()),
+        num_experts,
+    )
+    x = torch.ones(num_tokens, k_dim, dtype=torch.float16, device="cuda")
+    out = torch.empty(num_tokens, n_dim, dtype=torch.float16, device="cuda")
+    expert_offsets = torch.tensor([0, num_tokens], dtype=torch.int32, device="cuda")
+
+    ops.sm70_mxfp4_moe_gemm_out(
+        out,
+        x,
+        expert_offsets,
+        ptrs_w,
+        ptrs_s,
+        num_experts,
+        k_dim,
+        n_dim,
+        32,
+        False,
+    )
+
+    torch.testing.assert_close(out, torch.full_like(out, expected))
 
 
 def test_sm70_moe_add_bias_out_cuda_adds_bias_by_expert_offsets() -> None:

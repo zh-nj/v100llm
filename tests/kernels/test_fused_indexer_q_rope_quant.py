@@ -61,6 +61,39 @@ def _reference(
     return q_fp8, weights_out
 
 
+def _torch_reference(
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights: torch.Tensor,
+    softmax_scale: float,
+    head_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q = q.float()
+    cos_sin = cos_sin_cache[positions].float()
+    cos = cos_sin[:, : ROPE_DIM // 2].view(-1, 1, ROPE_DIM // 2)
+    sin = cos_sin[:, ROPE_DIM // 2 :].view(-1, 1, ROPE_DIM // 2)
+
+    q_rot = q.clone()
+    rope = q_rot[..., HEAD_DIM - ROPE_DIM :].clone()
+    even = rope[..., ::2]
+    odd = rope[..., 1::2]
+    rotated = torch.empty_like(rope)
+    rotated[..., ::2] = (even * cos - odd * sin).to(torch.bfloat16).float()
+    rotated[..., 1::2] = (odd * cos + even * sin).to(torch.bfloat16).float()
+    q_rot[..., HEAD_DIM - ROPE_DIM :] = rotated
+
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    absmax = q_rot.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+    scales = torch.exp2(torch.ceil(torch.log2(absmax * (1.0 / fp8_max))))
+    q_fp8 = (q_rot / scales).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+
+    weights_out = (
+        weights.float() * scales.squeeze(-1) * softmax_scale * head_scale
+    )
+    return q_fp8, weights_out
+
+
 @pytest.mark.parametrize("num_tokens", [1, 7, 32, 257])
 @pytest.mark.parametrize("cache_dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
@@ -96,3 +129,31 @@ def test_fused_indexer_q_rope_quant_matches_unfused(num_tokens, cache_dtype):
         f"weights mismatch: max abs diff "
         f"{(weights_ref - weights_fused).abs().max().item()}"
     )
+
+
+@torch.inference_mode()
+def test_sm70_fallback_matches_torch_reference():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for SM70 fallback coverage")
+    if torch.cuda.get_device_capability()[0] >= 8:
+        pytest.skip("SM70 fallback coverage requires a pre-Ampere CUDA device")
+
+    torch.manual_seed(123)
+    num_tokens = 5
+    device = "cuda"
+    q = torch.randn(num_tokens, N_HEAD, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.tensor([0, 3, 17, 29, 31], dtype=torch.int64, device=device)
+    cos_sin_cache = torch.randn(MAX_POS, ROPE_DIM, dtype=torch.float32, device=device)
+    weights = torch.randn(num_tokens, N_HEAD, dtype=torch.bfloat16, device=device)
+    softmax_scale = HEAD_DIM**-0.5
+    head_scale = N_HEAD**-0.5
+
+    q_fp8_ref, weights_ref = _torch_reference(
+        positions, q, cos_sin_cache, weights, softmax_scale, head_scale
+    )
+    q_fp8_fused, weights_fused = fused_indexer_q_rope_quant(
+        positions, q, cos_sin_cache, weights, softmax_scale, head_scale
+    )
+
+    assert torch.equal(q_fp8_ref.view(torch.int8), q_fp8_fused.view(torch.int8))
+    torch.testing.assert_close(weights_fused, weights_ref, rtol=0, atol=0)

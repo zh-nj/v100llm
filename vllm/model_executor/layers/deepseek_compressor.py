@@ -38,7 +38,6 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
 )
 
-
 class CompressorBackend(AttentionBackend):
     def __init__(self):
         super().__init__()
@@ -173,6 +172,248 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return CompressorBackend
+
+
+def _should_use_torch_fused_compressor_fallback(
+    kv_cache: torch.Tensor,
+    use_fp4_cache: bool,
+) -> bool:
+    if use_fp4_cache or not kv_cache.is_cuda:
+        return False
+    return torch.cuda.get_device_capability(kv_cache.device)[0] < 8
+
+
+def _normalize_sm70_fp8_cache_exponents(exponents: torch.Tensor) -> torch.Tensor:
+    return exponents
+
+
+def _apply_gptj_rope_tail_1d(
+    x: torch.Tensor,
+    position: int,
+    compress_ratio: int,
+    cos_sin_cache: torch.Tensor,
+    rope_head_dim: int,
+) -> torch.Tensor:
+    nope_head_dim = x.shape[-1] - rope_head_dim
+    compressed_pos = (position // compress_ratio) * compress_ratio
+    cos_sin = cos_sin_cache[compressed_pos].float()
+    half = rope_head_dim // 2
+
+    out = x.clone()
+    rope = out[nope_head_dim:]
+    even = rope[::2]
+    odd = rope[1::2]
+    rotated = torch.empty_like(rope)
+    rotated[::2] = even * cos_sin[:half] - odd * cos_sin[half:]
+    rotated[1::2] = odd * cos_sin[:half] + even * cos_sin[half:]
+    out[nope_head_dim:] = rotated
+    return out
+
+
+def _store_fp8_sparse_attention_cache_torch(
+    kv_cache_2d: torch.Tensor,
+    kv_block_idx: int,
+    kv_pos_in_block: int,
+    kv_cache_block_size: int,
+    token_stride: int,
+    scale_dim: int,
+    normed: torch.Tensor,
+    rotated: torch.Tensor,
+    rope_head_dim: int,
+    fp8_max: float,
+    quant_block: int,
+) -> None:
+    nope_head_dim = normed.shape[-1] - rope_head_dim
+    block_base = kv_block_idx
+    token_data_offset = kv_pos_in_block * token_stride
+    token_scale_offset = kv_cache_block_size * token_stride + (
+        kv_pos_in_block * scale_dim
+    )
+
+    quant_input = normed.to(torch.bfloat16).float()[:nope_head_dim]
+    blocks = quant_input.view(nope_head_dim // quant_block, quant_block)
+    absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+    exponents = _normalize_sm70_fp8_cache_exponents(
+        torch.ceil(torch.log2(absmax / fp8_max))
+    )
+    scales = torch.exp2(exponents)
+    fp8_bytes = (
+        (blocks / scales)
+        .clamp(-fp8_max, fp8_max)
+        .to(torch.float8_e4m3fn)
+        .contiguous()
+        .view(torch.uint8)
+        .view(-1)
+    )
+    rope_bytes = (
+        rotated[nope_head_dim:]
+        .to(torch.bfloat16)
+        .contiguous()
+        .view(torch.uint8)
+        .view(-1)
+    )
+    token_data = torch.cat((fp8_bytes, rope_bytes))
+    kv_cache_2d[
+        block_base,
+        token_data_offset:token_data_offset + token_data.shape[0],
+    ] = token_data
+
+    encoded_scales = (exponents.flatten() + 127.0).clamp(0, 255).to(torch.uint8)
+    scale_data = torch.zeros(scale_dim, dtype=torch.uint8, device=kv_cache_2d.device)
+    scale_data[:encoded_scales.shape[0]] = encoded_scales
+    kv_cache_2d[
+        block_base,
+        token_scale_offset:token_scale_offset + scale_dim,
+    ] = scale_data
+
+
+def _store_fp8_indexer_cache_torch(
+    kv_cache_2d: torch.Tensor,
+    kv_block_idx: int,
+    kv_pos_in_block: int,
+    kv_cache_block_size: int,
+    token_stride: int,
+    scale_dim: int,
+    rotated: torch.Tensor,
+    fp8_max: float,
+) -> None:
+    token_data_offset = kv_pos_in_block * token_stride
+    token_scale_offset = kv_cache_block_size * token_stride + (
+        kv_pos_in_block * scale_dim
+    )
+    quant_input = rotated.to(torch.bfloat16).float()
+    absmax = quant_input.abs().amax().clamp(min=1e-4)
+    exponent = torch.ceil(torch.log2(absmax / fp8_max))
+    scale = torch.exp2(exponent)
+    fp8_bytes = (
+        (quant_input / scale)
+        .clamp(-fp8_max, fp8_max)
+        .to(torch.float8_e4m3fn)
+        .contiguous()
+        .view(torch.uint8)
+    )
+    kv_cache_2d[
+        kv_block_idx,
+        token_data_offset:token_data_offset + token_stride,
+    ] = fp8_bytes
+    kv_cache_2d[
+        kv_block_idx,
+        token_scale_offset:token_scale_offset + scale_dim,
+    ] = scale.reshape(1).to(torch.float32).contiguous().view(torch.uint8)
+
+
+def _torch_fused_compress_norm_rope_insert_fp8_fallback(
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    kv_cache_block_size: int,
+    head_size: int,
+    state_width: int,
+    compress_ratio: int,
+    overlap: bool,
+    rope_head_dim: int,
+    fp8_max: float,
+    quant_block: int,
+    token_stride: int,
+    scale_dim: int,
+) -> None:
+    """Torch correctness fallback for SM70, where Triton fp8e4nv is invalid."""
+    kv_cache_2d = kv_cache.reshape(kv_cache.shape[0], -1)
+    window = (1 + int(overlap)) * compress_ratio
+    device = state_cache.device
+
+    for token_idx in range(slot_mapping.shape[0]):
+        slot_id = int(slot_mapping[token_idx].item())
+        if slot_id < 0:
+            continue
+
+        position = int(positions[token_idx].item())
+        if (position + 1) % compress_ratio != 0:
+            continue
+
+        kv_slot_idx = int(kv_slot_mapping[token_idx].item())
+        if kv_slot_idx < 0:
+            continue
+
+        req_idx = int(token_to_req_indices[token_idx].item())
+        start = position - window + 1
+        kv_rows: list[torch.Tensor] = []
+        score_rows: list[torch.Tensor] = []
+        for local_idx in range(window):
+            pos = start + local_idx
+            if pos < 0:
+                kv_rows.append(torch.zeros(head_size, device=device))
+                score_rows.append(
+                    torch.full((head_size, ), float("-inf"), device=device)
+                )
+                continue
+
+            block_in_seq = pos // block_size
+            pos_in_block = pos % block_size
+            physical_block = int(block_table[req_idx, block_in_seq].item())
+            head_offset = int(local_idx >= compress_ratio) * head_size
+            row = state_cache[physical_block, pos_in_block]
+            kv_rows.append(row[head_offset:head_offset + head_size].float())
+            score_rows.append(
+                row[
+                    state_width + head_offset:
+                    state_width + head_offset + head_size
+                ].float()
+            )
+
+        score = torch.stack(score_rows).softmax(dim=0)
+        kv = torch.stack(kv_rows)
+        compressed_kv = (kv * score).sum(dim=0)
+        variance = compressed_kv.pow(2).sum() / head_size
+        normed = compressed_kv * torch.rsqrt(variance + rms_norm_eps)
+        normed = normed * rms_norm_weight.float()
+        rotated = _apply_gptj_rope_tail_1d(
+            normed,
+            position,
+            compress_ratio,
+            cos_sin_cache,
+            rope_head_dim,
+        )
+
+        kv_block_idx = kv_slot_idx // kv_cache_block_size
+        kv_pos_in_block = kv_slot_idx % kv_cache_block_size
+        if head_size == 512:
+            _store_fp8_sparse_attention_cache_torch(
+                kv_cache_2d,
+                kv_block_idx,
+                kv_pos_in_block,
+                kv_cache_block_size,
+                token_stride,
+                scale_dim,
+                normed,
+                rotated,
+                rope_head_dim,
+                fp8_max,
+                quant_block,
+            )
+        elif head_size == 128:
+            _store_fp8_indexer_cache_torch(
+                kv_cache_2d,
+                kv_block_idx,
+                kv_pos_in_block,
+                kv_cache_block_size,
+                token_stride,
+                scale_dim,
+                rotated,
+                fp8_max,
+            )
+        else:
+            raise RuntimeError(
+                f"Unsupported DeepSeek compressor fallback head size: {head_size}"
+            )
 
 
 class DeepseekCompressor(nn.Module):
@@ -342,6 +583,34 @@ class DeepseekCompressor(nn.Module):
         cos_sin_cache = rotary_emb.cos_sin_cache
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
+
+        if _should_use_torch_fused_compressor_fallback(
+            kv_cache, self.use_fp4_cache
+        ):
+            _torch_fused_compress_norm_rope_insert_fp8_fallback(
+                state_cache,
+                token_to_req_indices,
+                positions,
+                slot_mapping,
+                block_table,
+                block_size,
+                self.norm.weight,
+                self.rms_norm_eps,
+                cos_sin_cache,
+                kv_cache,
+                k_cache_metadata.slot_mapping,
+                kv_cache.shape[1],
+                self.head_dim,
+                state_width,
+                self.compress_ratio,
+                self.overlap,
+                self.rope_head_dim,
+                448.0,
+                self._quant_block,
+                self._token_stride,
+                self._scale_dim,
+            )
+            return
 
         self._fused_kernel[(num_actual,)](
             # state cache
