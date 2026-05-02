@@ -354,7 +354,13 @@ def _mhc_pre_sm70_fast(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """SM70 fast path: cuBLAS fp16 GEMM + fused Triton post-GEMM kernel."""
+    """SM70 fast path: TurboMind MMA_884 GEMM + fused Triton post-GEMM kernel.
+
+    Uses sm70_f16_prepare + sm70_f16_gemm_out (Volta mma.sync.aligned.m8n8k4)
+    for the GEMM when available, falls back to cuBLAS fp16 GEMM otherwise.
+    A single Triton kernel handles norm/sigmoid/sinkhorn/mix.
+    The prepared weight is cached on the fn tensor (lazy, once per parameter).
+    """
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
     hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
@@ -365,14 +371,61 @@ def _mhc_pre_sm70_fast(
     num_tokens = residual_flat.shape[0]
     residual_vec = residual_flat.reshape(num_tokens, hc_hidden_size)
 
-    # Step 1: cuBLAS fp16 GEMM – [N, 16384] x [24, 16384]^T → [N, 24]
-    # Cache fp16 version of fn on the tensor itself to avoid repeated conversion.
-    fn_fp16 = getattr(fn, "_sm70_fp16_cache", None)
-    if fn_fp16 is None or fn_fp16.data_ptr() == 0:
-        fn_fp16 = fn.half()
-        fn._sm70_fp16_cache = fn_fp16  # type: ignore[attr-defined]
+    # Step 1: GEMM – [N, K] x [hc_mult3, K]^T → [N, hc_mult3]
+    # Try TurboMind MMA_884 first (requires N%32==0 padding), fall back to cuBLAS.
     res_fp16 = residual_vec if residual_vec.dtype == torch.float16 else residual_vec.half()
-    mixes_fp32 = (res_fp16 @ fn_fp16.t()).float()
+    if not res_fp16.is_contiguous():
+        res_fp16 = res_fp16.contiguous()
+
+    _use_tm = getattr(fn, "_sm70_use_turbomind", None)
+    if _use_tm is None:
+        # Decide once: use TurboMind if sm70_f16_prepare is available and
+        # K dimension satisfies alignment (K%16==0).
+        _use_tm = (
+            hasattr(torch.ops, "_C")
+            and hasattr(torch.ops._C, "sm70_f16_prepare")
+            and hc_hidden_size % 16 == 0
+        )
+        fn._sm70_use_turbomind = _use_tm  # type: ignore[attr-defined]
+
+    if _use_tm:
+        from vllm import _custom_ops as ops
+
+        _tm = getattr(fn, "_sm70_tm_prepared", None)
+        if _tm is None:
+            fn_fp16 = fn.half()
+            n_padded = ((hc_mult3 + 31) // 32) * 32
+            if n_padded != hc_mult3:
+                fn_padded = torch.zeros(
+                    n_padded, hc_hidden_size,
+                    dtype=torch.float16, device=fn.device,
+                )
+                fn_padded[:hc_mult3] = fn_fp16
+            else:
+                fn_padded = fn_fp16.contiguous()
+            prepared = ops.sm70_f16_prepare(fn_padded)
+            _tm = {
+                "weight": prepared[0],
+                "k_ld": int(prepared[1][0].item()),
+                "n_padded": n_padded,
+            }
+            fn._sm70_tm_prepared = _tm  # type: ignore[attr-defined]
+
+        n_padded = _tm["n_padded"]
+        gemm_out = torch.empty(
+            num_tokens, n_padded, dtype=torch.float16, device=residual.device,
+        )
+        ops.sm70_f16_gemm_out(
+            gemm_out, res_fp16, _tm["weight"], _tm["k_ld"], False
+        )
+        mixes_fp32 = gemm_out[:, :hc_mult3].float()
+    else:
+        # cuBLAS fp16 fallback (still faster than float32 torch matmul)
+        fn_fp16 = getattr(fn, "_sm70_fp16_cache", None)
+        if fn_fp16 is None:
+            fn_fp16 = fn.half()
+            fn._sm70_fp16_cache = fn_fp16  # type: ignore[attr-defined]
+        mixes_fp32 = (res_fp16 @ fn_fp16.t()).float()
 
     # Step 2: Compute squared-sum / dim for RMS norm (one value per token)
     rms_input = res_fp16.float().square().sum(dim=-1) / hc_hidden_size
