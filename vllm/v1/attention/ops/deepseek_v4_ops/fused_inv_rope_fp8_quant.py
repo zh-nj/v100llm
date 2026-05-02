@@ -209,7 +209,7 @@ def fused_inv_rope_fp8_quant(
 
     if _should_use_torch_fallback(o):
         assert not tma_aligned_scales, "SM70 fallback does not support SM100 scales"
-        _sm70_fused_inv_rope_fp8_quant(
+        _torch_inv_rope_fp8_quant_fallback(
             o,
             positions,
             cos_sin_cache,
