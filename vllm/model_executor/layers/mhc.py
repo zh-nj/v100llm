@@ -65,18 +65,18 @@ def _is_sm70_fast_path_available() -> bool:
 
 @triton.jit
 def _mhc_pre_post_gemm_kernel(
-    # GEMM result: [num_tokens, hc_mult3] (float32)
-    mixes_ptr,
-    # RMS input: [num_tokens] (float32) – pre-computed squared-sum / dim
-    rms_input_ptr,
+    # GEMM result: [num_tokens, n_padded] (float16) – raw TurboMind output
+    gemm_out_ptr,
+    # Residual: [num_tokens, hc_mult * hidden_size] (fp16)
+    residual_vec_ptr,
+    # Residual 3D: [num_tokens, hc_mult, hidden_size] (fp16)
+    residual_ptr,
     # Constants (small, loaded once)
     hc_scale_ptr,  # [3] float32
     hc_base_ptr,  # [hc_mult3] float32
-    # Residual: [num_tokens, hc_mult, hidden_size] (fp16/fp32)
-    residual_ptr,
     # Outputs
-    post_mix_ptr,  # [num_tokens, hc_mult, 1] float32
-    comb_mix_ptr,  # [num_tokens, hc_mult, hc_mult] float32
+    post_mix_ptr,  # [num_tokens, hc_mult] float32
+    comb_mix_ptr,  # [num_tokens, hc_mult * hc_mult] float32
     layer_input_ptr,  # [num_tokens, hidden_size] fp16
     # Scalar params
     rms_eps: tl.constexpr,
@@ -86,91 +86,89 @@ def _mhc_pre_post_gemm_kernel(
     sinkhorn_repeat: tl.constexpr,
     # Dims
     hidden_size: tl.constexpr,
+    hc_hidden_size: tl.constexpr,
     hc_mult: tl.constexpr,
     hc_mult3: tl.constexpr,
+    n_padded: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    RMS_BLOCK: tl.constexpr,
 ):
-    """Fused post-GEMM kernel for mhc_pre on SM70.
+    """Fully fused post-GEMM kernel for mhc_pre on SM70.
 
-    One program per token. Processes the tiny [hc_mult3]-element mix vector
-    (norm, sigmoid, sinkhorn) and then streams through the residual to
-    compute the weighted-sum layer_input.
+    One program per token. Fuses: GEMM output fp16→fp32 slice, RMS norm
+    computation, sigmoid, sinkhorn normalisation, and weighted-sum
+    layer_input — all in a single kernel launch.
     """
     pid = tl.program_id(0)
 
-    # --- Load mix vector [hc_mult3] ---
-    mix_offsets = tl.arange(0, 32)  # hc_mult3 <= 24, pad to 32
+    # --- 1. Load GEMM output (fp16) and cast to fp32 ---
+    mix_offsets = tl.arange(0, 32)  # hc_mult3 <= 24, pad to power-of-2
     mix_mask = mix_offsets < hc_mult3
     mixes_raw = tl.load(
-        mixes_ptr + pid * hc_mult3 + mix_offsets, mask=mix_mask, other=0.0
-    )
+        gemm_out_ptr + pid * n_padded + mix_offsets, mask=mix_mask, other=0.0
+    ).to(tl.float32)
 
-    # --- RMS norm ---
-    rms_val = tl.load(rms_input_ptr + pid)
-    rms_inv = tl.rsqrt(rms_val + rms_eps)
+    # --- 2. Compute RMS norm inline (avoid separate kernel) ---
+    # Accumulate squared sum over residual_vec in blocks
+    sq_sum = tl.zeros([1], dtype=tl.float32)
+    for rms_start in range(0, hc_hidden_size, RMS_BLOCK):
+        rms_offsets = rms_start + tl.arange(0, RMS_BLOCK)
+        rms_mask = rms_offsets < hc_hidden_size
+        rv = tl.load(
+            residual_vec_ptr + pid * hc_hidden_size + rms_offsets,
+            mask=rms_mask, other=0.0,
+        ).to(tl.float32)
+        sq_sum += tl.sum(rv * rv, axis=0)
+    rms_inv = tl.rsqrt(sq_sum / hc_hidden_size + rms_eps)
+
+    # --- 3. Apply RMS norm to mixes ---
     mixes = mixes_raw * rms_inv
 
-    # --- Load hc_scale and hc_base ---
+    # --- 4. Load constants ---
     hc_scale_0 = tl.load(hc_scale_ptr)
     hc_scale_1 = tl.load(hc_scale_ptr + 1)
     hc_scale_2 = tl.load(hc_scale_ptr + 2)
-    hc_base = tl.load(hc_base_ptr + mix_offsets, mask=mix_mask, other=0.0)
 
-    # --- pre_mix: sigmoid(mixes[:hc_mult] * scale[0] + base[:hc_mult]) + eps ---
-    pre_offsets = tl.arange(0, 4)  # hc_mult == 4
-    pre_vals = tl.load(
-        mixes_ptr + pid * hc_mult3 + pre_offsets,
-        mask=pre_offsets < hc_mult, other=0.0,
-    )
-    # re-normalize (we already have mixes, extract pre part)
-    pre_vals = mixes_raw * rms_inv  # reuse
-    # Extract first hc_mult elements using offsets
-    # Actually, `mixes` is a 32-wide vector; we index into it
+    # --- 5. pre_mix: first hc_mult elements ---
+    pre_offsets = tl.arange(0, 4)
     pre_base = tl.load(hc_base_ptr + pre_offsets, mask=pre_offsets < hc_mult, other=0.0)
-    # We need to extract mixes[0:hc_mult] – since mixes is contiguous, we
-    # can just re-load the normalised slice.
     pre_raw = tl.load(
-        mixes_ptr + pid * hc_mult3 + pre_offsets,
+        gemm_out_ptr + pid * n_padded + pre_offsets,
         mask=pre_offsets < hc_mult, other=0.0,
-    ) * rms_inv
+    ).to(tl.float32) * rms_inv
     pre_mix = tl.sigmoid(pre_raw * hc_scale_0 + pre_base) + hc_pre_eps
 
-    # --- post_mix: sigmoid(mixes[hc_mult:2*hc_mult] * scale[1] + ...) * mult ---
+    # --- 6. post_mix: next hc_mult elements ---
     post_offsets = hc_mult + tl.arange(0, 4)
     post_base = tl.load(
         hc_base_ptr + post_offsets, mask=post_offsets < 2 * hc_mult, other=0.0
     )
     post_raw = tl.load(
-        mixes_ptr + pid * hc_mult3 + post_offsets,
+        gemm_out_ptr + pid * n_padded + post_offsets,
         mask=post_offsets < 2 * hc_mult, other=0.0,
-    ) * rms_inv
+    ).to(tl.float32) * rms_inv
     post_mix = tl.sigmoid(post_raw * hc_scale_1 + post_base) * hc_post_mult_value
 
-    # Store post_mix: [hc_mult, 1]
     tl.store(
         post_mix_ptr + pid * hc_mult + tl.arange(0, 4),
-        post_mix,
-        mask=tl.arange(0, 4) < hc_mult,
+        post_mix, mask=tl.arange(0, 4) < hc_mult,
     )
 
-    # --- comb_mix: sinkhorn normalisation on [hc_mult, hc_mult] matrix ---
-    # Load comb raw values (hc_mult * hc_mult = 16 elements)
+    # --- 7. comb_mix: sinkhorn on [hc_mult, hc_mult] ---
     comb_offset_base = 2 * hc_mult
-    comb_offsets = tl.arange(0, 16)  # hc_mult^2 = 16
+    comb_offsets = tl.arange(0, 16)
     comb_raw = tl.load(
-        mixes_ptr + pid * hc_mult3 + comb_offset_base + comb_offsets,
+        gemm_out_ptr + pid * n_padded + comb_offset_base + comb_offsets,
         mask=comb_offsets < hc_mult * hc_mult, other=0.0,
-    ) * rms_inv
+    ).to(tl.float32) * rms_inv
     comb_base = tl.load(
         hc_base_ptr + comb_offset_base + comb_offsets,
         mask=comb_offsets < hc_mult * hc_mult, other=0.0,
     )
     comb = comb_raw * hc_scale_2 + comb_base
 
-    # softmax per row (4 rows of 4)
-    # Reshape: row = offset // hc_mult, col = offset % hc_mult
-    row_idx = comb_offsets // hc_mult  # 0,0,0,0,1,1,1,1,...
-    # Row max
+    # Softmax per row
+    row_idx = comb_offsets // hc_mult
     NEG_INF: tl.constexpr = -1e30
     row0_mask = row_idx == 0
     row1_mask = row_idx == 1
@@ -205,7 +203,6 @@ def _mhc_pre_post_gemm_kernel(
               tl.where(col2_mask, cs2, cs3)))
     comb = comb / (col_sum + hc_sinkhorn_eps)
 
-    # Additional sinkhorn iterations
     for _ in range(sinkhorn_repeat - 1):
         rs0 = tl.sum(tl.where(row0_mask, comb, 0.0), axis=0)
         rs1 = tl.sum(tl.where(row1_mask, comb, 0.0), axis=0)
@@ -214,7 +211,6 @@ def _mhc_pre_post_gemm_kernel(
         row_s = tl.where(row0_mask, rs0, tl.where(row1_mask, rs1,
                  tl.where(row2_mask, rs2, rs3)))
         comb = comb / (row_s + hc_sinkhorn_eps)
-
         cs0_ = tl.sum(tl.where(col0_mask, comb, 0.0), axis=0)
         cs1_ = tl.sum(tl.where(col1_mask, comb, 0.0), axis=0)
         cs2_ = tl.sum(tl.where(col2_mask, comb, 0.0), axis=0)
@@ -223,15 +219,12 @@ def _mhc_pre_post_gemm_kernel(
                  tl.where(col2_mask, cs2_, cs3_)))
         comb = comb / (col_s + hc_sinkhorn_eps)
 
-    # Store comb_mix: [hc_mult, hc_mult]
     tl.store(
         comb_mix_ptr + pid * hc_mult * hc_mult + comb_offsets,
-        comb,
-        mask=comb_offsets < hc_mult * hc_mult,
+        comb, mask=comb_offsets < hc_mult * hc_mult,
     )
 
-    # --- layer_input: einsum("nh,nhd->nd", pre_mix, residual) ---
-    # Stream through hidden_size in blocks
+    # --- 8. layer_input: einsum("nh,nhd->nd", pre_mix, residual) ---
     for h_start in range(0, hidden_size, BLOCK_H):
         h_offsets = h_start + tl.arange(0, BLOCK_H)
         h_mask = h_offsets < hidden_size
@@ -242,15 +235,12 @@ def _mhc_pre_post_gemm_kernel(
                 + hc_idx * hidden_size + h_offsets,
                 mask=h_mask, other=0.0,
             ).to(tl.float32)
-            # pre_mix[hc_idx] – extract scalar from the 4-wide vector
-            # Use tl.sum with a mask to extract the single element
             pm_mask = tl.arange(0, 4) == hc_idx
             pm_val = tl.sum(tl.where(pm_mask, pre_mix, 0.0), axis=0)
             acc += pm_val * r_vals
         tl.store(
             layer_input_ptr + pid * hidden_size + h_offsets,
-            acc.to(tl.float16),
-            mask=h_mask,
+            acc.to(tl.float16), mask=h_mask,
         )
 
 
@@ -412,25 +402,24 @@ def _mhc_pre_sm70_fast(
             fn._sm70_tm_prepared = _tm  # type: ignore[attr-defined]
 
         n_padded = _tm["n_padded"]
-        gemm_out = torch.empty(
+        gemm_out_raw = torch.empty(
             num_tokens, n_padded, dtype=torch.float16, device=residual.device,
         )
         ops.sm70_f16_gemm_out(
-            gemm_out, res_fp16, _tm["weight"], _tm["k_ld"], False
+            gemm_out_raw, res_fp16, _tm["weight"], _tm["k_ld"], False
         )
-        mixes_fp32 = gemm_out[:, :hc_mult3].float()
+        gemm_out = gemm_out_raw
+        n_padded = _tm["n_padded"]
     else:
         # cuBLAS fp16 fallback (still faster than float32 torch matmul)
         fn_fp16 = getattr(fn, "_sm70_fp16_cache", None)
         if fn_fp16 is None:
             fn_fp16 = fn.half()
             fn._sm70_fp16_cache = fn_fp16  # type: ignore[attr-defined]
-        mixes_fp32 = (res_fp16 @ fn_fp16.t()).float()
+        gemm_out = res_fp16 @ fn_fp16.t()
+        n_padded = hc_mult3
 
-    # Step 2: Compute squared-sum / dim for RMS norm (one value per token)
-    rms_input = res_fp16.float().square().sum(dim=-1) / hc_hidden_size
-
-    # Step 3: Allocate outputs
+    # Allocate outputs
     post_mix = torch.empty(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device
     )
@@ -441,16 +430,19 @@ def _mhc_pre_sm70_fast(
         num_tokens, hidden_size, dtype=torch.float16, device=residual.device
     )
 
-    # Step 4: Fused Triton post-GEMM kernel
+    # Fully fused Triton kernel: reads GEMM fp16 output + residual_vec,
+    # computes RMS norm inline, then sigmoid/sinkhorn/weighted-sum.
+    # Eliminates 3 separate CUDA kernels (slice, float cast, squared-sum).
     BLOCK_H = min(1024, hidden_size)
+    RMS_BLOCK = min(4096, hc_hidden_size)
     grid = (num_tokens,)
     res_fp16_flat = residual_flat if residual_flat.dtype == torch.float16 else residual_flat.half()
     _mhc_pre_post_gemm_kernel[grid](
-        mixes_fp32,
-        rms_input,
+        gemm_out,
+        res_fp16,
+        res_fp16_flat,
         hc_scale,
         hc_base,
-        res_fp16_flat,
         post_mix,
         comb_mix,
         layer_input,
@@ -460,9 +452,12 @@ def _mhc_pre_sm70_fast(
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
         hidden_size=hidden_size,
+        hc_hidden_size=hc_hidden_size,
         hc_mult=hc_mult,
         hc_mult3=hc_mult3,
+        n_padded=n_padded,
         BLOCK_H=BLOCK_H,
+        RMS_BLOCK=RMS_BLOCK,
     )
 
     post_mix = post_mix.view(*outer_shape, hc_mult, 1)
