@@ -89,6 +89,245 @@ _QK_TOKEN_DATA_BYTES = _QK_NOPE_DIM + _QK_ROPE_DIM * 2
 _QK_SCALE_BYTES = 8
 _SM70_FP16_ATTENTION_OUTPUT_MAX = float(torch.finfo(torch.float16).max)
 
+# Triton import for SM70 fused kernels
+from vllm.triton_utils import tl, triton
+
+
+@triton.jit
+def _sm70_fused_qnorm_rope_kv_insert_kernel(
+    # Q: [num_tokens, head_dim] fp16 (in-place)
+    q_ptr,
+    # KV: [num_tokens, head_dim] fp16 (read-only)
+    kv_ptr,
+    # K cache: [num_blocks, block_bytes] uint8
+    k_cache_ptr,
+    # Slot mapping: [num_tokens] int64
+    slot_mapping_ptr,
+    # Positions: [num_tokens] int64
+    positions_ptr,
+    # Cos-sin cache: [max_pos, rope_dim] fp16
+    cos_sin_cache_ptr,
+    # Params
+    eps: tl.constexpr,
+    block_size: tl.constexpr,
+    head_dim: tl.constexpr,  # 512
+    nope_dim: tl.constexpr,  # 448
+    rope_dim: tl.constexpr,  # 64
+    half_rope: tl.constexpr,  # 32
+    quant_block: tl.constexpr,  # 64
+    fp8_max: tl.constexpr,  # 448.0
+    token_data_bytes: tl.constexpr,  # 576
+    scale_bytes: tl.constexpr,  # 8
+    max_pos: tl.constexpr,
+    block_stride: tl.constexpr,  # total bytes per cache block
+    NOPE_BLOCK: tl.constexpr,  # processing block for nope part
+):
+    """Fused Q-norm + RoPE + KV-RoPE + FP8-quant + cache-insert for SM70.
+
+    One Triton program per token. Eliminates ~15 separate CUDA kernel
+    launches from the torch fallback path.
+    """
+    pid = tl.program_id(0)
+
+    # ---- Load position and cos/sin ----
+    pos = tl.load(positions_ptr + pid)
+
+    cos_offsets = tl.arange(0, 32)  # half_rope = 32
+    cos_mask = cos_offsets < half_rope
+    cos_vals = tl.load(
+        cos_sin_cache_ptr + pos * rope_dim + cos_offsets,
+        mask=cos_mask, other=0.0,
+    ).to(tl.float32)
+    sin_vals = tl.load(
+        cos_sin_cache_ptr + pos * rope_dim + half_rope + cos_offsets,
+        mask=cos_mask, other=0.0,
+    ).to(tl.float32)
+
+    # ---- Q: RMS norm ----
+    sq_sum = tl.zeros([1], dtype=tl.float32)
+    for start in range(0, head_dim, NOPE_BLOCK):
+        offsets = start + tl.arange(0, NOPE_BLOCK)
+        mask = offsets < head_dim
+        qv = tl.load(q_ptr + pid * head_dim + offsets, mask=mask, other=0.0).to(tl.float32)
+        sq_sum += tl.sum(qv * qv, axis=0)
+    rms_inv = tl.rsqrt(sq_sum / head_dim + eps)
+
+    # ---- Q: apply norm + RoPE, write back ----
+    # Nope part: just norm (no RoPE)
+    for start in range(0, nope_dim, NOPE_BLOCK):
+        offsets = start + tl.arange(0, NOPE_BLOCK)
+        mask = offsets < nope_dim
+        qv = tl.load(q_ptr + pid * head_dim + offsets, mask=mask, other=0.0).to(tl.float32)
+        qv = qv * rms_inv
+        tl.store(q_ptr + pid * head_dim + offsets, qv.to(tl.float16), mask=mask)
+
+    # Rope part: norm + GPT-J rotation
+    rope_offsets_even = tl.arange(0, 32)  # even indices: 0,1,...,31
+    rope_offsets_odd = tl.arange(0, 32)
+    even_mask = rope_offsets_even < half_rope
+    # Load Q rope part (interleaved even/odd)
+    q_even = tl.load(
+        q_ptr + pid * head_dim + nope_dim + rope_offsets_even * 2,
+        mask=even_mask, other=0.0,
+    ).to(tl.float32) * rms_inv
+    q_odd = tl.load(
+        q_ptr + pid * head_dim + nope_dim + rope_offsets_odd * 2 + 1,
+        mask=even_mask, other=0.0,
+    ).to(tl.float32) * rms_inv
+
+    # GPT-J rotation: even' = even*cos - odd*sin, odd' = odd*cos + even*sin
+    q_even_rot = q_even * cos_vals - q_odd * sin_vals
+    q_odd_rot = q_odd * cos_vals + q_even * sin_vals
+    tl.store(
+        q_ptr + pid * head_dim + nope_dim + rope_offsets_even * 2,
+        q_even_rot.to(tl.float16), mask=even_mask,
+    )
+    tl.store(
+        q_ptr + pid * head_dim + nope_dim + rope_offsets_odd * 2 + 1,
+        q_odd_rot.to(tl.float16), mask=even_mask,
+    )
+
+    # ---- KV: RoPE + FP8 quant + cache insert (all in Triton) ----
+    slot_idx = tl.load(slot_mapping_ptr + pid)
+    if slot_idx < 0:
+        return
+
+    block_idx = slot_idx // block_size
+    pos_in_block = slot_idx % block_size
+    cache_base = k_cache_ptr + block_idx.to(tl.int64) * block_stride
+    token_data_ptr = cache_base + pos_in_block * token_data_bytes
+    token_scale_ptr = cache_base + block_size * token_data_bytes + pos_in_block * scale_bytes
+
+    # KV RoPE on rope part (last 64 elements)
+    kv_even = tl.load(
+        kv_ptr + pid * head_dim + nope_dim + rope_offsets_even * 2,
+        mask=even_mask, other=0.0,
+    ).to(tl.float32)
+    kv_odd = tl.load(
+        kv_ptr + pid * head_dim + nope_dim + rope_offsets_odd * 2 + 1,
+        mask=even_mask, other=0.0,
+    ).to(tl.float32)
+    kv_even_rot = kv_even * cos_vals - kv_odd * sin_vals
+    kv_odd_rot = kv_odd * cos_vals + kv_even * sin_vals
+
+    # Store rope part as bf16 in cache
+    bf16_out_ptr = (token_data_ptr + nope_dim).to(tl.pointer_type(tl.bfloat16))
+    tl.store(bf16_out_ptr + rope_offsets_even * 2, kv_even_rot.to(tl.bfloat16), mask=even_mask)
+    tl.store(bf16_out_ptr + rope_offsets_odd * 2 + 1, kv_odd_rot.to(tl.bfloat16), mask=even_mask)
+
+    # KV nope part: UE8M0 FP8 quant + store (all in Triton, no torch)
+    # Manual fp8 e4m3fn encoding via fp16 bit manipulation.
+    # After UE8M0 scaling, values are in [-448, 448] so no overflow.
+    for qb in range(nope_dim // quant_block):
+        qb_offsets = qb * quant_block + tl.arange(0, 64)
+        qb_mask = qb_offsets < nope_dim
+        nope_vals = tl.load(
+            kv_ptr + pid * head_dim + qb_offsets,
+            mask=qb_mask, other=0.0,
+        ).to(tl.float32)
+
+        # UE8M0: scale = 2^ceil(log2(absmax / fp8_max))
+        abs_vals = tl.abs(nope_vals)
+        block_max = tl.max(abs_vals, axis=0)
+        block_max = tl.maximum(block_max, 1e-4)
+        raw_scale = block_max / fp8_max
+        exponent = tl.ceil(tl.log2(raw_scale))
+        scale = tl.exp2(exponent)
+
+        # Scale and clamp to fp8 range
+        x_scaled = nope_vals / scale
+        x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
+
+        # fp16→fp8 e4m3fn via bit manipulation
+        # Cast to fp16, extract bits
+        x_fp16 = x_clamped.to(tl.float16)
+        fp16_bits = x_fp16.to(tl.uint16, bitcast=True)
+        fp16_sign = (fp16_bits >> 15) & 1  # 1 bit
+        fp16_exp = (fp16_bits >> 10) & 0x1F  # 5 bits, bias=15
+        fp16_mant = fp16_bits & 0x3FF  # 10 bits
+
+        # fp8 exponent = fp16_exp - 8 (bias 15→7)
+        exp_fp8 = (fp16_exp.to(tl.int32) - 8)
+
+        # Round mantissa from 10 to 3 bits (round-to-nearest-even)
+        mant_fp8 = ((fp16_mant >> 7) & 0x7).to(tl.int32)
+        round_bit = ((fp16_mant >> 6) & 1).to(tl.int32)
+        sticky = (fp16_mant & 0x3F).to(tl.int32)
+        do_round = (round_bit != 0) & ((sticky != 0) | ((mant_fp8 & 1) != 0))
+        mant_fp8 = tl.where(do_round, mant_fp8 + 1, mant_fp8)
+        # Handle mantissa carry
+        carry = (mant_fp8 > 7)
+        mant_fp8 = tl.where(carry, 0, mant_fp8)
+        exp_fp8 = tl.where(carry, exp_fp8 + 1, exp_fp8)
+
+        # Clamp exp=15 mant to 6 (e4m3fn: mant=7 at exp=15 is NaN)
+        mant_fp8 = tl.where((exp_fp8 == 15) & (mant_fp8 > 6), 6, mant_fp8)
+        # Overflow: exp > 15 → max value (0x7E)
+        overflow = exp_fp8 > 15
+        exp_fp8 = tl.where(overflow, 15, exp_fp8)
+        mant_fp8 = tl.where(overflow, 6, mant_fp8)
+        # Underflow: exp <= 0 → zero (denorms negligible for UE8M0 scaled values)
+        underflow = exp_fp8 <= 0
+        exp_fp8 = tl.where(underflow, 0, exp_fp8)
+        mant_fp8 = tl.where(underflow, 0, mant_fp8)
+        # Zero input
+        is_zero = fp16_exp == 0
+        exp_fp8 = tl.where(is_zero, 0, exp_fp8)
+        mant_fp8 = tl.where(is_zero, 0, mant_fp8)
+
+        # Assemble fp8 byte: sign(1) | exp(4) | mant(3)
+        fp8_byte = (fp16_sign.to(tl.uint8) << 7) | (exp_fp8.to(tl.uint8) << 3) | mant_fp8.to(tl.uint8)
+        tl.store(token_data_ptr + qb_offsets, fp8_byte, mask=qb_mask)
+
+        # Store UE8M0 encoded scale
+        encoded = (exponent + 127.0)
+        encoded = tl.maximum(tl.minimum(encoded, 255.0), 0.0)
+        tl.store(token_scale_ptr + qb, encoded.to(tl.uint8))
+
+    # Padding scale byte at index 7
+    tl.store(token_scale_ptr + 7, tl.zeros((), dtype=tl.uint8))
+
+
+def _sm70_fused_qnorm_rope_kv_insert(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    block_size: int,
+) -> None:
+    """SM70 fully fused Triton kernel for Q-norm + RoPE + KV FP8 quant + cache insert.
+
+    Single kernel launch replaces ~15 CUDA ops from the torch fallback.
+    FP8 e4m3fn encoding done via fp16 bit manipulation (no tl.float8e4nv needed).
+    """
+    num_tokens = q.shape[0]
+    if num_tokens == 0:
+        return
+
+    head_dim = q.shape[-1]
+    block_stride = k_cache.shape[1]
+
+    grid = (num_tokens,)
+    _sm70_fused_qnorm_rope_kv_insert_kernel[grid](
+        q, kv, k_cache, slot_mapping, positions, cos_sin_cache,
+        eps=eps,
+        block_size=block_size,
+        head_dim=head_dim,
+        nope_dim=_QK_NOPE_DIM,
+        rope_dim=_QK_ROPE_DIM,
+        half_rope=_QK_ROPE_DIM // 2,
+        quant_block=_QK_QUANT_BLOCK,
+        fp8_max=_QK_FP8_MAX,
+        token_data_bytes=_QK_TOKEN_DATA_BYTES,
+        scale_bytes=_QK_SCALE_BYTES,
+        max_pos=cos_sin_cache.shape[0],
+        block_stride=block_stride,
+        NOPE_BLOCK=128,
+    )
+
 
 def _trace_nonfinite_tensor(label: str, tensor: torch.Tensor) -> None:
     if os.getenv("VLLM_DEEPSEEK_V4_NAN_TRACE", "0") != "1":
@@ -822,7 +1061,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
         # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
         if _should_use_qnorm_rope_kv_insert_fallback(q):
-            _torch_qnorm_rope_kv_insert_fallback(
+            _sm70_fused_qnorm_rope_kv_insert(
                 q,
                 kv,
                 swa_kv_cache_2d,
