@@ -1127,7 +1127,7 @@ def deepseek_v4_fp8_einsum(
     recipe: list[int],
 ) -> None:
     if _should_use_torch_fp8_einsum_fallback(a):
-        _deepseek_v4_fp8_einsum_torch_fallback(a, a_scale, b, b_scale, out, equation)
+        _sm70_fp8_einsum_bmm(a, a_scale, b, b_scale, out, equation)
         return
     fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
 
@@ -1168,6 +1168,55 @@ def _deepseek_v4_fp8_einsum_torch_fallback(
     ).repeat_interleave(128, dim=2)
     result = torch.einsum(equation, a_deq, b_deq)
     out.copy_(result.to(out.dtype))
+
+
+def _sm70_fp8_einsum_bmm(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+    equation: str,
+) -> None:
+    """SM70 fast path: pre-dequant weight to fp16 (cached) + bmm.
+
+    The wo_a weight (b) is dequantized to fp16 once and cached on the tensor.
+    At runtime, only the activation (a) needs dequant, then a single cuBLAS
+    bmm computes the grouped einsum.
+    """
+    if equation != "bhr,hdr->bhd":
+        return _deepseek_v4_fp8_einsum_torch_fallback(
+            a, a_scale, b, b_scale, out, equation
+        )
+
+    groups = a.shape[1]
+    hidden = a.shape[2]
+    rank = b.shape[1] if b.dim() == 3 else b.shape[0] // groups
+
+    # Lazily pre-dequant b (weight) to fp16 and cache as [groups, hidden, rank]
+    # for bmm: [groups, 1, hidden] @ [groups, hidden, rank] → [groups, 1, rank]
+    b_t_fp16 = getattr(b, "_sm70_predequant_t", None)
+    if b_t_fp16 is None:
+        b_3d = b.reshape(groups, rank, hidden)
+        weight_scale_shape = (groups, rank // 128, hidden // 128)
+        b_scale_3d = b_scale.reshape(weight_scale_shape)
+        b_deq = b_3d.float() * b_scale_3d.repeat_interleave(
+            128, dim=1
+        ).repeat_interleave(128, dim=2)
+        b_t_fp16 = b_deq.half().transpose(1, 2).contiguous()  # [groups, hidden, rank]
+        b._sm70_predequant_t = b_t_fp16  # type: ignore[attr-defined]
+
+    # Dequant a (activation) to fp16
+    a_blocks = a_scale.shape[-1]
+    a_deq = (a.float() * a_scale.repeat_interleave(
+        hidden // a_blocks, dim=-1
+    )).half()
+
+    # bmm: [groups, batch, hidden] @ [groups, hidden, rank] → [groups, batch, rank]
+    batch = a_deq.shape[0]
+    a_3d = a_deq.transpose(0, 1)  # [groups, batch, hidden]
+    result = torch.bmm(a_3d, b_t_fp16)  # [groups, batch, rank]
+    out.copy_(result.transpose(0, 1).to(out.dtype))
 
 
 def deepseek_v4_fp8_einsum_fake(
