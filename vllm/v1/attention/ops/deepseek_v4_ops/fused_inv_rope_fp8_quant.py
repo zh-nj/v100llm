@@ -35,6 +35,7 @@ def _fused_inv_rope_fp8_quant_per_head(
     ROPE_START: tl.constexpr,
     HALF_ROPE: tl.constexpr,
     TMA_ALIGNED_SCALES: tl.constexpr,
+    USE_SM70_FP8_ENCODE: tl.constexpr,
 ):
     # int64: stride multiply overflows int32 past num_tokens=32768 (IMA).
     pid_token = tl.program_id(0).to(tl.int64)
@@ -103,7 +104,7 @@ def _fused_inv_rope_fp8_quant_per_head(
         ),
         (HEAD_DIM,),
     )
-    x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
+    x_quant_f32 = tl.clamp(x / scales_exp, -fp8_max, fp8_max)
 
     fp8_base = (
         fp8_ptr
@@ -111,7 +112,42 @@ def _fused_inv_rope_fp8_quant_per_head(
         + pid_token * fp8_stride_token
         + qb_start * QUANT_GROUP_SIZE
     )
-    tl.store(fp8_base + offsets, x_quant)
+
+    if USE_SM70_FP8_ENCODE:
+        # SM70: manual FP8 e4m3fn encode via fp16 bit manipulation
+        # Convert to fp16 first (closest representable), then extract bits
+        # fp16: 1 sign + 5 exp (bias 15) + 10 mantissa
+        # fp8 e4m3fn: 1 sign + 4 exp (bias 7) + 3 mantissa
+        x_f16_bits = x_quant_f32.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32)
+        fp16_sign = (x_f16_bits >> 15) & 1
+        fp16_exp = (x_f16_bits >> 10) & 0x1F
+        fp16_mant = x_f16_bits & 0x3FF
+
+        # Rebias exponent: fp8_exp = fp16_exp - 15 + 7 = fp16_exp - 8
+        exp_fp8 = fp16_exp - 8
+        # Truncate mantissa: keep top 3 bits, round-to-nearest-even
+        mant_fp8 = (fp16_mant >> 7) & 0x7
+        round_bit = (fp16_mant >> 6) & 1
+        sticky = fp16_mant & 0x3F
+        do_round = round_bit & (sticky | (mant_fp8 & 1))
+        mant_fp8 = mant_fp8 + do_round
+        # Handle mantissa overflow
+        carry = mant_fp8 > 7
+        mant_fp8 = tl.where(carry, 0, mant_fp8)
+        exp_fp8 = tl.where(carry, exp_fp8 + 1, exp_fp8)
+        # Clamp to fp8 e4m3fn max (exp=15, mant=6 → 448.0)
+        is_max_exceeded = (exp_fp8 == 15) & (mant_fp8 > 6)
+        mant_fp8 = tl.where(is_max_exceeded, 6, mant_fp8)
+        is_overflow = exp_fp8 > 15
+        exp_fp8 = tl.where(is_overflow, 15, exp_fp8)
+        mant_fp8 = tl.where(is_overflow, 6, mant_fp8)
+        # Underflow: subnormals → zero
+        is_underflow = (exp_fp8 <= 0) | (fp16_exp == 0)
+        exp_fp8 = tl.where(is_underflow, 0, exp_fp8)
+        mant_fp8 = tl.where(is_underflow, 0, mant_fp8)
+
+        x_uint8 = ((fp16_sign << 7) | (exp_fp8 << 3) | mant_fp8).to(tl.uint8)
+        tl.store(fp8_base + offsets, x_uint8)
 
     block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
     qb_indices = qb_start + block_offsets
@@ -209,20 +245,9 @@ def fused_inv_rope_fp8_quant(
 
     if _should_use_torch_fallback(o):
         assert not tma_aligned_scales, "SM70 fallback does not support SM100 scales"
-        _torch_inv_rope_fp8_quant_fallback(
-            o,
-            positions,
-            cos_sin_cache,
-            fp8_buf,
-            scale_buf,
-            n_groups=n_groups,
-            heads_per_group=heads_per_group,
-            nope_dim=nope_dim,
-            rope_dim=rope_dim,
-            quant_group_size=quant_group_size,
-            fp8_max=fp8_max,
-        )
-        return fp8_buf.transpose(0, 1), scale_buf.transpose(0, 1)
+        use_sm70_fp8 = True
+    else:
+        use_sm70_fp8 = False
 
     common_args = dict(
         heads_per_group=heads_per_group,
@@ -240,16 +265,19 @@ def fused_inv_rope_fp8_quant(
         ROPE_START=nope_dim % quant_group_size,
         HALF_ROPE=rope_dim // 2,
         TMA_ALIGNED_SCALES=tma_aligned_scales,
+        USE_SM70_FP8_ENCODE=use_sm70_fp8,
         num_stages=1,
         launch_pdl=False,
     )
 
     grid = (tma_aligned_T, n_groups * heads_per_group)
+    # On SM70, pass fp8_buf as uint8 view to avoid Triton fp8e4nv pointer type error
+    fp8_kernel_buf = fp8_buf.view(torch.uint8) if use_sm70_fp8 else fp8_buf
     _fused_inv_rope_fp8_quant_per_head[grid](
         o,
         positions,
         cos_sin_cache,
-        fp8_buf,
+        fp8_kernel_buf,
         scale_buf,
         num_tokens,
         **common_args,

@@ -413,11 +413,26 @@ def _dequantize_and_gather_k_kernel(
                 # Load quantized fp8 values (stored as uint8)
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
-                # Bitcast uint8 back to fp8
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                # Manual FP8 e4m3fn decode (works on all architectures)
+                # FP8 e4m3fn: 1 sign + 4 exp + 3 mantissa, bias=7
+                sign = ((x_uint8 >> 7) & 1).to(tl.int32)
+                exp_bits = ((x_uint8 >> 3) & 0xF).to(tl.int32)
+                mant_bits = (x_uint8 & 0x7).to(tl.int32)
+                # Normal: fp32_exp = exp_bits - 7 + 127 = exp_bits + 120
+                fp32_exp = exp_bits + 120
+                fp32_bits = (sign << 31) | (fp32_exp << 23) | (mant_bits << 20)
+                # Zero when exp_bits==0 and mant_bits==0
+                is_zero = (exp_bits == 0) & (mant_bits == 0)
+                fp32_bits = tl.where(is_zero, 0, fp32_bits)
+                # Subnormal fp8: exp_bits==0, mant!=0
+                is_subnorm = (exp_bits == 0) & (mant_bits != 0)
+                subnorm_val = mant_bits.to(tl.float32) * 1.953125e-3  # 2^(-9)
+                subnorm_val = tl.where(sign == 1, -subnorm_val, subnorm_val)
+                x_float = tl.where(
+                    is_subnorm,
+                    subnorm_val,
+                    fp32_bits.to(tl.float32, bitcast=True),
+                )
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
@@ -425,23 +440,23 @@ def _dequantize_and_gather_k_kernel(
                 exponent = encoded_scale.to(tl.float32) - 127.0
                 scale = tl.exp2(exponent)
 
-                # Dequantize: bf16_value = fp8_value * scale
+                # Dequantize: value = fp8_value * scale
                 x_dequant = x_float * scale
 
-                # Store as bf16
-                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+                # Store to output as bf16 bits (output passed as uint16 view)
+                x_dq_u32 = x_dequant.to(tl.int32, bitcast=True)
+                bf16_bits = ((x_dq_u32 + 0x7FFF + ((x_dq_u32 >> 16) & 1)) >> 16).to(tl.uint16)
+                tl.store(output_row_ptr + offsets, bf16_bits, mask=mask)
 
         # ========== Copy BF16 portion directly ==========
         bf16_output_offset = fp8_dim  # After 448 elements in output
 
-        # Read bf16 from cache
-        bf16_cache_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
-
-        # Process in chunks of 16
+        # Load bf16 bytes as uint16, copy directly to output (also uint16 view of bf16)
+        bf16_cache_u16_ptr = token_bf16_ptr.to(tl.pointer_type(tl.uint16))
         for j in tl.static_range(bf16_dim // 16):
             chunk_offsets = j * 16 + tl.arange(0, 16)
-            bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
-            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+            bf16_u16 = tl.load(bf16_cache_u16_ptr + chunk_offsets)
+            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_u16)
 
 
 def dequantize_and_gather_k_cache(
@@ -465,24 +480,14 @@ def dequantize_and_gather_k_cache(
     FP8_MAX = 448.0
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
 
-    if _should_use_torch_fp8_cache_fallback(k_cache):
-        _torch_dequantize_and_gather_k_cache(
-            out,
-            k_cache,
-            seq_lens,
-            gather_lens,
-            block_table,
-            block_size,
-            offset,
-        )
-        return
-
     num_reqs = seq_lens.shape[0]
     NUM_WORKERS = 128
+    # Pass output as uint16 view to avoid Triton bf16 pointer issues on SM70
+    out_u16 = out.view(torch.uint16)
     _dequantize_and_gather_k_kernel[(num_reqs, NUM_WORKERS)](
-        out,
-        out.stride(0),
-        out.stride(1),
+        out_u16,
+        out_u16.stride(0),
+        out_u16.stride(1),
         k_cache,
         seq_lens,
         block_table,
