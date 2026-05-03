@@ -146,9 +146,16 @@ def sm70_fp8_paged_mqa_logits(
     batch_size, next_n, num_heads, head_dim = q.shape
     block_size = kv_cache.shape[1]
 
-    # Ensure context_lens is 2D [B, next_n]
+    # Ensure context_lens is 2D [B, next_n]. For native spec decode, a 1D
+    # length means the final generated token's length; earlier speculative
+    # tokens use progressively shorter effective context lengths.
     if context_lens.ndim == 1:
-        context_lens_2d = context_lens.unsqueeze(-1).expand(-1, next_n).contiguous()
+        next_n_arange = torch.arange(
+            next_n, device=context_lens.device, dtype=torch.int32
+        )
+        context_lens_2d = (
+            context_lens.unsqueeze(-1) - next_n + 1 + next_n_arange
+        ).contiguous()
     elif context_lens.ndim == 2:
         context_lens_2d = context_lens.contiguous()
     else:

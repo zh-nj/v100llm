@@ -114,4 +114,103 @@ def test_sm70_fallback_paged_logits_accepts_2d_context_lens() -> None:
                     offsets < context_len, values, float("-inf")
                 )
 
-    torch.testing.assert_close(logits, expected)
+    # The SM70 paged path uses a Triton kernel with fp8 manual decode and
+    # fused accumulation, so it can differ slightly from the eager torch
+    # reference while preserving the indexer ordering contract.
+    torch.testing.assert_close(logits, expected, rtol=2e-2, atol=1e-2)
+
+
+def test_sm70_fallback_paged_logits_accepts_1d_context_lens() -> None:
+    _require_cuda()
+    torch.manual_seed(2)
+    fp8_dtype = torch.float8_e4m3fn
+    batch_size, next_n, heads, head_dim = 2, 2, 3, 16
+    max_model_len, block_size, num_blocks = 8, 4, 6
+    q = torch.randn(
+        batch_size, next_n, heads, head_dim, device="cuda", dtype=torch.float16
+    ).to(fp8_dtype)
+    k = torch.randn(
+        num_blocks, block_size, 1, head_dim, device="cuda", dtype=torch.float16
+    ).to(fp8_dtype)
+    scales = torch.rand(num_blocks, block_size, 1, 1, device="cuda") + 0.5
+    kv_cache = _pack_fp8_cache(k, scales)
+    weights = torch.randn(
+        batch_size * next_n, heads, device="cuda", dtype=torch.float32
+    )
+    context_lens_1d = torch.tensor([6, 4], device="cuda", dtype=torch.int32)
+    next_n_arange = torch.arange(next_n, device="cuda", dtype=torch.int32)
+    context_lens_2d = (
+        context_lens_1d.unsqueeze(-1) - next_n + 1 + next_n_arange
+    ).contiguous()
+    block_tables = torch.tensor(
+        [[0, 1, 2], [3, 4, 5]], device="cuda", dtype=torch.int32
+    )
+
+    logits_1d = _fp8_paged_mqa_logits_torch_fallback(
+        q,
+        kv_cache,
+        weights,
+        context_lens_1d,
+        block_tables,
+        max_model_len,
+    )
+    logits_2d = _fp8_paged_mqa_logits_torch_fallback(
+        q,
+        kv_cache,
+        weights,
+        context_lens_2d,
+        block_tables,
+        max_model_len,
+    )
+
+    torch.testing.assert_close(logits_1d, logits_2d)
+
+
+def test_sm70_fallback_paged_logits_is_cudagraph_capture_safe() -> None:
+    _require_cuda()
+    if torch.cuda.get_device_capability()[0] != 7:
+        pytest.skip("SM70 fallback is only selected on compute capability 7.x")
+
+    torch.manual_seed(3)
+    fp8_dtype = torch.float8_e4m3fn
+    batch_size, next_n, heads, head_dim = 1, 1, 3, 16
+    max_model_len, block_size, num_blocks = 8, 4, 2
+    q = torch.randn(
+        batch_size, next_n, heads, head_dim, device="cuda", dtype=torch.float16
+    ).to(fp8_dtype)
+    k = torch.randn(
+        num_blocks, block_size, 1, head_dim, device="cuda", dtype=torch.float16
+    ).to(fp8_dtype)
+    scales = torch.rand(num_blocks, block_size, 1, 1, device="cuda") + 0.5
+    kv_cache = _pack_fp8_cache(k, scales)
+    weights = torch.randn(
+        batch_size * next_n, heads, device="cuda", dtype=torch.float32
+    )
+    context_lens = torch.tensor([[6]], device="cuda", dtype=torch.int32)
+    block_tables = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+
+    for _ in range(2):
+        _fp8_paged_mqa_logits_torch_fallback(
+            q,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+        )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        logits = _fp8_paged_mqa_logits_torch_fallback(
+            q,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert logits.shape == (batch_size * next_n, max_model_len)

@@ -406,6 +406,14 @@ th {
 > required for semantic correctness. With the default mHC path, the identity
 > prompt returns a coherent DeepSeek answer with `finish_reason=stop`, and the
 > exact-output prompt `ZX-42` returns `ZX-42` followed by EOS.
+>
+> CUDA Graph note for local SM70 (2026-05-02): DeepSeek V4 Flash on 8xV100 is
+> validated with eager prefill and `FULL_DECODE_ONLY` decode graphs. Launch
+> without `--enforce-eager` and set
+> `--compilation-config '{"mode":"NONE","cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1]}'`
+> so full decode graphs are enabled without entering the Torch Inductor path.
+> Keep `VLLM_SM70_MHC_FAST=0` unless the exact `ZX-42` canary and identity
+> smoke both pass after enabling the opt-in mHC fast path.
 
 | `Dots1ForCausalLM` | dots.llm1 | `rednote-hilab/dots.llm1.base`, `rednote-hilab/dots.llm1.inst`, etc. | | ✅︎ |
 | `DotsOCRForCausalLM` | dots_ocr | `rednote-hilab/dots.ocr` | ✅︎ | ✅︎ |

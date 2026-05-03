@@ -9,6 +9,7 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.sm70_mqa_logits import sm70_fp8_paged_mqa_logits
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
@@ -102,6 +103,16 @@ def _fp8_paged_mqa_logits_torch_fallback(
     block_tables: torch.Tensor,
     max_model_len: int,
 ) -> torch.Tensor:
+    if _can_use_sm70_torch_indexer_fallback(use_fp4_cache=False):
+        return sm70_fp8_paged_mqa_logits(
+            q,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+        )
+
     fp8_dtype = current_platform.fp8_dtype()
     batch_size, next_n, _, dim = q.shape
     raw_k = kv_cache[..., :dim].contiguous()

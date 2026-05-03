@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
+import os
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -14,6 +17,9 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_PATH = Path("/mnt/data6/models/DeepSeek-V4-Flash")
+FLASHMLA_SRC_PATH = Path(
+    os.getenv("FLASH_MLA_SRC_DIR", "/mnt/data/apps/FlashMLA")
+)
 
 
 CHECKS = [
@@ -60,6 +66,70 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _git_output(repo: Path, *args: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def inspect_flashmla_source() -> dict[str, Any]:
+    sparse_decode_sources = [
+        "csrc/sm70/decode/sparse_fp8/instantiations/v32_fp8.cu",
+        "csrc/sm70/decode/sparse_fp8/instantiations/model1_fp8.cu",
+    ]
+    sparse_prefill_sources = [
+        "csrc/sm70/prefill/sparse/instantiations/bf16.cu",
+    ]
+
+    return {
+        "path": str(FLASHMLA_SRC_PATH),
+        "branch": _git_output(FLASHMLA_SRC_PATH, "branch", "--show-current"),
+        "head": _git_output(FLASHMLA_SRC_PATH, "rev-parse", "--short", "HEAD"),
+        "has_sm70_sparse_decode_sources": all(
+            (FLASHMLA_SRC_PATH / relpath).is_file()
+            for relpath in sparse_decode_sources
+        ),
+        "has_sm70_sparse_prefill_sources": all(
+            (FLASHMLA_SRC_PATH / relpath).is_file()
+            for relpath in sparse_prefill_sources
+        ),
+    }
+
+
+def inspect_flashmla_runtime() -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "vllm_file": None,
+        "flashmla_core_importable": False,
+        "flashmla_core_import_error": None,
+        "sparse_supported": None,
+    }
+
+    try:
+        import vllm
+
+        report["vllm_file"] = getattr(vllm, "__file__", None)
+        importlib.import_module("vllm._flashmla_C")
+        report["flashmla_core_importable"] = True
+    except Exception as exc:  # noqa: BLE001 - inspect must report import failures.
+        report["flashmla_core_import_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        from vllm.v1.attention.ops import flashmla
+
+        ok, reason = flashmla.is_flashmla_sparse_supported()
+        report["sparse_supported"] = [ok, reason]
+    except Exception as exc:  # noqa: BLE001 - inspect must keep going.
+        report["sparse_supported"] = [False, f"{type(exc).__name__}: {exc}"]
+
+    return report
+
+
 def inspect_static() -> dict[str, Any]:
     checks = []
     for name, relpath, needle in CHECKS:
@@ -99,6 +169,8 @@ def inspect_static() -> dict[str, Any]:
 
     return {
         "root": str(ROOT),
+        "flashmla_source": inspect_flashmla_source(),
+        "flashmla_runtime": inspect_flashmla_runtime(),
         "checks": checks,
         "model": model_checks,
         "model_ready": model_ok,
@@ -184,22 +256,21 @@ def run_openai_stream(args: argparse.Namespace) -> int:
     generated = completion_tokens if completion_tokens is not None else delta_chunks
     decode_window_s = None if first_token_time is None else max(end - first_token_time, 1e-9)
     decode_tokens_per_s = None if decode_window_s is None else generated / decode_window_s
-    print(
-        json.dumps(
-            {
-                "TTFT": None if first_token_time is None else first_token_time - start,
-                "total_s": end - start,
-                "completion_tokens": completion_tokens,
-                "delta_chunks_when_usage_missing": delta_chunks,
-                "decode_window_s": decode_window_s,
-                "decode_tokens_per_s": decode_tokens_per_s,
-                "finish_reason": finish_reason,
-                "output_preview": "".join(pieces)[: args.preview_chars],
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
+    result = {
+        "TTFT": None if first_token_time is None else first_token_time - start,
+        "total_s": end - start,
+        "completion_tokens": completion_tokens,
+        "delta_chunks_when_usage_missing": delta_chunks,
+        "decode_window_s": decode_window_s,
+        "decode_tokens_per_s": decode_tokens_per_s,
+        "finish_reason": finish_reason,
+        "output_preview": "".join(pieces)[: args.preview_chars],
+    }
+    if args.bench_mode is not None:
+        result["mode"] = args.bench_mode
+    if args.prompt_name is not None:
+        result["prompt_name"] = args.prompt_name
+    print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
 
@@ -211,6 +282,8 @@ def main() -> int:
     parser.add_argument("--api-key", default="EMPTY")
     parser.add_argument("--model", default=str(MODEL_PATH))
     parser.add_argument("--prompt", default="你好，请用一句话说明你是谁。")
+    parser.add_argument("--prompt-name")
+    parser.add_argument("--bench-mode", choices=["eager", "full_decode_only"])
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--preview-chars", type=int, default=400)
