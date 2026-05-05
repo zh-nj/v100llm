@@ -26,14 +26,14 @@ def _make_vllm_config_for_full_decode_only():
     compilation_config = CompilationConfig(
         cudagraph_mode="FULL_DECODE_ONLY",
         mode=CompilationMode.NONE,
-        cudagraph_capture_sizes=[1],
+        cudagraph_capture_sizes=[1, 2, 4],
     )
-    compilation_config.max_cudagraph_capture_size = 1
+    compilation_config.max_cudagraph_capture_size = 4
     compilation_config.post_init_cudagraph_sizes()
 
     config = MagicMock(spec=VllmConfig)
     config.compilation_config = compilation_config
-    config.scheduler_config = SchedulerConfig.default_factory(max_num_seqs=1)
+    config.scheduler_config = SchedulerConfig.default_factory(max_num_seqs=4)
     config.parallel_config = ParallelConfig()
     config.speculative_config = None
     config.lora_config = None
@@ -72,3 +72,31 @@ def test_full_decode_only_dispatches_single_token_uniform_decode(monkeypatch):
 
     assert mode == CUDAGraphMode.FULL
     assert desc == BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True)
+
+
+def test_full_decode_only_dispatches_expanded_capture_sizes(monkeypatch):
+    """Validate that CUDA graph dispatch works for expanded capture sizes [1,2,4].
+
+    All three tile scheduler types (swaonly/c4a/c128a) are supported at each
+    capture size because FlashMLASchedMeta is created fresh per build() call
+    and workspace tensors use max_num_batched_tokens for address stability.
+    """
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_capability",
+        lambda *args, **kwargs: DeviceCapability(7, 0),
+    )
+    from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+
+    config = _make_vllm_config_for_full_decode_only()
+    dispatcher = CudagraphDispatcher(config)
+    dispatcher.initialize_cudagraph_keys(CUDAGraphMode.FULL_DECODE_ONLY, 1)
+
+    for num_tokens in [1, 2, 4]:
+        mode, desc = dispatcher.dispatch(
+            num_tokens=num_tokens, uniform_decode=True
+        )
+        assert mode == CUDAGraphMode.FULL, (
+            f"Expected FULL CG mode for num_tokens={num_tokens}"
+        )
+        assert desc.num_tokens == num_tokens

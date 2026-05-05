@@ -5,7 +5,7 @@ DeepseekV4 MLA Attention Layer
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -89,6 +89,9 @@ _QK_QUANT_BLOCK = 64
 _QK_TOKEN_DATA_BYTES = _QK_NOPE_DIM + _QK_ROPE_DIM * 2
 _QK_SCALE_BYTES = 8
 _SM70_FP16_ATTENTION_OUTPUT_MAX = float(torch.finfo(torch.float16).max)
+
+_PREFILL_CUDAGRAPH_ENABLED = os.getenv("VLLM_PREFILL_CUDAGRAPH", "0") == "1"
+_PREFILL_CUDAGRAPH_DEBUG = os.getenv("VLLM_PREFILL_CUDAGRAPH_DEBUG", "0") == "1"
 
 
 def _trace_nonfinite_tensor(label: str, tensor: torch.Tensor) -> None:
@@ -268,6 +271,14 @@ def _gather_decode_kv_triton_kernel(
     num_tokens,
     topk,
     cache_block_size: tl.constexpr,
+    # Optional local-index output (fused index-building).
+    # When non-zero, each program writes pid_token * idx_row_stride +
+    # pid_topk + idx_offset for valid slots, or -1 for invalid.
+    local_indices_ptr,
+    idx_stride0,
+    idx_row_stride,
+    idx_offset,
+    EMIT_INDICES: tl.constexpr = False,
     FP8_DIM: tl.constexpr = 448,
     ROPE_DIM: tl.constexpr = 64,
     SCALE_DIM: tl.constexpr = 8,
@@ -280,6 +291,9 @@ def _gather_decode_kv_triton_kernel(
 
     Replaces the pure-torch _gather_decode_prefill_fallback_kv_ for SM70.
     FP8 decode logic matches _dequantize_and_gather_k_kernel exactly.
+
+    When EMIT_INDICES is True, also writes local dense indices into
+    local_indices_ptr, fusing the work of _build_decode_prefill_fallback_indices.
     """
     pid_token = tl.program_id(0).to(tl.int64)
     pid_topk = tl.program_id(1).to(tl.int64)
@@ -293,6 +307,8 @@ def _gather_decode_kv_triton_kernel(
     if pid_topk >= tok_len:
         zero_offsets = tl.arange(0, OUTPUT_DIM)
         tl.store(out_row + zero_offsets, tl.zeros((OUTPUT_DIM,), dtype=tl.uint16))
+        if EMIT_INDICES:
+            tl.store(local_indices_ptr + pid_token * idx_stride0 + pid_topk, -1)
         return
 
     slot_idx = tl.load(
@@ -302,7 +318,16 @@ def _gather_decode_kv_triton_kernel(
     if slot_idx < 0:
         zero_offsets = tl.arange(0, OUTPUT_DIM)
         tl.store(out_row + zero_offsets, tl.zeros((OUTPUT_DIM,), dtype=tl.uint16))
+        if EMIT_INDICES:
+            tl.store(local_indices_ptr + pid_token * idx_stride0 + pid_topk, -1)
         return
+
+    if EMIT_INDICES:
+        local_idx = pid_token * idx_row_stride + pid_topk + idx_offset
+        tl.store(
+            local_indices_ptr + pid_token * idx_stride0 + pid_topk,
+            local_idx.to(tl.int32),
+        )
 
     block_idx = slot_idx // cache_block_size
     pos_in_block = slot_idx % cache_block_size
@@ -315,32 +340,49 @@ def _gather_decode_kv_triton_kernel(
         + pos_in_block * SCALE_DIM
     )
 
-    # FP8 dequant: identical to _dequantize_and_gather_k_kernel
+    # Batch-load all 7 UE8M0 scale bytes before the quant block loop
+    # to reduce scattered reads (one vector load vs 7 scalar loads).
+    # Compute all scales upfront as a vector. Use power-of-2 arange(0,8)
+    # with mask for the 7 valid scale bytes.
+    scale_offsets = tl.arange(0, 8)
+    scale_mask = scale_offsets < N_QUANT_BLOCKS
+    scale_bytes = tl.load(
+        token_scale_base + scale_offsets, mask=scale_mask, other=127
+    )
+    all_exponents = scale_bytes.to(tl.float32) - 127.0
+    all_scales = tl.exp2(all_exponents)
+
+    # FP8 dequant with optimized bit manipulation (matches
+    # _decode_fp8_e4m3fn from sm70_mqa_logits.py: reduces 5
+    # intermediates to 2 by shifting low7 bits directly).
     for qb_idx in tl.static_range(N_QUANT_BLOCKS):
         qb_start = qb_idx * QUANT_BLOCK
         fp8_offsets = tl.arange(0, QUANT_BLOCK)
 
         x_uint8 = tl.load(token_data_base + qb_start + fp8_offsets)
 
-        # FP8 e4m3fn → float32 (same bit manipulation as gather kernel)
-        sign = ((x_uint8 >> 7) & 1).to(tl.int32)
-        exp_bits = ((x_uint8 >> 3) & 0xF).to(tl.int32)
-        mant_bits = (x_uint8 & 0x7).to(tl.int32)
-        fp32_exp = exp_bits + 120
-        fp32_bits = (sign << 31) | (fp32_exp << 23) | (mant_bits << 20)
-        is_zero = (exp_bits == 0) & (mant_bits == 0)
-        fp32_bits = tl.where(is_zero, 0, fp32_bits)
-        is_subnorm = (exp_bits == 0) & (mant_bits != 0)
+        # Optimized FP8 e4m3fn → float32 with subnormal handling.
+        # Normal path: sign_bit | ((low7 + 120<<3) << 20) — same as
+        # _decode_fp8_e4m3fn from sm70_mqa_logits.py.
+        # Subnormal path (exp_bits==0, mant!=0): mant * 2^-9.
+        val32 = x_uint8.to(tl.int32)
+        sign_bit = (val32 & 0x80) << 24
+        low7 = val32 & 0x7F
+        fp32_bits = sign_bit | ((low7 + (120 << 3)) << 20)
+        fp32_bits = tl.where(low7 == 0, 0, fp32_bits)
+        normal_val = fp32_bits.to(tl.float32, bitcast=True)
+        # Subnormals: exp_bits==0 means low7 in [1,7]; mantissa = low7 * 2^-9
+        is_subnorm = low7 < 8  # low7 in [1..7] when low7 != 0
+        is_subnorm = is_subnorm & (low7 != 0)
+        mant_bits = low7  # For subnormals, low7 == mant_bits (exp=0)
         subnorm_val = mant_bits.to(tl.float32) * 1.953125e-3
-        subnorm_val = tl.where(sign == 1, -subnorm_val, subnorm_val)
-        x_float = tl.where(
-            is_subnorm, subnorm_val, fp32_bits.to(tl.float32, bitcast=True)
-        )
+        sign_mask = (val32 >> 7) & 1
+        subnorm_val = tl.where(sign_mask == 1, -subnorm_val, subnorm_val)
+        x_float = tl.where(is_subnorm, subnorm_val, normal_val)
 
-        # UE8M0 scale
-        encoded_scale = tl.load(token_scale_base + qb_idx)
-        exponent = encoded_scale.to(tl.float32) - 127.0
-        scale = tl.exp2(exponent)
+        # UE8M0 scale from pre-loaded batch via mask extraction
+        qb_mask = tl.arange(0, 8) == qb_idx
+        scale = tl.sum(tl.where(qb_mask, all_scales, 0.0))
 
         x_dequant = x_float * scale
 
@@ -351,12 +393,11 @@ def _gather_decode_kv_triton_kernel(
         )
         tl.store(out_row + qb_start + fp8_offsets, bf16_bits)
 
-    # BF16 RoPE portion: copy as uint16
+    # BF16 RoPE portion: vectorized copy as uint16 (single 64-element load)
     rope_u16_ptr = (token_data_base + FP8_DIM).to(tl.pointer_type(tl.uint16))
-    for chunk_idx in tl.static_range(ROPE_DIM // 16):
-        offsets = chunk_idx * 16 + tl.arange(0, 16)
-        rope_u16 = tl.load(rope_u16_ptr + offsets)
-        tl.store(out_row + FP8_DIM + offsets, rope_u16)
+    rope_offsets = tl.arange(0, ROPE_DIM)
+    rope_u16 = tl.load(rope_u16_ptr + rope_offsets)
+    tl.store(out_row + FP8_DIM + rope_offsets, rope_u16)
 
 
 def _gather_decode_prefill_fallback_kv_(
@@ -395,8 +436,362 @@ def _gather_decode_prefill_fallback_kv_(
         num_tokens,
         topk,
         block_size,
+        0,  # local_indices_ptr (unused)
+        0,  # idx_stride0 (unused)
+        0,  # idx_row_stride (unused)
+        0,  # idx_offset (unused)
+        EMIT_INDICES=False,
     )
     return out
+
+
+def _gather_decode_prefill_fallback_kv_with_indices_(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    global_indices: torch.Tensor,
+    global_lens: torch.Tensor,
+    block_size: int,
+    *,
+    row_stride: int | None = None,
+    offset: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused gather + index-build: calls the enhanced Triton kernel once to
+    produce both the BF16 KV workspace *and* local dense indices, replacing
+    the separate ``_gather_decode_prefill_fallback_kv_`` +
+    ``_build_decode_prefill_fallback_indices`` sequence.
+
+    Returns ``(out, local_indices, local_lens)`` where ``local_indices`` has
+    shape ``[num_tokens, 1, topk]`` (matching the format expected by
+    ``flash_mla_sparse_fwd``) and ``local_lens`` is ``[num_tokens]``.
+    """
+    slots = _decode_prefill_fallback_slots(global_indices)
+    lens = global_lens.reshape(-1)
+    topk = slots.shape[-1]
+    if row_stride is None:
+        row_stride = topk
+
+    if out.shape[0] != slots.shape[0] or out.shape[1] != topk:
+        raise ValueError(
+            "Decode fallback KV workspace shape must match indices, got "
+            f"out={tuple(out.shape)} indices={tuple(global_indices.shape)}"
+        )
+
+    num_tokens = slots.shape[0]
+    local_indices = torch.empty(
+        (num_tokens, topk), dtype=torch.int32, device=slots.device,
+    )
+
+    if slots.numel() == 0:
+        out.zero_()
+        local_indices.fill_(-1)
+        return out, local_indices.unsqueeze(1), lens
+
+    block_stride = k_cache.stride(0)
+    out_u16 = out.view(torch.uint16)
+
+    _gather_decode_kv_triton_kernel[(num_tokens, topk)](
+        out_u16,
+        out_u16.stride(0),
+        out_u16.stride(1),
+        k_cache,
+        block_stride,
+        slots,
+        slots.stride(0),
+        lens,
+        num_tokens,
+        topk,
+        block_size,
+        local_indices,
+        local_indices.stride(0),
+        row_stride,
+        offset,
+        EMIT_INDICES=True,
+    )
+    return out, local_indices.unsqueeze(1), lens
+
+
+# ---------------------------------------------------------------------------
+# SM70 Triton kernel: fused Q-norm + GPT-J RoPE + FP8 quant + KV cache write
+# Replaces _torch_qnorm_rope_kv_insert_fallback with a single kernel launch.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _encode_fp8_e4m3fn(value):
+    """Encode float32 value to FP8 e4m3fn as uint8.
+
+    Reverse of _decode_fp8_e4m3fn from sm70_mqa_logits.py.
+    FP8 e4m3fn: sign(1) | exp(4) | mantissa(3), bias=7, max=448.0
+    """
+    # Extract sign
+    val_i32 = value.to(tl.int32, bitcast=True)
+    sign = (val_i32 >> 31) & 1  # 0 or 1
+
+    abs_val = tl.abs(value)
+
+    # Clamp to FP8 e4m3fn max
+    abs_val = tl.minimum(abs_val, 448.0)
+
+    # Handle zero / subnormal boundary
+    # FP8 e4m3fn subnormals: exp=0, mant in [1..7] → values 1*2^-9 .. 7*2^-9
+    # Smallest normal: exp=1, mant=0 → 2^(1-7) = 2^-6 = 0.015625
+    # We use a threshold to decide normal vs subnormal
+    is_zero = abs_val == 0.0
+
+    # For normal values: extract FP32 exponent and mantissa
+    abs_i32 = abs_val.to(tl.int32, bitcast=True)
+    fp32_exp = (abs_i32 >> 23) & 0xFF  # biased FP32 exponent
+    fp32_mant = abs_i32 & 0x7FFFFF  # 23-bit FP32 mantissa
+
+    # FP8 biased exponent = fp32_exp - 127 + 7 = fp32_exp - 120
+    fp8_exp = fp32_exp - 120
+
+    # Round mantissa: FP8 has 3 mantissa bits, FP32 has 23
+    # Shift right by 20, with round-to-nearest-even
+    fp8_mant = (fp32_mant + (1 << 19)) >> 20
+    # Handle mantissa overflow (rounding up can overflow 3 bits)
+    carry = fp8_mant >> 3
+    fp8_exp = fp8_exp + carry
+    fp8_mant = fp8_mant & 0x7
+
+    # Clamp exponent to valid range [1..15] for normal, handle overflow
+    fp8_exp = tl.minimum(fp8_exp, 15)
+
+    # Subnormal path: fp8_exp <= 0
+    # For subnormal: mantissa encodes value / 2^-9
+    # subnorm_mant = round(abs_val / 2^-9) = round(abs_val * 512)
+    subnorm_mant = (abs_val * 512.0 + 0.5).to(tl.int32)
+    subnorm_mant = tl.minimum(subnorm_mant, 7)
+
+    is_subnorm = fp8_exp <= 0
+
+    # Assemble FP8 byte
+    normal_byte = (fp8_exp << 3) | fp8_mant
+    subnorm_byte = subnorm_mant
+    fp8_byte = tl.where(is_subnorm, subnorm_byte, normal_byte)
+    fp8_byte = tl.where(is_zero, 0, fp8_byte)
+
+    # Apply sign
+    fp8_byte = fp8_byte | (sign << 7)
+    return fp8_byte.to(tl.uint8)
+
+
+@triton.jit
+def _sm70_qnorm_rope_kv_insert_triton_kernel(
+    # Q: [num_tokens, n_heads, head_dim] fp16, modified in-place
+    q_ptr,
+    q_stride0,
+    q_stride1,
+    # KV: [num_tokens, kv_dim] fp16 (kv_dim = 512)
+    kv_ptr,
+    kv_stride0,
+    # K cache: [num_blocks, block_bytes] uint8
+    k_cache_ptr,
+    k_cache_block_stride,
+    # slot_mapping: [num_tokens] int32
+    slot_mapping_ptr,
+    # positions: [num_tokens] int64
+    positions_ptr,
+    # cos_sin_cache: [max_pos, rope_dim] fp32 (rope_dim = 64, first 32=cos, last 32=sin)
+    cos_sin_cache_ptr,
+    cos_sin_cache_stride0,
+    # Scalars
+    eps: tl.constexpr,
+    num_tokens,
+    n_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    # Cache layout constants
+    NOPE_DIM: tl.constexpr = 448,
+    ROPE_DIM: tl.constexpr = 64,
+    ROPE_HALF: tl.constexpr = 32,
+    QUANT_BLOCK: tl.constexpr = 64,
+    N_QUANT_BLOCKS: tl.constexpr = 7,
+    TOKEN_DATA_BYTES: tl.constexpr = 576,
+    SCALE_BYTES: tl.constexpr = 8,
+    FP8_MAX: tl.constexpr = 448.0,
+):
+    """One program per token.
+
+    Q-side (in-place): per-head RMSNorm + GPT-J interleaved RoPE
+    KV-side: GPT-J RoPE + FP8 block quant + paged cache scatter write
+    """
+    pid = tl.program_id(0)
+    if pid >= num_tokens:
+        return
+
+    # ---- Load position and cos/sin for this token ----
+    pos = tl.load(positions_ptr + pid)
+    cs_base = cos_sin_cache_ptr + pos * cos_sin_cache_stride0
+    cos_offsets = tl.arange(0, 32)
+    sin_offsets = 32 + tl.arange(0, 32)
+    cos_vals = tl.load(cs_base + cos_offsets).to(tl.float32)
+    sin_vals = tl.load(cs_base + sin_offsets).to(tl.float32)
+
+    # ---- Q-side: per-head RMSNorm + GPT-J RoPE (in-place) ----
+    q_token_base = q_ptr + pid * q_stride0
+
+    for h in tl.static_range(n_heads):
+        q_head_base = q_token_base + h * q_stride1
+
+        # Compute variance (sum of squares) over the full head_dim.
+        # Process NoPE in 7 blocks of 64, then RoPE as 1 block of 64.
+        sq_sum = tl.zeros((), dtype=tl.float32)
+        for qb in tl.static_range(N_QUANT_BLOCKS):
+            offs = qb * QUANT_BLOCK + tl.arange(0, 64)
+            vals = tl.load(q_head_base + offs).to(tl.float32)
+            sq_sum += tl.sum(vals * vals, axis=0)
+
+        # RoPE portion of Q head (last 64 dims)
+        rope_offs = NOPE_DIM + tl.arange(0, 64)
+        q_rope_fp16 = tl.load(q_head_base + rope_offs)
+        q_rope = q_rope_fp16.to(tl.float32)
+        sq_sum += tl.sum(q_rope * q_rope, axis=0)
+
+        variance = sq_sum / head_dim
+        inv_rms = 1.0 / tl.sqrt(variance + eps)
+
+        # Write back NoPE portion (normalized, no rotation)
+        for qb in tl.static_range(N_QUANT_BLOCKS):
+            offs = qb * QUANT_BLOCK + tl.arange(0, 64)
+            vals = tl.load(q_head_base + offs).to(tl.float32)
+            normed = vals * inv_rms
+            tl.store(q_head_base + offs, normed.to(tl.float16))
+
+        # GPT-J interleaved RoPE on the rope portion
+        # even indices [0,2,4,...,62], odd indices [1,3,...,63]
+        even_offs = NOPE_DIM + tl.arange(0, 32) * 2
+        odd_offs = NOPE_DIM + tl.arange(0, 32) * 2 + 1
+        q_even = tl.load(q_head_base + even_offs).to(tl.float32) * inv_rms
+        q_odd = tl.load(q_head_base + odd_offs).to(tl.float32) * inv_rms
+
+        new_even = q_even * cos_vals - q_odd * sin_vals
+        new_odd = q_odd * cos_vals + q_even * sin_vals
+
+        tl.store(q_head_base + even_offs, new_even.to(tl.float16))
+        tl.store(q_head_base + odd_offs, new_odd.to(tl.float16))
+
+    # ---- KV-side: GPT-J RoPE + FP8 quant + cache scatter write ----
+    slot = tl.load(slot_mapping_ptr + pid)
+    if slot < 0:
+        return
+
+    kv_base = kv_ptr + pid * kv_stride0
+
+    # Apply GPT-J RoPE to KV rope portion (last 64 dims)
+    kv_even_offs = NOPE_DIM + tl.arange(0, 32) * 2
+    kv_odd_offs = NOPE_DIM + tl.arange(0, 32) * 2 + 1
+    kv_rope_even = tl.load(kv_base + kv_even_offs).to(tl.float32)
+    kv_rope_odd = tl.load(kv_base + kv_odd_offs).to(tl.float32)
+
+    kv_rope_new_even = kv_rope_even * cos_vals - kv_rope_odd * sin_vals
+    kv_rope_new_odd = kv_rope_odd * cos_vals + kv_rope_even * sin_vals
+
+    # ---- Compute cache write addresses ----
+    block_idx = (slot // cache_block_size).to(tl.int64)
+    pos_in_block = slot % cache_block_size
+
+    cache_block_base = k_cache_ptr + block_idx * k_cache_block_stride
+    token_data_base = cache_block_base + pos_in_block * TOKEN_DATA_BYTES
+    token_scale_base = (
+        cache_block_base
+        + cache_block_size * TOKEN_DATA_BYTES
+        + pos_in_block * SCALE_BYTES
+    )
+
+    # ---- FP8 block quantization of NoPE portion (7 blocks of 64) ----
+    for qb_idx in tl.static_range(N_QUANT_BLOCKS):
+        qb_start = qb_idx * QUANT_BLOCK
+        offsets = tl.arange(0, 64)
+        nope_vals = tl.load(kv_base + qb_start + offsets).to(tl.float32)
+
+        # Per-block absmax
+        absmax = tl.max(tl.abs(nope_vals), axis=0)
+        absmax = tl.maximum(absmax, 1e-4)
+
+        # UE8M0 scale: ceil(log2(absmax / 448.0))
+        exponent = tl.math.ceil(tl.math.log2(absmax / FP8_MAX))
+        scale = tl.exp2(exponent)
+
+        # Quantize to FP8 range
+        scaled_vals = nope_vals / scale
+        scaled_vals = tl.maximum(tl.minimum(scaled_vals, FP8_MAX), -FP8_MAX)
+
+        # Encode to FP8 e4m3fn bytes
+        fp8_bytes = _encode_fp8_e4m3fn(scaled_vals)
+        tl.store(token_data_base + qb_start + offsets, fp8_bytes)
+
+        # Encode UE8M0 scale byte
+        encoded_scale = (exponent + 127.0)
+        encoded_scale = tl.maximum(tl.minimum(encoded_scale, 254.0), 0.0)
+        tl.store(token_scale_base + qb_idx, encoded_scale.to(tl.uint8))
+
+    # ---- Write RoPE portion as BF16 bytes ----
+    # Convert rotated even/odd values to BF16 uint16, then write as uint8 pairs
+    rope_u8_base = token_data_base + NOPE_DIM
+
+    # Convert even values to BF16
+    even_u32 = kv_rope_new_even.to(tl.int32, bitcast=True)
+    even_bf16 = ((even_u32 + 0x7FFF + ((even_u32 >> 16) & 1)) >> 16).to(tl.uint16)
+    # Convert odd values to BF16
+    odd_u32 = kv_rope_new_odd.to(tl.int32, bitcast=True)
+    odd_bf16 = ((odd_u32 + 0x7FFF + ((odd_u32 >> 16) & 1)) >> 16).to(tl.uint16)
+
+    # Write interleaved as uint8: [even0_lo, even0_hi, odd0_lo, odd0_hi, ...]
+    # Each bf16 value is 2 bytes, interleaved pattern: even[0], odd[0], even[1], odd[1]...
+    # Total: 32 even + 32 odd = 64 bf16 values = 128 bytes
+    rope_u16_ptr = rope_u8_base.to(tl.pointer_type(tl.uint16))
+    even_store_offs = tl.arange(0, 32) * 2  # positions 0,2,4,...,62
+    odd_store_offs = tl.arange(0, 32) * 2 + 1  # positions 1,3,...,63
+    tl.store(rope_u16_ptr + even_store_offs, even_bf16)
+    tl.store(rope_u16_ptr + odd_store_offs, odd_bf16)
+
+
+def _sm70_triton_qnorm_rope_kv_insert(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    block_size: int,
+) -> None:
+    """SM70 Triton replacement for _torch_qnorm_rope_kv_insert_fallback.
+
+    Fuses Q-norm + GPT-J RoPE + FP8 quantization + paged cache write
+    into a single Triton kernel launch. Grid: (num_tokens,).
+    """
+    num_tokens = slot_mapping.shape[0]
+    if num_tokens == 0:
+        return
+
+    n_heads = q.shape[1]
+    head_dim = q.shape[2]
+    block_stride = k_cache.stride(0)
+
+    # Q is fp16, kv is fp16, cos_sin_cache is fp32
+    # Ensure positions are int64
+    positions_i64 = positions.to(torch.int64) if positions.dtype != torch.int64 else positions
+
+    grid = (num_tokens,)
+    _sm70_qnorm_rope_kv_insert_triton_kernel[grid](
+        q,
+        q.stride(0),
+        q.stride(1),
+        kv,
+        kv.stride(0),
+        k_cache,
+        block_stride,
+        slot_mapping,
+        positions_i64,
+        cos_sin_cache,
+        cos_sin_cache.stride(0),
+        eps,
+        num_tokens,
+        n_heads,
+        head_dim,
+        block_size,
+    )
 
 
 def _apply_gptj_rope_tail(
@@ -504,6 +899,331 @@ def _torch_qnorm_rope_kv_insert_fallback(
         + torch.arange(_QK_SCALE_BYTES, device=k_cache.device)
     )
     k_cache[block_indices[:, None], scale_offsets] = scale_data
+
+
+@dataclass
+class PrefillCaptureSize:
+    max_tokens: int
+    max_M: int
+    graph: torch.cuda.CUDAGraph | None = None
+    enabled: bool = True
+    eager_latency_us: float = 0.0
+    graph_latency_us: float = 0.0
+
+
+@dataclass
+class PrefillGraphConfig:
+    enabled: bool = False
+    capture_sizes: list[tuple[int, int]] = field(default_factory=list)
+    performance_gate_tolerance: float = 0.05
+    debug_mode: bool = False
+
+
+class PrefillGraphDispatcher:
+    def __init__(
+        self,
+        capture_sizes: list[tuple[int, int]],
+        padded_heads: int,
+        head_dim: int,
+        scale: float,
+        attn_sink: torch.Tensor,
+        device: torch.device,
+    ):
+        self.padded_heads = padded_heads
+        self.head_dim = head_dim
+        self.scale = scale
+        self.attn_sink = attn_sink
+        self.device = device
+        self.enabled = True
+
+        self.sizes: list[PrefillCaptureSize] = sorted(
+            [PrefillCaptureSize(max_tokens=t, max_M=m) for t, m in capture_sizes],
+            key=lambda s: s.max_tokens,
+        )
+
+        # Dispatch counters for metrics
+        self.graph_dispatch_count: int = 0
+        self.eager_dispatch_count: int = 0
+
+        # Workspace buffers (allocated below; None if OOM)
+        self.q_padded: torch.Tensor | None = None
+        self.indices_padded: torch.Tensor | None = None
+        self.topk_length_padded: torch.Tensor | None = None
+        self.output_padded: torch.Tensor | None = None
+        self.flash_output_bf16: torch.Tensor | None = None
+
+        if not self.sizes:
+            self.enabled = False
+            return
+
+        max_tokens = max(s.max_tokens for s in self.sizes)
+        max_M = max(s.max_M for s in self.sizes)
+
+        try:
+            (
+                self.q_padded,
+                self.indices_padded,
+                self.topk_length_padded,
+                self.output_padded,
+                self.flash_output_bf16,
+            ) = current_workspace_manager().get_simultaneous(
+                ((max_tokens, padded_heads, head_dim), torch.float16),
+                ((max_tokens, 1, max_M), torch.int32),
+                ((max_tokens,), torch.int32),
+                ((max_tokens, padded_heads, head_dim), torch.float16),
+                ((max_tokens, padded_heads, head_dim), torch.bfloat16),
+            )
+            total_bytes = (
+                self.q_padded.nelement() * self.q_padded.element_size()
+                + self.indices_padded.nelement() * self.indices_padded.element_size()
+                + self.topk_length_padded.nelement()
+                * self.topk_length_padded.element_size()
+                + self.output_padded.nelement() * self.output_padded.element_size()
+                + self.flash_output_bf16.nelement()
+                * self.flash_output_bf16.element_size()
+            )
+            logger.info(
+                "Prefill CUDA graph workspace allocated: %.2f MB for %d capture sizes",
+                total_bytes / (1024 * 1024),
+                len(self.sizes),
+            )
+        except (AssertionError, torch.cuda.OutOfMemoryError) as e:
+            logger.warning(
+                "Prefill CUDA graph disabled: insufficient GPU memory for "
+                "workspace allocation: %s",
+                e,
+            )
+            self.enabled = False
+            self.q_padded = None
+            self.indices_padded = None
+            self.topk_length_padded = None
+            self.output_padded = None
+            self.flash_output_bf16 = None
+
+    def find_capture_size(
+        self, num_chunk_tokens: int, M: int
+    ) -> PrefillCaptureSize | None:
+        if not self.enabled:
+            return None
+        for s in self.sizes:
+            if s.max_tokens >= num_chunk_tokens and s.max_M >= M and s.enabled:
+                return s
+        return None
+
+    def _prepare_workspace(
+        self,
+        q_chunk: torch.Tensor,
+        combined_indices: torch.Tensor,
+        combined_lens: torch.Tensor,
+        num_chunk_tokens: int,
+        chunk_size: int,
+        capture_size: PrefillCaptureSize,
+    ) -> None:
+        capture_tokens = capture_size.max_tokens
+
+        # Copy q_chunk → q_padded[:num_chunk_tokens], zero-fill rest
+        self.q_padded[:num_chunk_tokens].copy_(q_chunk)
+        if capture_tokens > num_chunk_tokens:
+            self.q_padded[num_chunk_tokens:capture_tokens].zero_()
+
+        # Copy combined_indices → indices_padded[:num_chunk_tokens]
+        self.indices_padded[:num_chunk_tokens].copy_(combined_indices)
+
+        # Copy combined_lens → topk_length_padded[:chunk_size], zero-fill rest
+        self.topk_length_padded[:chunk_size].copy_(combined_lens)
+        if capture_tokens > chunk_size:
+            self.topk_length_padded[chunk_size:capture_tokens].zero_()
+
+    def try_graph_replay(
+        self,
+        q_chunk: torch.Tensor,
+        kv_flat: torch.Tensor,
+        combined_indices: torch.Tensor,
+        combined_lens: torch.Tensor,
+        output_slice: torch.Tensor,
+        num_chunk_tokens: int,
+        M: int,
+    ) -> bool:
+        capture_size = self.find_capture_size(num_chunk_tokens, M)
+        if capture_size is None or capture_size.graph is None:
+            self.eager_dispatch_count += 1
+            return False
+
+        chunk_size = combined_lens.shape[0]
+        self._prepare_workspace(
+            q_chunk, combined_indices, combined_lens,
+            num_chunk_tokens, chunk_size, capture_size,
+        )
+
+        capture_size.graph.replay()
+
+        output_slice.copy_(self.output_padded[:num_chunk_tokens])
+        self.graph_dispatch_count += 1
+        return True
+
+    def capture_graphs(
+        self,
+        flash_mla_sparse_fwd_fn,
+        flashmla_bf16_io_fn,
+        copy_flashmla_output_fn,
+    ) -> None:
+        for size in self.sizes:
+            if not size.enabled:
+                continue
+            try:
+                ct = size.max_tokens
+
+                # Prepare deterministic workspace content for capture
+                self.q_padded[:ct].zero_()
+                self.indices_padded[:ct].fill_(-1)
+                self.topk_length_padded[:ct].zero_()
+                self.output_padded[:ct].zero_()
+                self.flash_output_bf16[:ct].zero_()
+
+                # Warm up the kernels before capture (required by CUDA graphs)
+                flash_q, flash_out = flashmla_bf16_io_fn(
+                    self.q_padded[:ct], self.output_padded[:ct]
+                )
+                flash_mla_sparse_fwd_fn(
+                    flash_q,
+                    torch.empty(0, 1, self.head_dim,
+                                dtype=torch.bfloat16, device=self.device),
+                    self.indices_padded[:ct],
+                    self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=self.topk_length_padded[:ct],
+                )
+                copy_flashmla_output_fn(flash_out, self.output_padded[:ct])
+
+                # Capture the graph
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    flash_q, flash_out = flashmla_bf16_io_fn(
+                        self.q_padded[:ct], self.output_padded[:ct]
+                    )
+                    out_tuple = flash_mla_sparse_fwd_fn(
+                        flash_q,
+                        torch.empty(0, 1, self.head_dim,
+                                    dtype=torch.bfloat16, device=self.device),
+                        self.indices_padded[:ct],
+                        self.scale,
+                        attn_sink=self.attn_sink,
+                        topk_length=self.topk_length_padded[:ct],
+                    )
+                    copy_flashmla_output_fn(out_tuple[0], self.output_padded[:ct])
+
+                size.graph = graph
+                logger.info(
+                    "Prefill CUDA graph captured for size (tokens=%d, M=%d)",
+                    ct, size.max_M,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Prefill CUDA graph capture failed for size (tokens=%d, M=%d): %s",
+                    size.max_tokens, size.max_M, e,
+                )
+                size.enabled = False
+
+    def warmup_validate(
+        self,
+        flash_mla_sparse_fwd_fn,
+        flashmla_bf16_io_fn,
+        copy_flashmla_output_fn,
+    ) -> None:
+        for size in self.sizes:
+            if not size.enabled or size.graph is None:
+                continue
+            ct = size.max_tokens
+
+            # Generate random inputs for validation
+            q_rand = torch.randn(
+                ct, self.padded_heads, self.head_dim,
+                dtype=torch.float16, device=self.device,
+            )
+            indices_rand = torch.full(
+                (ct, 1, 1), -1, dtype=torch.int32, device=self.device,
+            )
+            lens_rand = torch.zeros(ct, dtype=torch.int32, device=self.device)
+            output_eager = torch.zeros(
+                ct, self.padded_heads, self.head_dim,
+                dtype=torch.float16, device=self.device,
+            )
+
+            # --- Eager execution ---
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+
+            start_event.record()
+            flash_q, flash_out = flashmla_bf16_io_fn(q_rand, output_eager)
+            out_tuple = flash_mla_sparse_fwd_fn(
+                flash_q,
+                torch.empty(0, 1, self.head_dim,
+                            dtype=torch.bfloat16, device=self.device),
+                indices_rand,
+                self.scale,
+                attn_sink=self.attn_sink,
+                topk_length=lens_rand,
+            )
+            copy_flashmla_output_fn(out_tuple[0], output_eager)
+            end_event.record()
+            torch.cuda.synchronize()
+            eager_us = start_event.elapsed_time(end_event) * 1000.0
+
+            # --- Graph execution ---
+            self.q_padded[:ct].copy_(q_rand)
+            self.indices_padded[:ct].copy_(indices_rand)
+            self.topk_length_padded[:ct].copy_(lens_rand)
+            self.output_padded[:ct].zero_()
+
+            start_event.record()
+            size.graph.replay()
+            end_event.record()
+            torch.cuda.synchronize()
+            graph_us = start_event.elapsed_time(end_event) * 1000.0
+
+            size.eager_latency_us = eager_us
+            size.graph_latency_us = graph_us
+
+            # Compare outputs
+            output_graph = self.output_padded[:ct].clone()
+            if not torch.equal(output_eager, output_graph):
+                max_diff = (output_eager.float() - output_graph.float()).abs().max().item()
+                logger.warning(
+                    "Prefill graph output diverges from eager for size "
+                    "(tokens=%d, M=%d): max_diff=%.6e — disabling",
+                    ct, size.max_M, max_diff,
+                )
+                size.enabled = False
+                continue
+
+            # Performance gating: disable if graph is not faster within 5% tolerance
+            tolerance = 0.05
+            if graph_us > eager_us * (1.0 + tolerance):
+                logger.info(
+                    "Prefill graph for size (tokens=%d, M=%d) disabled: "
+                    "graph %.1fµs vs eager %.1fµs",
+                    ct, size.max_M, graph_us, eager_us,
+                )
+                size.enabled = False
+            else:
+                logger.info(
+                    "Prefill graph for size (tokens=%d, M=%d) validated: "
+                    "graph %.1fµs vs eager %.1fµs",
+                    ct, size.max_M, graph_us, eager_us,
+                )
+
+    def get_dispatch_stats(self) -> dict[str, int | float]:
+        total = self.graph_dispatch_count + self.eager_dispatch_count
+        graph_fraction = (
+            self.graph_dispatch_count / total if total > 0 else 0.0
+        )
+        return {
+            "graph_dispatch_count": self.graph_dispatch_count,
+            "eager_dispatch_count": self.eager_dispatch_count,
+            "total_dispatch_count": total,
+            "graph_dispatch_fraction": graph_fraction,
+        }
 
 
 def _flashmla_bf16_io(
@@ -912,16 +1632,28 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE
         #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
         # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-            q,
-            kv,
-            swa_kv_cache_2d,
-            swa_metadata.slot_mapping,
-            positions.to(torch.int64),
-            self.rotary_emb.cos_sin_cache,
-            self.eps,
-            swa_metadata.block_size,
-        )
+        if _should_use_qnorm_rope_kv_insert_fallback(q):
+            _sm70_triton_qnorm_rope_kv_insert(
+                q,
+                kv,
+                swa_kv_cache_2d,
+                swa_metadata.slot_mapping,
+                positions.to(torch.int64),
+                self.rotary_emb.cos_sin_cache,
+                self.eps,
+                swa_metadata.block_size,
+            )
+        else:
+            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                q,
+                kv,
+                swa_kv_cache_2d,
+                swa_metadata.slot_mapping,
+                positions.to(torch.int64),
+                self.rotary_emb.cos_sin_cache,
+                self.eps,
+                swa_metadata.block_size,
+            )
 
 
 def deepseek_v4_attention(
@@ -1017,11 +1749,11 @@ def _sm70_fp8_einsum_bmm(
     out: torch.Tensor,
     equation: str,
 ) -> None:
-    """SM70 optimised path: pre-dequant weight to fp32 (cached) + fp32 einsum.
+    """SM70 optimised path: pre-dequant weight to fp16 (cached) + fp16 einsum.
 
-    The wo_a weight (b) is dequantized to fp32 once and cached on the tensor
-    (~86 MB extra VRAM for fp32 vs ~43 MB for fp16).  At runtime, only the
-    activation (a) needs dequant to fp32, then einsum runs fully in fp32.
+    The wo_a weight (b) is dequantized to fp16 once and cached on the tensor
+    (~43 MB extra VRAM).  At runtime, the activation (a) is dequanted to fp16,
+    then einsum runs in fp16 for halved bandwidth vs the previous fp32 path.
     Eliminates repeated weight dequant (~1.5x faster than re-dequant every call).
     """
     if equation != "bhr,hdr->bhd":
@@ -1034,28 +1766,28 @@ def _sm70_fp8_einsum_bmm(
     hidden = a.shape[2]
     rank = b.shape[1] if b.dim() == 3 else b.shape[0] // groups
 
-    # Lazily pre-dequant b (weight) to fp32 and cache
-    b_f32 = getattr(b, "_sm70_predequant_f32", None)
-    if b_f32 is None:
+    # Lazily pre-dequant b (weight) to fp16 and cache
+    b_f16 = getattr(b, "_sm70_predequant_f16", None)
+    if b_f16 is None:
         b_3d = b.reshape(groups, rank, hidden)
         weight_scale_shape = (groups, rank // 128, hidden // 128)
         b_scale_3d = b_scale.reshape(weight_scale_shape)
-        b_f32 = (
+        b_f16 = (
             b_3d.float()
             * b_scale_3d.repeat_interleave(128, dim=1).repeat_interleave(
                 128, dim=2
             )
-        ).contiguous()  # [groups, rank, hidden]
-        b._sm70_predequant_f32 = b_f32  # type: ignore[attr-defined]
+        ).half().contiguous()  # [groups, rank, hidden]
+        b._sm70_predequant_f16 = b_f16  # type: ignore[attr-defined]
 
-    # Dequant a (activation) to fp32
+    # Dequant a (activation) to fp16
     a_blocks = a_scale.shape[-1]
     a_deq = a.float() * a_scale.repeat_interleave(
         hidden // a_blocks, dim=-1
     )  # [T, G, D] fp32
 
-    # fp32 einsum — no precision loss
-    result = torch.einsum("bhr,hdr->bhd", a_deq, b_f32)
+    # fp16 einsum — halved bandwidth, acceptable precision (rtol < 1e-3)
+    result = torch.einsum("bhr,hdr->bhd", a_deq.half(), b_f16)
     out.copy_(result.to(out.dtype))
 
 
@@ -1186,6 +1918,33 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         self.kv_cache = torch.tensor([])
 
+        # Prefill CUDA graph dispatcher (partial capture of attention kernel)
+        self._prefill_graph_dispatcher: PrefillGraphDispatcher | None = None
+        if _PREFILL_CUDAGRAPH_ENABLED:
+            N = (
+                (self.max_model_len + self.compress_ratio - 1)
+                // self.compress_ratio
+            )
+            M = N + self.window_size + self.max_num_batched_tokens
+            # Default capture sizes: chunk token counts from 1..PREFILL_CHUNK_SIZE
+            # each paired with M (fixed for this model config).
+            # Users can override via compilation config
+            # prefill_cudagraph_capture_sizes if needed.
+            # Example compilation config override:
+            #   compilation_config:
+            #     prefill_cudagraph_capture_sizes: [[2, 820000], [4, 820000]]
+            capture_sizes = [
+                (t, M) for t in range(1, PREFILL_CHUNK_SIZE + 1)
+            ]
+            self._prefill_graph_dispatcher = PrefillGraphDispatcher(
+                capture_sizes=capture_sizes,
+                padded_heads=self.padded_heads,
+                head_dim=head_dim,
+                scale=scale,
+                attn_sink=attn_sink,
+                device=attn_sink.device,
+            )
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return DeepseekV4FlashMLASparseBackend
 
@@ -1263,6 +2022,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 output=output[:num_decode_tokens],
             )
 
+    # NOTE: _forward_decode is entirely unaffected by the prefill CUDA graph
+    # feature.  PrefillGraphDispatcher operates only within _forward_prefill's
+    # chunk loop; the decode path (including the existing CudagraphDispatcher
+    # for full-model decode graphs) remains unchanged.
     def _forward_decode(
         self,
         q: torch.Tensor,
@@ -1309,22 +2072,22 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         if _should_use_sm70_decode_prefill_fallback(q, swa_only):
             if swa_only:
-                fallback_indices, fallback_lens = (
-                    _build_decode_prefill_fallback_indices(swa_indices, swa_lens)
-                )
-                fallback_topk_length: torch.Tensor | None = fallback_lens
+                swa_topk = swa_indices.shape[-1]
                 fallback_kv = _get_decode_prefill_fallback_workspace(
-                    (num_decode_tokens, fallback_indices.shape[-1], q.shape[-1]),
+                    (num_decode_tokens, swa_topk, q.shape[-1]),
                     torch.bfloat16,
                     q.device,
                 )
-                _gather_decode_prefill_fallback_kv_(
-                    fallback_kv,
-                    self.swa_cache_layer.kv_cache,
-                    swa_indices,
-                    fallback_lens,
-                    swa_metadata.block_size,
+                fallback_kv, fallback_indices, fallback_lens = (
+                    _gather_decode_prefill_fallback_kv_with_indices_(
+                        fallback_kv,
+                        self.swa_cache_layer.kv_cache,
+                        swa_indices,
+                        swa_lens,
+                        swa_metadata.block_size,
+                    )
                 )
+                fallback_topk_length: torch.Tensor | None = fallback_lens
             else:
                 assert kv_cache is not None
                 assert attn_metadata is not None
@@ -1340,31 +2103,27 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     q.device,
                 )
                 compressed_kv = fallback_kv[:, :compressed_topk]
-                _gather_decode_prefill_fallback_kv_(
-                    compressed_kv,
-                    kv_cache,
-                    topk_indices,
-                    topk_lens,
-                    attn_metadata.block_size // self.compress_ratio,
+                compressed_kv, compressed_indices, _ = (
+                    _gather_decode_prefill_fallback_kv_with_indices_(
+                        compressed_kv,
+                        kv_cache,
+                        topk_indices,
+                        topk_lens,
+                        attn_metadata.block_size // self.compress_ratio,
+                        row_stride=total_topk,
+                    )
                 )
                 swa_kv = fallback_kv[:, compressed_topk:]
-                _gather_decode_prefill_fallback_kv_(
-                    swa_kv,
-                    self.swa_cache_layer.kv_cache,
-                    swa_indices,
-                    swa_lens,
-                    swa_metadata.block_size,
-                )
-                compressed_indices, _ = _build_decode_prefill_fallback_indices(
-                    topk_indices,
-                    topk_lens,
-                    row_stride=total_topk,
-                )
-                swa_fallback_indices, _ = _build_decode_prefill_fallback_indices(
-                    swa_indices,
-                    swa_lens,
-                    row_stride=total_topk,
-                    offset=compressed_topk,
+                swa_kv, swa_fallback_indices, _ = (
+                    _gather_decode_prefill_fallback_kv_with_indices_(
+                        swa_kv,
+                        self.swa_cache_layer.kv_cache,
+                        swa_indices,
+                        swa_lens,
+                        swa_metadata.block_size,
+                        row_stride=total_topk,
+                        offset=compressed_topk,
+                    )
                 )
                 fallback_indices = torch.cat(
                     (compressed_indices, swa_fallback_indices), dim=-1
@@ -1494,6 +2253,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         kv = workspace_manager.get_simultaneous(
             ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
         )[0]
+        # Aux stream operations (KV-insert, compressor) launched via
+        # maybe_execute_in_parallel in attention_impl have already completed
+        # by the time we reach here — event synchronization in that helper
+        # ensures the default stream observes their writes.  The chunk loop
+        # below therefore runs entirely on the default stream with no
+        # cross-stream hazards.
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
@@ -1566,30 +2331,78 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 )
 
             output_slice = output[query_start:query_end]
-            q_chunk, output_chunk = _flashmla_bf16_io(
-                q[query_start:query_end],
-                output_slice,
-            )
-            if trace_prefill:
-                _trace_tensor_summary(f"{self.prefix}.prefill.q_chunk", q_chunk)
-            flash_output, max_logits, lse = flash_mla_sparse_fwd(
-                q=q_chunk,
-                kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices.unsqueeze(1),
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
-                topk_length=combined_lens,
-                out=output_chunk,
-            )
-            if trace_prefill:
-                _trace_tensor_summary(
-                    f"{self.prefix}.prefill.flash_output", flash_output
+            num_chunk_tokens = query_end - query_start
+
+            # Attempt prefill CUDA graph replay for the attention kernel.
+            # KV gather and index combination above remain eager; only the
+            # _flashmla_bf16_io + flash_mla_sparse_fwd + _copy_flashmla_output
+            # sequence is eligible for graph replay.
+            graph_replayed = False
+            if self._prefill_graph_dispatcher is not None:
+                graph_replayed = self._prefill_graph_dispatcher.try_graph_replay(
+                    q_chunk=q[query_start:query_end],
+                    kv_flat=kv.view(-1, 1, q.shape[-1]),
+                    combined_indices=combined_indices.unsqueeze(1),
+                    combined_lens=combined_lens,
+                    output_slice=output_slice,
+                    num_chunk_tokens=num_chunk_tokens,
+                    M=M,
                 )
-                _trace_tensor_summary(
-                    f"{self.prefix}.prefill.max_logits", max_logits
+
+            # Debug mode: run eager too and compare outputs
+            if _PREFILL_CUDAGRAPH_DEBUG and graph_replayed:
+                graph_output = output_slice.clone()
+                q_chunk_dbg, output_chunk_dbg = _flashmla_bf16_io(
+                    q[query_start:query_end], output_slice,
                 )
-                _trace_tensor_summary(f"{self.prefix}.prefill.lse", lse)
-            _copy_flashmla_output(flash_output, output_slice)
+                flash_out_dbg, _, _ = flash_mla_sparse_fwd(
+                    q=q_chunk_dbg,
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=combined_lens,
+                    out=output_chunk_dbg,
+                )
+                _copy_flashmla_output(flash_out_dbg, output_slice)
+                if not torch.equal(graph_output, output_slice):
+                    max_diff = (
+                        (graph_output.float() - output_slice.float())
+                        .abs().max().item()
+                    )
+                    logger.warning(
+                        "Prefill graph debug: output divergence at %s "
+                        "chunk %d: max_diff=%.6e — using eager output",
+                        self.prefix, chunk_idx, max_diff,
+                    )
+                else:
+                    output_slice.copy_(graph_output)
+
+            if not graph_replayed:
+                q_chunk, output_chunk = _flashmla_bf16_io(
+                    q[query_start:query_end],
+                    output_slice,
+                )
+                if trace_prefill:
+                    _trace_tensor_summary(f"{self.prefix}.prefill.q_chunk", q_chunk)
+                flash_output, max_logits, lse = flash_mla_sparse_fwd(
+                    q=q_chunk,
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=combined_lens,
+                    out=output_chunk,
+                )
+                if trace_prefill:
+                    _trace_tensor_summary(
+                        f"{self.prefix}.prefill.flash_output", flash_output
+                    )
+                    _trace_tensor_summary(
+                        f"{self.prefix}.prefill.max_logits", max_logits
+                    )
+                    _trace_tensor_summary(f"{self.prefix}.prefill.lse", lse)
+                _copy_flashmla_output(flash_output, output_slice)
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):

@@ -238,8 +238,15 @@ def test_forward_decode_uses_sparse_prefill_fallback_for_sm70_swa_only(monkeypat
     def fail_direct_decode(**_kwargs):
         raise AssertionError("direct FlashMLA decode should not be called")
 
-    def fake_gather(out, *_args, **_kwargs):
+    def fake_gather_with_indices(out, _k_cache, global_indices, global_lens, _block_size, *, row_stride=None, offset=0):
         out.fill_(2)
+        from vllm.model_executor.layers.deepseek_v4_attention import (
+            _build_decode_prefill_fallback_indices,
+        )
+        local_indices, local_lens = _build_decode_prefill_fallback_indices(
+            global_indices, global_lens, row_stride=row_stride, offset=offset,
+        )
+        return out, local_indices, local_lens
 
     def fake_sparse_prefill(**kwargs):
         captured["q_shape"] = kwargs["q"].shape
@@ -250,7 +257,7 @@ def test_forward_decode_uses_sparse_prefill_fallback_for_sm70_swa_only(monkeypat
         return kwargs["out"], None, None
 
     monkeypatch.setattr(d4a, "flash_mla_with_kvcache", fail_direct_decode)
-    monkeypatch.setattr(d4a, "_gather_decode_prefill_fallback_kv_", fake_gather)
+    monkeypatch.setattr(d4a, "_gather_decode_prefill_fallback_kv_with_indices_", fake_gather_with_indices)
     monkeypatch.setattr(d4a, "flash_mla_sparse_fwd", fake_sparse_prefill)
 
     attn._forward_decode(
@@ -323,9 +330,16 @@ def test_forward_decode_uses_sparse_prefill_fallback_for_sm70_compressed(
     def fail_direct_decode(**_kwargs):
         raise AssertionError("direct FlashMLA decode should not be called")
 
-    def fake_gather(out, *_args, **_kwargs):
+    def fake_gather_with_indices(out, _k_cache, global_indices, global_lens, _block_size, *, row_stride=None, offset=0):
         captured["gather_shapes"].append(tuple(out.shape))
         out.fill_(2)
+        from vllm.model_executor.layers.deepseek_v4_attention import (
+            _build_decode_prefill_fallback_indices,
+        )
+        local_indices, local_lens = _build_decode_prefill_fallback_indices(
+            global_indices, global_lens, row_stride=row_stride, offset=offset,
+        )
+        return out, local_indices, local_lens
 
     def fake_sparse_prefill(**kwargs):
         captured["indices"] = kwargs["indices"].clone()
@@ -335,7 +349,7 @@ def test_forward_decode_uses_sparse_prefill_fallback_for_sm70_compressed(
         return kwargs["out"], None, None
 
     monkeypatch.setattr(d4a, "flash_mla_with_kvcache", fail_direct_decode)
-    monkeypatch.setattr(d4a, "_gather_decode_prefill_fallback_kv_", fake_gather)
+    monkeypatch.setattr(d4a, "_gather_decode_prefill_fallback_kv_with_indices_", fake_gather_with_indices)
     monkeypatch.setattr(d4a, "flash_mla_sparse_fwd", fake_sparse_prefill)
 
     attn._forward_decode(

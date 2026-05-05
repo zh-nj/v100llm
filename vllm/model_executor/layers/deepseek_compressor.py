@@ -416,6 +416,381 @@ def _torch_fused_compress_norm_rope_insert_fp8_fallback(
             )
 
 
+# =============================================================================
+# SM70 Triton kernel: Fused compress → RMSNorm → RoPE → FP8 quant → cache write
+# Replaces _torch_fused_compress_norm_rope_insert_fp8_fallback with a Triton
+# kernel that processes only tokens at compress-ratio boundaries (pre-filtered
+# on the Python side via firing_indices).
+# Grid: (num_firing_tokens,) — one program per boundary token.
+# =============================================================================
+
+
+@triton.jit
+def _sm70_fused_compress_norm_rope_insert_fp8_kernel(
+    # ── state cache (compressor internal state) ──
+    state_cache_ptr,
+    state_cache_stride0,
+    state_cache_stride1,
+    # ── metadata ──
+    token_to_req_indices_ptr,
+    positions_ptr,
+    slot_mapping_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    # ── RMSNorm ──
+    rms_norm_weight_ptr,
+    rms_norm_eps,
+    # ── RoPE ──
+    cos_sin_cache_ptr,
+    cos_sin_stride,
+    # ── KV cache output ──
+    k_cache_ptr,
+    kv_slot_mapping_ptr,
+    kv_cache_block_size,
+    # ── firing indices (pre-filtered boundary tokens) ──
+    firing_indices_ptr,
+    # ── constexprs ──
+    HEAD_SIZE: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+    STATE_WIDTH: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    OVERLAP: tl.constexpr,
+    ROPE_HEAD_DIM: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    KV_BLOCK_STRIDE: tl.constexpr,
+    IS_INDEXER: tl.constexpr,  # True for head=128 indexer path
+):
+    """SM70 fused compress → RMSNorm → RoPE → FP8 quant → cache write.
+
+    Pre-filtered version: only launched for tokens at compress boundaries.
+    Each program reads its actual token index from firing_indices.
+
+    For IS_INDEXER=False (head=512 sparse attention path):
+      - NoPE (448) encoded as 7 × 64-element FP8 blocks + UE8M0 scales
+      - RoPE (64) stored as BF16
+    For IS_INDEXER=True (head=128 indexer path):
+      - Entire head encoded as single FP8 block + float32 scale
+    """
+    pid = tl.program_id(0)
+    token_idx = tl.load(firing_indices_ptr + pid)
+
+    slot_id = tl.load(slot_mapping_ptr + token_idx)
+    if slot_id < 0:
+        return
+
+    position = tl.load(positions_ptr + token_idx)
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+
+    # ── Gather state cache entries ────────────────────────────────────
+    WINDOW: tl.constexpr = (1 + OVERLAP) * COMPRESS_RATIO
+    start = position - WINDOW + 1
+    tokens = tl.arange(0, WINDOW)
+    pos = start + tokens
+    mask_pos = pos >= 0
+
+    block_indices = pos // block_size
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + block_indices,
+        mask=mask_pos,
+        other=0,
+    )
+    block_offsets = pos % block_size
+    head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
+
+    block = tl.arange(0, TRITON_BLOCK_SIZE)
+    mask = block < HEAD_SIZE
+    block_numbers_i64 = block_numbers.to(tl.int64)
+
+    row_base = (
+        state_cache_ptr
+        + block_numbers_i64 * state_cache_stride0
+        + block_offsets * state_cache_stride1
+        + head_offset
+    )
+
+    combined_mask = mask_pos[:, None] & mask[None, :]
+
+    # ── Softmax + weighted sum ───────────────────────────────────────
+    score = tl.load(
+        row_base[:, None] + STATE_WIDTH + block[None, :],
+        mask=combined_mask,
+        other=float("-inf"),
+    )
+    score = tl.softmax(score, dim=0)
+
+    kv = tl.load(
+        row_base[:, None] + block[None, :],
+        mask=combined_mask,
+        other=0.0,
+    )
+
+    compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
+
+    # ── RMSNorm (fp32 throughout) ──────────────────────────────────────
+    rms_w = tl.load(rms_norm_weight_ptr + block, mask=mask, other=0.0)
+    variance = tl.sum(compressed_kv * compressed_kv, axis=0) / HEAD_SIZE
+    rrms = tl.rsqrt(variance + rms_norm_eps)
+    normed = compressed_kv * rrms * rms_w
+
+    # ── KV cache pointers ────────────────────────────────────────────
+    kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
+    if kv_slot_idx < 0:
+        return
+    kv_block_idx = kv_slot_idx // kv_cache_block_size
+    kv_pos_in_block = kv_slot_idx % kv_cache_block_size
+
+    cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
+    fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
+    scale_ptr = (
+        cache_block_ptr
+        + kv_cache_block_size * TOKEN_STRIDE
+        + kv_pos_in_block * SCALE_DIM
+    )
+
+    NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM
+    HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM // 2
+
+    # ── Register-based GPT-J forward RoPE in fp32 ─────────────────────
+    NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
+    NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
+
+    pair_2d = tl.reshape(normed, (NUM_PAIRS, 2))
+    even, odd = tl.split(pair_2d)  # each [NUM_PAIRS] fp32
+
+    pair_idx = tl.arange(0, NUM_PAIRS)
+    rope_pair_local = pair_idx - NOPE_PAIRS
+    is_rope_pair = rope_pair_local >= 0
+    cs_idx = tl.maximum(rope_pair_local, 0)
+
+    compressed_pos = (position // COMPRESS_RATIO) * COMPRESS_RATIO
+    cache_base = cos_sin_cache_ptr + compressed_pos * cos_sin_stride
+    cos_v = tl.load(cache_base + cs_idx, mask=is_rope_pair, other=1.0)
+    sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope_pair, other=0.0)
+
+    new_even = even * cos_v - odd * sin_v
+    new_odd = odd * cos_v + even * sin_v
+    result = tl.interleave(new_even, new_odd)  # [TRITON_BLOCK_SIZE] fp32
+
+    if IS_INDEXER:
+        # ── Indexer path: single FP8 block + float32 scale ────────────
+        INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
+
+        # bf16 roundtrip via bit manipulation (SM70 compatible)
+        result_u32 = result.to(tl.int32, bitcast=True)
+        result_rounded = result_u32 + 0x7FFF + ((result_u32 >> 16) & 1)
+        result_bf16_u32 = (result_rounded >> 16) << 16
+        result_bf16 = result_bf16_u32.to(tl.float32, bitcast=True)
+
+        absmax = tl.max(tl.abs(result_bf16), axis=0)
+        absmax = tl.maximum(absmax, 1e-4)
+        raw_scale = absmax * INV_FP8_MAX
+        exponent = tl.ceil(tl.log2(raw_scale))
+        inv_scale = tl.exp2(-exponent)
+
+        x_scaled = result_bf16 * inv_scale
+        x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+
+        # Manual FP8 e4m3fn encode via fp16 bit manipulation
+        x_f16_bits = (
+            x_clamped.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32)
+        )
+        fp16_sign = (x_f16_bits >> 15) & 1
+        fp16_exp = (x_f16_bits >> 10) & 0x1F
+        fp16_mant = x_f16_bits & 0x3FF
+        exp_fp8 = fp16_exp - 8
+        mant_fp8 = (fp16_mant >> 7) & 0x7
+        round_bit = (fp16_mant >> 6) & 1
+        sticky = fp16_mant & 0x3F
+        do_round = round_bit & (sticky | (mant_fp8 & 1))
+        mant_fp8 = mant_fp8 + do_round
+        carry = mant_fp8 > 7
+        mant_fp8 = tl.where(carry, 0, mant_fp8)
+        exp_fp8 = tl.where(carry, exp_fp8 + 1, exp_fp8)
+        is_max_exceeded = (exp_fp8 == 15) & (mant_fp8 > 6)
+        mant_fp8 = tl.where(is_max_exceeded, 6, mant_fp8)
+        is_overflow = exp_fp8 > 15
+        exp_fp8 = tl.where(is_overflow, 15, exp_fp8)
+        mant_fp8 = tl.where(is_overflow, 6, mant_fp8)
+        is_underflow = (exp_fp8 <= 0) | (fp16_exp == 0)
+        exp_fp8 = tl.where(is_underflow, 0, exp_fp8)
+        mant_fp8 = tl.where(is_underflow, 0, mant_fp8)
+        x_uint8 = ((fp16_sign << 7) | (exp_fp8 << 3) | mant_fp8).to(tl.uint8)
+
+        tl.store(fp8_ptr + block, x_uint8, mask=mask)
+
+        # Single float32 scale
+        scale_val = tl.exp2(exponent)
+        tl.store(scale_ptr.to(tl.pointer_type(tl.float32)), scale_val)
+    else:
+        # ── Sparse attention path: 7 × FP8 blocks + BF16 RoPE ────────
+        N_QUANT_BLOCKS: tl.constexpr = TRITON_BLOCK_SIZE // QUANT_BLOCK
+        N_NOPE_BLOCKS: tl.constexpr = NOPE_HEAD_DIM // QUANT_BLOCK
+        INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
+
+        # bf16 roundtrip via bit manipulation (SM70 compatible)
+        normed_u32 = normed.to(tl.int32, bitcast=True)
+        normed_rounded = normed_u32 + 0x7FFF + ((normed_u32 >> 16) & 1)
+        quant_bf16_u32 = (normed_rounded >> 16) << 16
+        quant_input = quant_bf16_u32.to(tl.float32, bitcast=True)
+
+        quant_2d = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK))
+        abs_2d = tl.abs(quant_2d)
+        block_absmax = tl.max(abs_2d, axis=1)  # [N_QUANT_BLOCKS] fp32
+        block_absmax = tl.maximum(block_absmax, 1e-4)
+
+        raw_scales = block_absmax * INV_FP8_MAX
+        exponents = tl.ceil(tl.log2(raw_scales))
+        inv_scales = tl.exp2(-exponents)
+        inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
+        x_scaled = quant_2d * inv_scales_col
+        x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+
+        # Manual FP8 e4m3fn encode via fp16 bit manipulation
+        x_f16_bits = (
+            x_clamped.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32)
+        )
+        fp16_sign = (x_f16_bits >> 15) & 1
+        fp16_exp = (x_f16_bits >> 10) & 0x1F
+        fp16_mant = x_f16_bits & 0x3FF
+        exp_fp8 = fp16_exp - 8
+        mant_fp8 = (fp16_mant >> 7) & 0x7
+        round_bit = (fp16_mant >> 6) & 1
+        sticky = fp16_mant & 0x3F
+        do_round = round_bit & (sticky | (mant_fp8 & 1))
+        mant_fp8 = mant_fp8 + do_round
+        carry = mant_fp8 > 7
+        mant_fp8 = tl.where(carry, 0, mant_fp8)
+        exp_fp8 = tl.where(carry, exp_fp8 + 1, exp_fp8)
+        is_max_exceeded = (exp_fp8 == 15) & (mant_fp8 > 6)
+        mant_fp8 = tl.where(is_max_exceeded, 6, mant_fp8)
+        is_overflow = exp_fp8 > 15
+        exp_fp8 = tl.where(is_overflow, 15, exp_fp8)
+        mant_fp8 = tl.where(is_overflow, 6, mant_fp8)
+        is_underflow = (exp_fp8 <= 0) | (fp16_exp == 0)
+        exp_fp8 = tl.where(is_underflow, 0, exp_fp8)
+        mant_fp8 = tl.where(is_underflow, 0, mant_fp8)
+        x_uint8 = ((fp16_sign << 7) | (exp_fp8 << 3) | mant_fp8).to(tl.uint8)
+        x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
+
+        nope_mask = block < NOPE_HEAD_DIM
+        tl.store(fp8_ptr + block, x_uint8_flat, mask=nope_mask)
+
+        scale_idx = tl.arange(0, N_QUANT_BLOCKS)
+        encoded = exponents + 127.0
+        encoded = tl.maximum(tl.minimum(encoded, 255.0), 0.0)
+        tl.store(
+            scale_ptr + scale_idx,
+            encoded.to(tl.uint8),
+            mask=scale_idx < N_NOPE_BLOCKS,
+        )
+        tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
+
+        # Store rotated rope portion as bf16 (uint16) into cache's bf16 area
+        bf16_u16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.uint16))
+        rope_local = block - NOPE_HEAD_DIM
+        is_rope = (block >= NOPE_HEAD_DIM) & mask
+        # fp32 → bf16 via bit manipulation
+        result_u32 = result.to(tl.int32, bitcast=True)
+        result_bf16_bits = (
+            (result_u32 + 0x7FFF + ((result_u32 >> 16) & 1)) >> 16
+        ).to(tl.uint16)
+        tl.store(bf16_u16_ptr + rope_local, result_bf16_bits, mask=is_rope)
+
+
+def _sm70_triton_fused_compress_norm_rope_insert_fp8(
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    kv_cache_block_size: int,
+    head_size: int,
+    state_width: int,
+    compress_ratio: int,
+    overlap: bool,
+    rope_head_dim: int,
+    fp8_max: float,
+    quant_block: int,
+    token_stride: int,
+    scale_dim: int,
+) -> None:
+    """SM70 Triton replacement for _torch_fused_compress_norm_rope_insert_fp8_fallback.
+
+    Pre-computes firing mask on the Python side, then launches the Triton kernel
+    with grid=(num_firing_tokens,) to eliminate per-token boundary checks and
+    Python-level loop overhead.
+    """
+    num_tokens = slot_mapping.shape[0]
+    if num_tokens == 0:
+        return
+
+    # Pre-compute firing mask: only tokens at compress-ratio boundaries
+    fire_mask = (positions[:num_tokens] + 1) % compress_ratio == 0
+    # Also filter out padding tokens (slot_mapping < 0)
+    fire_mask = fire_mask & (slot_mapping[:num_tokens] >= 0)
+    firing_indices = fire_mask.nonzero(as_tuple=False).squeeze(1)
+
+    if firing_indices.numel() == 0:
+        return
+
+    # Ensure int32 for kernel compatibility
+    firing_indices = firing_indices.to(torch.int32)
+
+    is_indexer = head_size == 128
+    triton_block_size = triton.next_power_of_2(head_size)
+    num_warps = 1 if is_indexer else 4
+
+    _sm70_fused_compress_norm_rope_insert_fp8_kernel[(firing_indices.numel(),)](
+        # state cache
+        state_cache,
+        state_cache.stride(0),
+        state_cache.stride(1),
+        # metadata
+        token_to_req_indices,
+        positions,
+        slot_mapping,
+        block_table,
+        block_table.stride(0),
+        block_size,
+        # RMSNorm
+        rms_norm_weight,
+        rms_norm_eps,
+        # RoPE
+        cos_sin_cache,
+        cos_sin_cache.stride(0),
+        # KV cache
+        kv_cache,
+        kv_slot_mapping,
+        kv_cache_block_size,
+        # firing indices
+        firing_indices,
+        # constexprs
+        HEAD_SIZE=head_size,
+        TRITON_BLOCK_SIZE=triton_block_size,
+        STATE_WIDTH=state_width,
+        COMPRESS_RATIO=compress_ratio,
+        OVERLAP=overlap,
+        ROPE_HEAD_DIM=rope_head_dim,
+        FP8_MAX=fp8_max,
+        QUANT_BLOCK=quant_block,
+        TOKEN_STRIDE=token_stride,
+        SCALE_DIM=scale_dim,
+        KV_BLOCK_STRIDE=kv_cache.stride(0),
+        IS_INDEXER=is_indexer,
+        num_warps=num_warps,
+    )
+
+
 class DeepseekCompressor(nn.Module):
     def __init__(
         self,

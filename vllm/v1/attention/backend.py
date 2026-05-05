@@ -485,6 +485,8 @@ class AttentionCGSupport(Enum):
     """Cudagraph supported for batches the only contain query_len==1 decodes"""
     NEVER = 0
     """NO cudagraph support"""
+    PREFILL_PARTIAL = 4
+    """Partial prefill graph capture (attention kernel only)"""
 
 
 class AttentionMetadataBuilder(ABC, Generic[M]):

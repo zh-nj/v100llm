@@ -265,6 +265,22 @@ def get_prefill_workspace_size(max_model_len: int):
 
 class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_prefill_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.PREFILL_PARTIAL
+
+    # CUDA graph capture with expanded sizes [1,2,4] is supported. All
+    # workspace tensors (q_concat_buffer, prefill_bf16_workspace,
+    # tile_scheduler_metadata_buffer, num_splits_buffer, etc.) are allocated via
+    # get_simultaneous() using max_num_batched_tokens, ensuring stable addresses
+    # across different capture sizes. FlashMLASchedMeta instances are created
+    # fresh per build() call (have_initialized=False) so the tile-scheduler
+    # planner runs correctly for each batch size during capture. The three tile
+    # scheduler types (swaonly/c4a/c128a) all work with T>1 since the
+    # FlashMLA C++ planner derives its work distribution from the actual
+    # seq_lens/topk_length passed at runtime.
+    #
+    # To enable expanded capture:
+    #   --cudagraph-capture-sizes 1 2 4
+    # or via compilation_config={"cudagraph_capture_sizes": [1, 2, 4]}
 
     def __init__(
         self,
