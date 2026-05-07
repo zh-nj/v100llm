@@ -64,6 +64,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
 )
 from vllm.utils.import_utils import has_deep_gemm
+
+# Cache the deep_gemm module probe once at import; `has_deep_gemm()` internally
+# calls `importlib.util.find_spec`, which `torch._dynamo` refuses to trace
+# during AOT fullgraph capture for FULL_AND_PIECEWISE CUDA graph mode.
+_HAS_DEEP_GEMM_CACHED: bool = has_deep_gemm()
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
@@ -2612,7 +2617,7 @@ def deepseek_v4_fp8_einsum(
 
 
 def _should_use_torch_fp8_einsum_fallback(a: torch.Tensor) -> bool:
-    if not has_deep_gemm():
+    if not _HAS_DEEP_GEMM_CACHED:
         return True
     if not a.is_cuda:
         return False
