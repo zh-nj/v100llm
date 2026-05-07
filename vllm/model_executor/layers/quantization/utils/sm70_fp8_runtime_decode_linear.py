@@ -112,12 +112,20 @@ def apply_sm70_fp8_runtime_decode_layer(
     if not getattr(layer, "_sm70_fp8_runtime_prepared", False):
         raise RuntimeError("SM70 FP8 runtime decode weights were not prepared.")
 
+    # SM70 FP8 direct / runtime GEMM kernels require float16 inputs.
+    # Under torch.compile + inductor, upstream RMSNorm/mul outputs may get
+    # dtype-promoted to float32 (fx graph trace propagates fp32 accumulator
+    # through the `rsqrt * mul` chain), which reaches us as fp32. Cast
+    # explicitly so the C++ TORCH_CHECK on input.scalar_type() doesn't fire
+    # inside the compiled submod.
+    if x.dtype != torch.float16:
+        x = x.to(torch.float16)
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     padded_out_dim = int(layer.weight.size(0))
     logical_out_dim = int(getattr(layer, "_sm70_fp8_output_size", padded_out_dim))
     out_padded = torch.empty(
         (x_2d.size(0), padded_out_dim),
-        dtype=x_2d.dtype,
+        dtype=torch.float16,
         device=x_2d.device,
     )
     if getattr(layer, "_sm70_fp8_direct_prepared", False):

@@ -18,6 +18,13 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+def _sm70_mqa_block_d(head_dim: int) -> int:
+    for block_d in (64, 32, 16, 8, 4, 2, 1):
+        if head_dim >= block_d and head_dim % block_d == 0:
+            return block_d
+    raise ValueError(f"Unsupported SM70 MQA head_dim={head_dim}")
+
+
 @triton.jit
 def _decode_fp8_e4m3fn(uint8_val):
     """Decode FP8 e4m3fn uint8 vector to fp32.
@@ -248,10 +255,9 @@ def sm70_fp8_paged_mqa_logits(
     # KV cache: [num_blocks, block_size, 1, D+4] → flatten dim2
     kv_flat = kv_cache.reshape(kv_cache.shape[0], block_size, -1)
 
-    # Choose BLOCK_D: chunk size for D dimension. 64 gives 2 chunks for
-    # HEAD_DIM=128, halving the inner loop iterations and total Q decode
-    # calls while keeping each vector load within V100 register budget.
-    BLOCK_D = 64
+    # Use 64 for the real DeepSeek dimensions, but keep small synthetic
+    # contract tests valid by choosing a divisor of head_dim.
+    BLOCK_D = _sm70_mqa_block_d(head_dim)
 
     grid = (num_rows, max_model_len)
     _sm70_fp8_paged_mqa_logits_kernel[grid](
@@ -430,9 +436,9 @@ def sm70_fp8_mqa_logits(
     q_u8 = q.view(torch.uint8)
     k_u8 = k_fp8.view(torch.uint8)
 
-    # Choose BLOCK_D: chunk size for D dimension. 64 gives 2 chunks for
-    # HEAD_DIM=128, halving inner loop iterations and Q decode calls.
-    BLOCK_D = 64
+    # Use 64 for the real DeepSeek dimensions, but keep small synthetic
+    # contract tests valid by choosing a divisor of head_dim.
+    BLOCK_D = _sm70_mqa_block_d(head_dim)
 
     grid = (M, N)
     _sm70_fp8_mqa_logits_kernel[grid](

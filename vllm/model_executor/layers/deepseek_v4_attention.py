@@ -4,7 +4,12 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import json
 import os
+import threading
+from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
@@ -12,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
+
+import vllm.envs as envs
 
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
@@ -92,6 +99,670 @@ _SM70_FP16_ATTENTION_OUTPUT_MAX = float(torch.finfo(torch.float16).max)
 
 _PREFILL_CUDAGRAPH_ENABLED = os.getenv("VLLM_PREFILL_CUDAGRAPH", "0") == "1"
 _PREFILL_CUDAGRAPH_DEBUG = os.getenv("VLLM_PREFILL_CUDAGRAPH_DEBUG", "0") == "1"
+_PREFILL_CUDAGRAPH_PERF_GATE = (
+    os.getenv("VLLM_PREFILL_CUDAGRAPH_PERF_GATE", "0") == "1"
+)
+_DEEPSEEK_V4_PROFILE_ENABLED = os.getenv("VLLM_DEEPSEEK_V4_PROFILE", "0") == "1"
+_DEEPSEEK_V4_PROFILE_NVTX = os.getenv("VLLM_DEEPSEEK_V4_PROFILE_NVTX", "0") == "1"
+_DEEPSEEK_V4_PROFILE_LOG_EVERY = int(
+    os.getenv("VLLM_DEEPSEEK_V4_PROFILE_LOG_EVERY", "200")
+)
+# Event-record mode: "queue" (default) batches CUDA event syncs at step
+# boundary; "eager" syncs each end-event immediately (legacy behavior).
+_DEEPSEEK_V4_PROFILE_MODE = os.getenv(
+    "VLLM_DEEPSEEK_V4_PROFILE_MODE", "queue"
+).strip().lower()
+if _DEEPSEEK_V4_PROFILE_MODE not in ("queue", "eager"):
+    _DEEPSEEK_V4_PROFILE_MODE = "queue"
+# Cap recorded steps; 0 / unset => unlimited.
+_DEEPSEEK_V4_PROFILE_STEP_LIMIT = int(
+    os.getenv("VLLM_DEEPSEEK_V4_PROFILE_STEP_LIMIT", "0")
+)
+# Phase filter: "decode", "prefill", or "both" (default).
+_DEEPSEEK_V4_PROFILE_PHASE_FILTER = os.getenv(
+    "VLLM_DEEPSEEK_V4_PROFILE_PHASE_FILTER", "both"
+).strip().lower()
+if _DEEPSEEK_V4_PROFILE_PHASE_FILTER not in ("decode", "prefill", "both"):
+    _DEEPSEEK_V4_PROFILE_PHASE_FILTER = "both"
+
+# O3 fix: Tunable num_warps for the SM70 qnorm+RoPE+KV-insert Triton kernel.
+# Under CUDA-graph capture_size=1 decode the launch grid is degenerate (1,);
+# bumping num_warps boosts per-program parallelism to compensate. Default 4.
+try:
+    _SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS = max(
+        1,
+        int(os.getenv("VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS", "4")),
+    )
+except ValueError:
+    _SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS = 4
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+class _DeepseekV4PhasePrometheus:
+    def __init__(self) -> None:
+        import prometheus_client
+
+        self._prometheus_client = prometheus_client
+        self.duration_us = self._counter(
+            "vllm:deepseek_v4_phase_duration_us",
+            "DeepSeek V4 attention phase CUDA event duration in microseconds.",
+            ("phase",),
+        )
+        self.records = self._counter(
+            "vllm:deepseek_v4_phase_records",
+            "DeepSeek V4 attention phase record count.",
+            ("phase",),
+        )
+        self.failed_events = self._counter(
+            "vllm:deepseek_v4_phase_failed_events",
+            "DeepSeek V4 attention phase CUDA event failures.",
+            ("phase",),
+        )
+
+    def _counter(self, name: str, documentation: str, labelnames: tuple[str, ...]):
+        try:
+            return self._prometheus_client.Counter(
+                name=name,
+                documentation=documentation,
+                labelnames=labelnames,
+            )
+        except ValueError:
+            names_to_collectors = self._prometheus_client.REGISTRY._names_to_collectors
+            collector = names_to_collectors.get(name)
+            if collector is None:
+                collector = names_to_collectors.get(f"{name}_total")
+            if collector is None:
+                raise
+            return collector
+
+    def record(self, label: str, elapsed_us: float) -> None:
+        self.duration_us.labels(label).inc(float(elapsed_us))
+        self.records.labels(label).inc()
+
+    def record_failure(self, label: str) -> None:
+        try:
+            self.failed_events.labels(label).inc()
+        except Exception:
+            pass
+
+
+_DEEPSEEK_V4_PROFILE_PROMETHEUS: _DeepseekV4PhasePrometheus | None = None
+_DEEPSEEK_V4_PROFILE_PROMETHEUS_LOCK = threading.Lock()
+_DEEPSEEK_V4_PROFILE_PROMETHEUS_DISABLED = False
+
+
+def _get_deepseek_v4_phase_prometheus():
+    global _DEEPSEEK_V4_PROFILE_PROMETHEUS_DISABLED
+    global _DEEPSEEK_V4_PROFILE_PROMETHEUS
+    sink = _DEEPSEEK_V4_PROFILE_PROMETHEUS
+    if sink is not None:
+        return sink
+    if _DEEPSEEK_V4_PROFILE_PROMETHEUS_DISABLED:
+        return None
+    with _DEEPSEEK_V4_PROFILE_PROMETHEUS_LOCK:
+        sink = _DEEPSEEK_V4_PROFILE_PROMETHEUS
+        if sink is not None:
+            return sink
+        try:
+            _DEEPSEEK_V4_PROFILE_PROMETHEUS = _DeepseekV4PhasePrometheus()
+        except Exception:
+            _DEEPSEEK_V4_PROFILE_PROMETHEUS_DISABLED = True
+            logger.exception(
+                "DeepSeek V4 phase Prometheus metrics disabled after init failure"
+            )
+            return None
+        return _DEEPSEEK_V4_PROFILE_PROMETHEUS
+
+
+class _DeepseekV4PhaseRawTrace:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        # Best-effort env_metadata sidecar (Task 1.4).
+        try:
+            self._write_env_metadata_sidecar()
+        except Exception:
+            logger.warning(
+                "DeepSeek V4 profile: failed to write env_metadata sidecar",
+                exc_info=True,
+            )
+
+    def _write_env_metadata_sidecar(self) -> None:
+        import datetime
+        import subprocess
+
+        meta_path = self.path + ".meta.json"
+        meta: dict = {}
+
+        def _safe(fn, key, default=None):
+            try:
+                meta[key] = fn()
+            except Exception:
+                logger.warning(
+                    "DeepSeek V4 profile env_metadata: %s unavailable", key
+                )
+                meta[key] = default
+
+        def _git(args):
+            return subprocess.run(
+                ["git", *args],
+                capture_output=True, text=True, check=True, timeout=5,
+            ).stdout.strip()
+
+        _safe(lambda: _git(["rev-parse", "HEAD"]), "git_commit")
+        _safe(lambda: _git(["rev-parse", "--abbrev-ref", "HEAD"]), "git_branch")
+        _safe(lambda: torch.__version__, "torch_version")
+        _safe(lambda: torch.version.cuda, "cuda_version")
+        meta["conda_env"] = os.environ.get("CONDA_DEFAULT_ENV")
+        meta["model_path"] = os.environ.get("VLLM_MODEL_PATH") or os.environ.get(
+            "MODEL_PATH"
+        )
+        meta["timestamp_start_utc"] = (
+            datetime.datetime.now(datetime.timezone.utc).isoformat()
+        )
+
+        gpus: list[dict] = []
+        try:
+            if torch.cuda.is_available():
+                for idx in range(torch.cuda.device_count()):
+                    try:
+                        props = torch.cuda.get_device_properties(idx)
+                        gpus.append({
+                            "index": idx,
+                            "name": props.name,
+                            "bus_id": getattr(props, "pci_bus_id", None),
+                        })
+                    except Exception:
+                        gpus.append({"index": idx})
+        except Exception:
+            logger.warning(
+                "DeepSeek V4 profile env_metadata: gpu enumeration failed"
+            )
+        meta["gpus"] = gpus
+
+        try:
+            meta["vllm_env_vars"] = {
+                k: v for k, v in os.environ.items() if k.startswith("VLLM_")
+            }
+        except Exception:
+            meta["vllm_env_vars"] = {}
+
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, indent=2, sort_keys=True)
+
+    def record(
+        self,
+        label: str,
+        elapsed_us: float,
+        *,
+        step_id: int | None = None,
+        step_kind: str | None = None,
+        step_token_count: int | None = None,
+        layer_idx: int | None = None,
+        compress_ratio: int | None = None,
+        extra: dict | None = None,
+    ) -> None:
+        cuda_device = None
+        if torch.cuda.is_available():
+            try:
+                cuda_device = int(torch.cuda.current_device())
+            except Exception:
+                cuda_device = None
+        row = {
+            "pid": os.getpid(),
+            "cuda_device": cuda_device,
+            "phase": label,
+            "elapsed_us": float(elapsed_us),
+            "step_id": step_id,
+            "step_kind": step_kind,
+            "step_token_count": step_token_count,
+            "layer_idx": layer_idx,
+            "compress_ratio": compress_ratio,
+        }
+        if extra:
+            for k, v in extra.items():
+                row.setdefault(k, v)
+        line = json.dumps(row, separators=(",", ":")) + "\n"
+        with self._lock:
+            with open(self.path, "a", encoding="utf-8") as trace:
+                trace.write(line)
+
+
+_DEEPSEEK_V4_PROFILE_RAW_TRACE: _DeepseekV4PhaseRawTrace | None = None
+_DEEPSEEK_V4_PROFILE_RAW_TRACE_LOCK = threading.Lock()
+_DEEPSEEK_V4_PROFILE_RAW_TRACE_DISABLED = False
+
+
+def _get_deepseek_v4_phase_raw_trace():
+    global _DEEPSEEK_V4_PROFILE_RAW_TRACE
+    global _DEEPSEEK_V4_PROFILE_RAW_TRACE_DISABLED
+    path = os.getenv("VLLM_DEEPSEEK_V4_PROFILE_RAW_PATH")
+    if not path or _DEEPSEEK_V4_PROFILE_RAW_TRACE_DISABLED:
+        return None
+    sink = _DEEPSEEK_V4_PROFILE_RAW_TRACE
+    if sink is not None and sink.path == path:
+        return sink
+    with _DEEPSEEK_V4_PROFILE_RAW_TRACE_LOCK:
+        sink = _DEEPSEEK_V4_PROFILE_RAW_TRACE
+        if sink is not None and sink.path == path:
+            return sink
+        try:
+            _DEEPSEEK_V4_PROFILE_RAW_TRACE = _DeepseekV4PhaseRawTrace(path)
+        except Exception:
+            _DEEPSEEK_V4_PROFILE_RAW_TRACE_DISABLED = True
+            logger.exception(
+                "DeepSeek V4 phase raw trace disabled after init failure"
+            )
+            return None
+        return _DEEPSEEK_V4_PROFILE_RAW_TRACE
+
+
+class _DeepseekV4PhaseProfiler:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stats: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
+        self._records = 0
+        self._failed_events = 0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._stats.clear()
+            self._records = 0
+            self._failed_events = 0
+
+    def record_failure(self, label: str) -> None:
+        with self._lock:
+            self._failed_events += 1
+        sink = _get_deepseek_v4_phase_prometheus()
+        if sink is not None:
+            sink.record_failure(label)
+
+    @property
+    def failed_events(self) -> int:
+        with self._lock:
+            return self._failed_events
+
+    def record(
+        self,
+        label: str,
+        elapsed_us: float,
+        *,
+        step_id: int | None = None,
+        step_kind: str | None = None,
+        step_token_count: int | None = None,
+        layer_idx: int | None = None,
+        compress_ratio: int | None = None,
+        extra: dict | None = None,
+    ) -> None:
+        with self._lock:
+            stats = self._stats[label]
+            stats[0] += 1.0
+            stats[1] += float(elapsed_us)
+            self._records += 1
+            should_log = (
+                _DEEPSEEK_V4_PROFILE_LOG_EVERY > 0
+                and self._records % _DEEPSEEK_V4_PROFILE_LOG_EVERY == 0
+            )
+            snapshot = self._snapshot_locked(reset=False) if should_log else None
+        sink = _get_deepseek_v4_phase_prometheus()
+        if sink is not None:
+            sink.record(label, elapsed_us)
+        raw_trace = _get_deepseek_v4_phase_raw_trace()
+        if raw_trace is not None:
+            raw_trace.record(
+                label,
+                elapsed_us,
+                step_id=step_id,
+                step_kind=step_kind,
+                step_token_count=step_token_count,
+                layer_idx=layer_idx,
+                compress_ratio=compress_ratio,
+                extra=extra,
+            )
+        if snapshot is not None:
+            top = sorted(
+                snapshot.items(),
+                key=lambda item: item[1]["total_us"],
+                reverse=True,
+            )[:16]
+            logger.info(
+                "DeepSeek V4 phase profile top=%s",
+                {
+                    name: {
+                        "count": data["count"],
+                        "total_ms": round(data["total_us"] / 1000.0, 3),
+                        "avg_us": round(data["avg_us"], 1),
+                    }
+                    for name, data in top
+                },
+            )
+
+    def _snapshot_locked(self, *, reset: bool) -> dict[str, dict[str, float]]:
+        snapshot = {
+            label: {
+                "count": int(values[0]),
+                "total_us": values[1],
+                "avg_us": values[1] / values[0] if values[0] else 0.0,
+            }
+            for label, values in self._stats.items()
+        }
+        if reset:
+            self._stats.clear()
+            self._records = 0
+        return snapshot
+
+    def snapshot(self, *, reset: bool = False) -> dict[str, dict[str, float]]:
+        with self._lock:
+            return self._snapshot_locked(reset=reset)
+
+
+_DEEPSEEK_V4_PROFILE = _DeepseekV4PhaseProfiler()
+
+
+# ---------------------------------------------------------------------------
+# Thread-local step/layer context (Task 1.1) + queued CUDA events (Task 1.2).
+# ---------------------------------------------------------------------------
+
+
+class _DeepseekV4PhaseContext(threading.local):
+    """Thread-local profiling context.
+
+    Fields default to None so existing call sites that omit step/layer
+    information remain backward compatible.
+    """
+
+    def __init__(self) -> None:  # noqa: D401 - threading.local init
+        super().__init__()
+        self.step_id: int | None = None
+        self.step_kind: str | None = None
+        self.step_token_count: int | None = None
+        self.layer_idx: int | None = None
+        self.compress_ratio: int | None = None
+        # Per-thread CUDA-event ring buffer for queue mode. Each entry is
+        # (start, end, label, ctx_snapshot).
+        self.event_queue: list[tuple] = []
+        # Monotonic step counter used when no caller provides explicit ids.
+        self._auto_step_counter = 0
+
+
+_DEEPSEEK_V4_PHASE_CONTEXT = _DeepseekV4PhaseContext()
+
+
+def _phase_context_snapshot() -> dict:
+    ctx = _DEEPSEEK_V4_PHASE_CONTEXT
+    return {
+        "step_id": ctx.step_id,
+        "step_kind": ctx.step_kind,
+        "step_token_count": ctx.step_token_count,
+        "layer_idx": ctx.layer_idx,
+        "compress_ratio": ctx.compress_ratio,
+    }
+
+
+def _phase_filter_allows(step_kind: str | None) -> bool:
+    if _DEEPSEEK_V4_PROFILE_PHASE_FILTER == "both" or step_kind is None:
+        return True
+    return step_kind == _DEEPSEEK_V4_PROFILE_PHASE_FILTER
+
+
+def _phase_step_limit_exceeded(step_id: int | None) -> bool:
+    if _DEEPSEEK_V4_PROFILE_STEP_LIMIT <= 0 or step_id is None:
+        return False
+    return step_id >= _DEEPSEEK_V4_PROFILE_STEP_LIMIT
+
+
+def _flush_event_queue() -> None:
+    queue = _DEEPSEEK_V4_PHASE_CONTEXT.event_queue
+    if not queue:
+        return
+    # One sync per step boundary (queue mode) is sufficient: synchronize
+    # the last enqueued end event, then read elapsed_time on each pair.
+    try:
+        queue[-1][1].synchronize()
+    except Exception:
+        logger.warning(
+            "DeepSeek V4 profile: queued event sync failed; dropping batch",
+            exc_info=True,
+        )
+        queue.clear()
+        return
+    for entry in queue:
+        if len(entry) == 5:
+            start, end, label, ctx, extra = entry
+        else:
+            start, end, label, ctx = entry
+            extra = None
+        try:
+            elapsed_us = start.elapsed_time(end) * 1000.0
+        except Exception:
+            logger.warning(
+                "DeepSeek V4 profile: elapsed_time failed for phase=%s "
+                "layer_idx=%s step_id=%s",
+                label,
+                ctx.get("layer_idx"),
+                ctx.get("step_id"),
+            )
+            _DEEPSEEK_V4_PROFILE.record_failure(label)
+            continue
+        _DEEPSEEK_V4_PROFILE.record(
+            label,
+            elapsed_us,
+            step_id=ctx.get("step_id"),
+            step_kind=ctx.get("step_kind"),
+            step_token_count=ctx.get("step_token_count"),
+            layer_idx=ctx.get("layer_idx"),
+            compress_ratio=ctx.get("compress_ratio"),
+            extra=extra,
+        )
+    queue.clear()
+
+
+def _is_cuda_stream_capturing() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+@contextmanager
+def _profile_phase(
+    label: str, ref: torch.Tensor, *, extra: dict | None = None
+) -> Iterator[None]:
+    if not ref.is_cuda or _is_cuda_stream_capturing():
+        yield
+        return
+    use_events = _DEEPSEEK_V4_PROFILE_ENABLED
+    use_nvtx = _DEEPSEEK_V4_PROFILE_NVTX
+    if not use_events and not use_nvtx:
+        yield
+        return
+    ctx_snapshot = _phase_context_snapshot()
+    if use_events and (
+        not _phase_filter_allows(ctx_snapshot["step_kind"])
+        or _phase_step_limit_exceeded(ctx_snapshot["step_id"])
+    ):
+        use_events = False
+    if not use_events and not use_nvtx:
+        yield
+        return
+    if use_nvtx:
+        torch.cuda.nvtx.range_push(label)
+    if not use_events:
+        try:
+            yield
+        finally:
+            if use_nvtx:
+                torch.cuda.nvtx.range_pop()
+        return
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    try:
+        yield
+    finally:
+        end.record()
+        if _DEEPSEEK_V4_PROFILE_MODE == "queue":
+            _DEEPSEEK_V4_PHASE_CONTEXT.event_queue.append(
+                (start, end, label, ctx_snapshot, extra)
+            )
+        else:
+            try:
+                end.synchronize()
+                elapsed_us = start.elapsed_time(end) * 1000.0
+            except Exception:
+                logger.warning(
+                    "DeepSeek V4 profile: elapsed_time failed for phase=%s "
+                    "layer_idx=%s step_id=%s",
+                    label,
+                    ctx_snapshot.get("layer_idx"),
+                    ctx_snapshot.get("step_id"),
+                )
+                _DEEPSEEK_V4_PROFILE.record_failure(label)
+            else:
+                _DEEPSEEK_V4_PROFILE.record(
+                    label,
+                    elapsed_us,
+                    step_id=ctx_snapshot["step_id"],
+                    step_kind=ctx_snapshot["step_kind"],
+                    step_token_count=ctx_snapshot["step_token_count"],
+                    layer_idx=ctx_snapshot["layer_idx"],
+                    compress_ratio=ctx_snapshot["compress_ratio"],
+                    extra=extra,
+                )
+        if use_nvtx:
+            torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
+def _profile_step(
+    step_idx: int | None = None,
+    phase_kind: str | None = None,
+    token_count: int | None = None,
+) -> Iterator[None]:
+    """Push thread-local step context + NVTX range; flush queued events on exit.
+
+    Safe to call when profiling is disabled — becomes a near no-op.
+    """
+    profiling_active = (
+        _DEEPSEEK_V4_PROFILE_ENABLED or _DEEPSEEK_V4_PROFILE_NVTX
+    )
+    ctx = _DEEPSEEK_V4_PHASE_CONTEXT
+    prev = (ctx.step_id, ctx.step_kind, ctx.step_token_count)
+    if step_idx is None:
+        step_idx = ctx._auto_step_counter
+        ctx._auto_step_counter += 1
+    ctx.step_id = step_idx
+    ctx.step_kind = phase_kind
+    ctx.step_token_count = token_count
+    pushed_nvtx = False
+    if profiling_active and _DEEPSEEK_V4_PROFILE_NVTX and torch.cuda.is_available():
+        try:
+            torch.cuda.nvtx.range_push(
+                f"step[idx={step_idx},type={phase_kind},tokens={token_count}]"
+            )
+            pushed_nvtx = True
+        except Exception:
+            pushed_nvtx = False
+    try:
+        yield
+    finally:
+        if (
+            _DEEPSEEK_V4_PROFILE_ENABLED
+            and _DEEPSEEK_V4_PROFILE_MODE == "queue"
+            and torch.cuda.is_available()
+            and not _is_cuda_stream_capturing()
+        ):
+            try:
+                _flush_event_queue()
+            except Exception:
+                logger.warning(
+                    "DeepSeek V4 profile: queue flush failed",
+                    exc_info=True,
+                )
+                ctx.event_queue.clear()
+        if pushed_nvtx:
+            try:
+                torch.cuda.nvtx.range_pop()
+            except Exception:
+                pass
+        ctx.step_id, ctx.step_kind, ctx.step_token_count = prev
+
+
+@contextmanager
+def _profile_layer(
+    layer_idx: int | None = None,
+    compress_ratio: int | None = None,
+) -> Iterator[None]:
+    """Push thread-local layer context + NVTX range. Safe no-op when disabled."""
+    ctx = _DEEPSEEK_V4_PHASE_CONTEXT
+    prev = (ctx.layer_idx, ctx.compress_ratio)
+    ctx.layer_idx = layer_idx
+    ctx.compress_ratio = compress_ratio
+    pushed_nvtx = False
+    if (
+        _DEEPSEEK_V4_PROFILE_NVTX
+        and torch.cuda.is_available()
+    ):
+        try:
+            torch.cuda.nvtx.range_push(
+                f"layer[idx={layer_idx},compress_ratio={compress_ratio}]"
+            )
+            pushed_nvtx = True
+        except Exception:
+            pushed_nvtx = False
+    try:
+        yield
+    finally:
+        if pushed_nvtx:
+            try:
+                torch.cuda.nvtx.range_pop()
+            except Exception:
+                pass
+        ctx.layer_idx, ctx.compress_ratio = prev
+
+
+def _profile_or_null(label: str, ref: torch.Tensor, *, extra: dict | None = None):
+    if not _DEEPSEEK_V4_PROFILE_ENABLED and not _DEEPSEEK_V4_PROFILE_NVTX:
+        return nullcontext()
+    return _profile_phase(label, ref, extra=extra)
+
+
+def _default_prefill_cudagraph_capture_sizes(
+    *,
+    max_num_batched_tokens: int,
+    max_model_len: int,
+    max_M: int,
+) -> list[tuple[int, int]]:
+    env_sizes = os.getenv("VLLM_PREFILL_CUDAGRAPH_CAPTURE_TOKENS")
+    max_tokens = max(1, min(max_num_batched_tokens, max_model_len))
+    if env_sizes:
+        tokens = sorted(
+            {
+                int(part.strip())
+                for part in env_sizes.split(",")
+                if part.strip()
+            }
+        )
+        return [(min(token, max_tokens), max_M) for token in tokens if token > 0]
+
+    tokens: list[int] = []
+    size = 1
+    while size < max_tokens:
+        tokens.append(size)
+        size *= 2
+    tokens.append(max_tokens)
+    return [(token, max_M) for token in sorted(set(tokens))]
 
 
 def _trace_nonfinite_tensor(label: str, tensor: torch.Tensor) -> None:
@@ -195,10 +866,18 @@ def _should_use_sm70_decode_prefill_fallback(
     q: torch.Tensor,
     swa_only: bool,
 ) -> bool:
+    del swa_only
     if not q.is_cuda:
         return False
     capability = torch.cuda.get_device_capability(q.device)
-    return capability[0] < 8
+    major, minor = capability
+    if major >= 8:
+        return False
+    if major == 7 and minor == 0 and _env_flag(
+        "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", default=True
+    ):
+        return False
+    return True
 
 
 def _get_decode_prefill_fallback_workspace(
@@ -791,7 +1470,40 @@ def _sm70_triton_qnorm_rope_kv_insert(
         n_heads,
         head_dim,
         block_size,
+        num_warps=_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS,
     )
+
+
+def _sm70_triton_qnorm_rope_kv_insert_fake(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    block_size: int,
+) -> None:
+    # Mutation-only (no return); fake_impl is a no-op so dynamo/inductor
+    # can reason about the op without tracing the triton kernel body.
+    # This is what lets us opt out of the broken
+    # `decompose_triton_kernel_wrapper_functional` pattern-matcher pass
+    # in torch._inductor (2.9) that mishandles our kernels.
+    return None
+
+
+try:
+    direct_register_custom_op(
+        op_name="sm70_qnorm_rope_kv_insert",
+        op_func=_sm70_triton_qnorm_rope_kv_insert,
+        mutates_args=["q", "k_cache"],
+        fake_impl=_sm70_triton_qnorm_rope_kv_insert_fake,
+    )
+    _sm70_triton_qnorm_rope_kv_insert_op = (
+        torch.ops.vllm.sm70_qnorm_rope_kv_insert
+    )
+except (RuntimeError, AttributeError):
+    _sm70_triton_qnorm_rope_kv_insert_op = None
 
 
 def _apply_gptj_rope_tail(
@@ -932,9 +1644,9 @@ class PrefillGraphDispatcher:
         self.padded_heads = padded_heads
         self.head_dim = head_dim
         self.scale = scale
-        self.attn_sink = attn_sink
         self.device = device
         self.enabled = True
+        self.debug_validated = False
 
         self.sizes: list[PrefillCaptureSize] = sorted(
             [PrefillCaptureSize(max_tokens=t, max_M=m) for t, m in capture_sizes],
@@ -949,6 +1661,8 @@ class PrefillGraphDispatcher:
         self.q_padded: torch.Tensor | None = None
         self.indices_padded: torch.Tensor | None = None
         self.topk_length_padded: torch.Tensor | None = None
+        self.kv_padded: torch.Tensor | None = None
+        self.attn_sink_workspace: torch.Tensor | None = None
         self.output_padded: torch.Tensor | None = None
         self.flash_output_bf16: torch.Tensor | None = None
 
@@ -960,24 +1674,54 @@ class PrefillGraphDispatcher:
         max_M = max(s.max_M for s in self.sizes)
 
         try:
-            (
-                self.q_padded,
-                self.indices_padded,
-                self.topk_length_padded,
-                self.output_padded,
-                self.flash_output_bf16,
-            ) = current_workspace_manager().get_simultaneous(
-                ((max_tokens, padded_heads, head_dim), torch.float16),
-                ((max_tokens, 1, max_M), torch.int32),
-                ((max_tokens,), torch.int32),
-                ((max_tokens, padded_heads, head_dim), torch.float16),
-                ((max_tokens, padded_heads, head_dim), torch.bfloat16),
+            # CUDA graph static inputs must have stable, private storage.  Do
+            # not use the scratch workspace manager here: _forward_prefill()
+            # also allocates its gather workspace from that pool, and aliasing
+            # graph inputs with runtime KV scratch corrupts replay.
+            self.q_padded = torch.empty(
+                (max_tokens, padded_heads, head_dim),
+                dtype=torch.float16,
+                device=device,
             )
+            self.indices_padded = torch.empty(
+                (max_tokens, 1, max_M),
+                dtype=torch.int32,
+                device=device,
+            )
+            self.topk_length_padded = torch.empty(
+                (max_tokens,),
+                dtype=torch.int32,
+                device=device,
+            )
+            self.kv_padded = torch.empty(
+                (PREFILL_CHUNK_SIZE, max_M, head_dim),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.attn_sink_workspace = torch.empty(
+                tuple(attn_sink.shape),
+                dtype=attn_sink.dtype,
+                device=device,
+            )
+            self.output_padded = torch.empty(
+                (max_tokens, padded_heads, head_dim),
+                dtype=torch.float16,
+                device=device,
+            )
+            self.flash_output_bf16 = torch.empty(
+                (max_tokens, padded_heads, head_dim),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.attn_sink_workspace.copy_(attn_sink)
             total_bytes = (
                 self.q_padded.nelement() * self.q_padded.element_size()
                 + self.indices_padded.nelement() * self.indices_padded.element_size()
                 + self.topk_length_padded.nelement()
                 * self.topk_length_padded.element_size()
+                + self.kv_padded.nelement() * self.kv_padded.element_size()
+                + self.attn_sink_workspace.nelement()
+                * self.attn_sink_workspace.element_size()
                 + self.output_padded.nelement() * self.output_padded.element_size()
                 + self.flash_output_bf16.nelement()
                 * self.flash_output_bf16.element_size()
@@ -997,6 +1741,8 @@ class PrefillGraphDispatcher:
             self.q_padded = None
             self.indices_padded = None
             self.topk_length_padded = None
+            self.kv_padded = None
+            self.attn_sink_workspace = None
             self.output_padded = None
             self.flash_output_bf16 = None
 
@@ -1016,23 +1762,50 @@ class PrefillGraphDispatcher:
         combined_indices: torch.Tensor,
         combined_lens: torch.Tensor,
         num_chunk_tokens: int,
-        chunk_size: int,
         capture_size: PrefillCaptureSize,
     ) -> None:
         capture_tokens = capture_size.max_tokens
+        capture_M = capture_size.max_M
 
         # Copy q_chunk → q_padded[:num_chunk_tokens], zero-fill rest
         self.q_padded[:num_chunk_tokens].copy_(q_chunk)
         if capture_tokens > num_chunk_tokens:
             self.q_padded[num_chunk_tokens:capture_tokens].zero_()
 
-        # Copy combined_indices → indices_padded[:num_chunk_tokens]
-        self.indices_padded[:num_chunk_tokens].copy_(combined_indices)
+        # Copy combined_indices → indices_padded[:num_chunk_tokens], padding
+        # the captured graph's static width with invalid slots when needed.
+        indices_width = combined_indices.shape[-1]
+        self.indices_padded[:num_chunk_tokens, :, :indices_width].copy_(
+            combined_indices
+        )
+        if capture_M > indices_width:
+            self.indices_padded[
+                :num_chunk_tokens, :, indices_width:capture_M
+            ].fill_(-1)
+        if capture_tokens > num_chunk_tokens:
+            self.indices_padded[num_chunk_tokens:capture_tokens].fill_(-1)
 
-        # Copy combined_lens → topk_length_padded[:chunk_size], zero-fill rest
-        self.topk_length_padded[:chunk_size].copy_(combined_lens)
-        if capture_tokens > chunk_size:
-            self.topk_length_padded[chunk_size:capture_tokens].zero_()
+        # combined_lens is per token, not per request.  Keeping stale token
+        # lengths here corrupts graph replay outputs.
+        self.topk_length_padded[:num_chunk_tokens].copy_(combined_lens)
+        if capture_tokens > num_chunk_tokens:
+            self.topk_length_padded[num_chunk_tokens:capture_tokens].zero_()
+
+    def _prepare_kv_workspace(
+        self,
+        kv_flat: torch.Tensor,
+        chunk_size: int,
+        M: int,
+        capture_size: PrefillCaptureSize,
+    ) -> None:
+        assert self.kv_padded is not None
+        capture_M = capture_size.max_M
+        kv_source = kv_flat.view(PREFILL_CHUNK_SIZE, M, self.head_dim)
+        self.kv_padded[:chunk_size, :M].copy_(kv_source[:chunk_size, :M])
+        if capture_M > M:
+            self.kv_padded[:chunk_size, M:capture_M].zero_()
+        if PREFILL_CHUNK_SIZE > chunk_size:
+            self.kv_padded[chunk_size:PREFILL_CHUNK_SIZE].zero_()
 
     def try_graph_replay(
         self,
@@ -1042,23 +1815,33 @@ class PrefillGraphDispatcher:
         combined_lens: torch.Tensor,
         output_slice: torch.Tensor,
         num_chunk_tokens: int,
+        num_chunk_reqs: int,
         M: int,
+        attn_sink: torch.Tensor | None = None,
     ) -> bool:
         capture_size = self.find_capture_size(num_chunk_tokens, M)
         if capture_size is None or capture_size.graph is None:
             self.eager_dispatch_count += 1
             return False
 
-        chunk_size = combined_lens.shape[0]
         self._prepare_workspace(
             q_chunk, combined_indices, combined_lens,
-            num_chunk_tokens, chunk_size, capture_size,
+            num_chunk_tokens, capture_size,
         )
+        self._prepare_kv_workspace(kv_flat, num_chunk_reqs, M, capture_size)
+        if attn_sink is not None and self.attn_sink_workspace is not None:
+            self.attn_sink_workspace.copy_(attn_sink)
 
         capture_size.graph.replay()
 
         output_slice.copy_(self.output_padded[:num_chunk_tokens])
         self.graph_dispatch_count += 1
+        if self.graph_dispatch_count == 1:
+            logger.info(
+                "Prefill CUDA graph replayed first chunk with "
+                "tokens=%d, M=%d, capture_tokens=%d, capture_M=%d",
+                num_chunk_tokens, M, capture_size.max_tokens, capture_size.max_M,
+            )
         return True
 
     def capture_graphs(
@@ -1077,6 +1860,7 @@ class PrefillGraphDispatcher:
                 self.q_padded[:ct].zero_()
                 self.indices_padded[:ct].fill_(-1)
                 self.topk_length_padded[:ct].zero_()
+                self.kv_padded.zero_()
                 self.output_padded[:ct].zero_()
                 self.flash_output_bf16[:ct].zero_()
 
@@ -1086,11 +1870,10 @@ class PrefillGraphDispatcher:
                 )
                 flash_mla_sparse_fwd_fn(
                     flash_q,
-                    torch.empty(0, 1, self.head_dim,
-                                dtype=torch.bfloat16, device=self.device),
+                    self.kv_padded.view(-1, 1, self.head_dim),
                     self.indices_padded[:ct],
                     self.scale,
-                    attn_sink=self.attn_sink,
+                    attn_sink=self.attn_sink_workspace,
                     topk_length=self.topk_length_padded[:ct],
                 )
                 copy_flashmla_output_fn(flash_out, self.output_padded[:ct])
@@ -1103,11 +1886,10 @@ class PrefillGraphDispatcher:
                     )
                     out_tuple = flash_mla_sparse_fwd_fn(
                         flash_q,
-                        torch.empty(0, 1, self.head_dim,
-                                    dtype=torch.bfloat16, device=self.device),
+                        self.kv_padded.view(-1, 1, self.head_dim),
                         self.indices_padded[:ct],
                         self.scale,
-                        attn_sink=self.attn_sink,
+                        attn_sink=self.attn_sink_workspace,
                         topk_length=self.topk_length_padded[:ct],
                     )
                     copy_flashmla_output_fn(out_tuple[0], self.output_padded[:ct])
@@ -1144,6 +1926,13 @@ class PrefillGraphDispatcher:
                 (ct, 1, 1), -1, dtype=torch.int32, device=self.device,
             )
             lens_rand = torch.zeros(ct, dtype=torch.int32, device=self.device)
+            kv_rand = torch.randn(
+                PREFILL_CHUNK_SIZE,
+                size.max_M,
+                self.head_dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
             output_eager = torch.zeros(
                 ct, self.padded_heads, self.head_dim,
                 dtype=torch.float16, device=self.device,
@@ -1158,11 +1947,10 @@ class PrefillGraphDispatcher:
             flash_q, flash_out = flashmla_bf16_io_fn(q_rand, output_eager)
             out_tuple = flash_mla_sparse_fwd_fn(
                 flash_q,
-                torch.empty(0, 1, self.head_dim,
-                            dtype=torch.bfloat16, device=self.device),
+                kv_rand.view(-1, 1, self.head_dim),
                 indices_rand,
                 self.scale,
-                attn_sink=self.attn_sink,
+                attn_sink=self.attn_sink_workspace,
                 topk_length=lens_rand,
             )
             copy_flashmla_output_fn(out_tuple[0], output_eager)
@@ -1174,7 +1962,13 @@ class PrefillGraphDispatcher:
             self.q_padded[:ct].copy_(q_rand)
             self.indices_padded[:ct].copy_(indices_rand)
             self.topk_length_padded[:ct].copy_(lens_rand)
+            self.kv_padded.copy_(kv_rand)
             self.output_padded[:ct].zero_()
+
+            # The first replay after capture can pay driver-side cold costs.
+            # Do not let that one sample decide whether the graph is usable.
+            size.graph.replay()
+            torch.cuda.synchronize()
 
             start_event.record()
             size.graph.replay()
@@ -1197,9 +1991,11 @@ class PrefillGraphDispatcher:
                 size.enabled = False
                 continue
 
-            # Performance gating: disable if graph is not faster within 5% tolerance
             tolerance = 0.05
-            if graph_us > eager_us * (1.0 + tolerance):
+            if (
+                _PREFILL_CUDAGRAPH_PERF_GATE
+                and graph_us > eager_us * (1.0 + tolerance)
+            ):
                 logger.info(
                     "Prefill graph for size (tokens=%d, M=%d) disabled: "
                     "graph %.1fµs vs eager %.1fµs",
@@ -1209,9 +2005,12 @@ class PrefillGraphDispatcher:
             else:
                 logger.info(
                     "Prefill graph for size (tokens=%d, M=%d) validated: "
-                    "graph %.1fµs vs eager %.1fµs",
+                    "graph %.1fµs vs eager %.1fµs%s",
                     ct, size.max_M, graph_us, eager_us,
+                    "" if _PREFILL_CUDAGRAPH_PERF_GATE
+                    else " (perf gate disabled)",
                 )
+        self.debug_validated = True
 
     def get_dispatch_stats(self) -> dict[str, int | float]:
         total = self.graph_dispatch_count + self.eager_dispatch_count
@@ -1224,6 +2023,60 @@ class PrefillGraphDispatcher:
             "total_dispatch_count": total,
             "graph_dispatch_fraction": graph_fraction,
         }
+
+
+_PREFILL_GRAPH_DISPATCHER_CACHE: dict[tuple[object, ...], PrefillGraphDispatcher] = {}
+_PREFILL_GRAPH_DISPATCHER_CACHE_LOCK = threading.Lock()
+
+
+def _get_or_create_prefill_graph_dispatcher(
+    *,
+    capture_sizes: list[tuple[int, int]],
+    padded_heads: int,
+    head_dim: int,
+    scale: float,
+    attn_sink: torch.Tensor,
+    device: torch.device,
+    flash_mla_sparse_fwd_fn,
+    flashmla_bf16_io_fn,
+    copy_flashmla_output_fn,
+) -> PrefillGraphDispatcher:
+    device_key = (
+        device.type,
+        device.index if device.index is not None else torch.cuda.current_device()
+        if device.type == "cuda" and torch.cuda.is_available()
+        else None,
+    )
+    key = (
+        device_key,
+        tuple(capture_sizes),
+        padded_heads,
+        head_dim,
+        float(scale),
+        tuple(attn_sink.shape),
+        str(attn_sink.dtype),
+    )
+
+    with _PREFILL_GRAPH_DISPATCHER_CACHE_LOCK:
+        dispatcher = _PREFILL_GRAPH_DISPATCHER_CACHE.get(key)
+        if dispatcher is not None:
+            return dispatcher
+
+        dispatcher = PrefillGraphDispatcher(
+            capture_sizes=capture_sizes,
+            padded_heads=padded_heads,
+            head_dim=head_dim,
+            scale=scale,
+            attn_sink=attn_sink,
+            device=device,
+        )
+        dispatcher.capture_graphs(
+            flash_mla_sparse_fwd_fn,
+            flashmla_bf16_io_fn,
+            copy_flashmla_output_fn,
+        )
+        _PREFILL_GRAPH_DISPATCHER_CACHE[key] = dispatcher
+        return dispatcher
 
 
 def _flashmla_bf16_io(
@@ -1447,7 +2300,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
         _trace_nonfinite_tensor(f"{self.prefix}.wrapper.input", hidden_states)
-        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+        with _profile_or_null("wrapper.fused_wqa_wkv", hidden_states):
+            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         _trace_nonfinite_tensor(f"{self.prefix}.wrapper.qr", qr)
         _trace_nonfinite_tensor(f"{self.prefix}.wrapper.kv", kv)
@@ -1462,54 +2316,82 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         # Attention (inside custom op for torch.compile boundary)
-        torch.ops.vllm.deepseek_v4_attention(
-            hidden_states,
-            qr,
-            kv,
-            positions,
-            o_padded,
-            self.layer_name,
-        )
+        with _profile_or_null("wrapper.attention_total", hidden_states):
+            torch.ops.vllm.deepseek_v4_attention(
+                hidden_states,
+                qr,
+                kv,
+                positions,
+                o_padded,
+                self.layer_name,
+            )
         _trace_nonfinite_tensor(f"{self.prefix}.wrapper.o_padded", o_padded)
         o = o_padded[:, : self.n_local_heads, :]
         _trace_nonfinite_tensor(f"{self.prefix}.wrapper.o", o)
         _trace_layer16_summary(self.prefix, "wrapper.o", o)
 
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
-        o_fp8, o_scale = fused_inv_rope_fp8_quant(
-            o,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            n_groups=self.n_local_groups,
-            heads_per_group=self.n_local_heads // self.n_local_groups,
-            nope_dim=self.nope_head_dim,
-            rope_dim=self.rope_head_dim,
-            tma_aligned_scales=self._tma_aligned_scales,
-        )
+        with _profile_or_null("wrapper.o_inv_rope_fp8_quant", o):
+            o_fp8, o_scale = fused_inv_rope_fp8_quant(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                tma_aligned_scales=self._tma_aligned_scales,
+            )
         _trace_nonfinite_tensor(f"{self.prefix}.wrapper.o_scale", o_scale)
         _trace_layer16_summary(self.prefix, "wrapper.o_scale", o_scale)
 
         wo_a_fp8 = self.wo_a.weight
         wo_a_scale = self.wo_a.weight_scale_inv
 
+        # O1 fused path: combine `wrapper.o_fp8_einsum` + `wrapper.wo_b` into
+        # a single Python-level call, eliminating the intermediate `z` global
+        # memory roundtrip. Gated by VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB; only
+        # used on the SM70 software-FP8 fallback path. SM80+ unchanged.
+        if (
+            _env_flag("VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB")
+            and _should_use_torch_fp8_einsum_fallback(o_fp8)
+        ):
+            with _profile_or_null("wrapper.wo_b", o_fp8):
+                out = _sm70_fused_o_einsum_wo_b(
+                    o_fp8,
+                    o_scale,
+                    wo_a_fp8,
+                    wo_a_scale,
+                    self.wo_b,
+                    "bhr,hdr->bhd",
+                    hidden_states.dtype,
+                )
+            if _should_clamp_sm70_fp16_attention_output(out):
+                _clamp_sm70_fp16_attention_output_(out)
+            _trace_nonfinite_tensor(f"{self.prefix}.wrapper.wo_b", out)
+            _trace_layer16_summary(self.prefix, "wrapper.wo_b", out)
+            return out
+
         z = torch.empty(
             (num_tokens, self.n_local_groups, self.o_lora_rank),
             device=o.device,
             dtype=hidden_states.dtype,
         )
-        torch.ops.vllm.deepseek_v4_fp8_einsum(
-            o_fp8,
-            o_scale,
-            wo_a_fp8,
-            wo_a_scale,
-            z,
-            "bhr,hdr->bhd",
-            list(self._einsum_recipe),
-        )
+        with _profile_or_null("wrapper.o_fp8_einsum", z):
+            torch.ops.vllm.deepseek_v4_fp8_einsum(
+                o_fp8,
+                o_scale,
+                wo_a_fp8,
+                wo_a_scale,
+                z,
+                "bhr,hdr->bhd",
+                list(self._einsum_recipe),
+            )
         _trace_nonfinite_tensor(f"{self.prefix}.wrapper.z", z)
         _trace_layer16_summary(self.prefix, "wrapper.z", z)
 
-        out = self.wo_b(z.flatten(1))
+        with _profile_or_null("wrapper.wo_b", z):
+            out = self.wo_b(z.flatten(1))
         if isinstance(out, tuple):
             out = out[0]
         if _should_clamp_sm70_fp16_attention_output(out):
@@ -1529,16 +2411,18 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
-        qr, kv = fused_q_kv_rmsnorm(
-            qr,
-            kv,
-            self.q_norm.weight.data,
-            self.kv_norm.weight.data,
-            self.eps,
-        )
+        with _profile_or_null("impl.q_kv_rmsnorm", qr):
+            qr, kv = fused_q_kv_rmsnorm(
+                qr,
+                kv,
+                self.q_norm.weight.data,
+                self.kv_norm.weight.data,
+                self.eps,
+            )
         _trace_nonfinite_tensor(f"{self.prefix}.impl.qr_norm", qr)
         _trace_nonfinite_tensor(f"{self.prefix}.impl.kv_norm", kv)
-        q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+        with _profile_or_null("impl.q_proj", qr):
+            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
         _trace_nonfinite_tensor(f"{self.prefix}.impl.q_proj", q)
 
         # Overlap kv_insert with whichever of indexer/compressor is present.
@@ -1554,28 +2438,33 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 compressor(hidden_states, positions, self.rotary_emb)
 
-            maybe_execute_in_parallel(
-                lambda: indexer(hidden_states, qr, positions, self.indexer_rotary_emb),
-                kv_insert_and_compress,
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
+            with _profile_or_null("impl.indexer_kv_compress_overlap", q):
+                maybe_execute_in_parallel(
+                    lambda: indexer(
+                        hidden_states, qr, positions, self.indexer_rotary_emb
+                    ),
+                    kv_insert_and_compress,
+                    self.ln_events[0],
+                    self.ln_events[1],
+                    self.aux_stream,
+                )
         elif self.compressor is not None:
             # Compressor on default, kv_insert on aux.
             compressor = self.compressor
-            maybe_execute_in_parallel(
-                lambda: compressor(hidden_states, positions, self.rotary_emb),
-                lambda: self._fused_qnorm_rope_kv_insert(
-                    q, kv, positions, attn_metadata
-                ),
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
+            with _profile_or_null("impl.compressor_kv_insert_overlap", q):
+                maybe_execute_in_parallel(
+                    lambda: compressor(hidden_states, positions, self.rotary_emb),
+                    lambda: self._fused_qnorm_rope_kv_insert(
+                        q, kv, positions, attn_metadata
+                    ),
+                    self.ln_events[0],
+                    self.ln_events[1],
+                    self.aux_stream,
+                )
         else:
             # SWA-only layer: no compressor, no overlap.
-            self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+            with _profile_or_null("impl.kv_insert", q):
+                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
         _trace_nonfinite_tensor(f"{self.prefix}.impl.q_after_insert", q)
 
         # Handle dummy run (no metadata).
@@ -1604,7 +2493,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
-        self.mla_attn(q, kv, positions, output=out)
+        with _profile_or_null("impl.mla_attn_total", q):
+            self.mla_attn(q, kv, positions, output=out)
         _trace_nonfinite_tensor(f"{self.prefix}.impl.mla_out", out)
 
     def _fused_qnorm_rope_kv_insert(
@@ -1633,16 +2523,31 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
         # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
         if _should_use_qnorm_rope_kv_insert_fallback(q):
-            _sm70_triton_qnorm_rope_kv_insert(
-                q,
-                kv,
-                swa_kv_cache_2d,
-                swa_metadata.slot_mapping,
-                positions.to(torch.int64),
-                self.rotary_emb.cos_sin_cache,
-                self.eps,
-                swa_metadata.block_size,
-            )
+            # Use the custom-op version when available (opts us out of the
+            # torch inductor 2.9 `decompose_triton_kernel_wrapper_functional`
+            # pass that mishandles dynamic-shape stride expressions).
+            if _sm70_triton_qnorm_rope_kv_insert_op is not None:
+                _sm70_triton_qnorm_rope_kv_insert_op(
+                    q,
+                    kv,
+                    swa_kv_cache_2d,
+                    swa_metadata.slot_mapping,
+                    positions.to(torch.int64),
+                    self.rotary_emb.cos_sin_cache,
+                    self.eps,
+                    swa_metadata.block_size,
+                )
+            else:
+                _sm70_triton_qnorm_rope_kv_insert(
+                    q,
+                    kv,
+                    swa_kv_cache_2d,
+                    swa_metadata.slot_mapping,
+                    positions.to(torch.int64),
+                    self.rotary_emb.cos_sin_cache,
+                    self.eps,
+                    swa_metadata.block_size,
+                )
         else:
             torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
@@ -1791,6 +2696,62 @@ def _sm70_fp8_einsum_bmm(
     out.copy_(result.to(out.dtype))
 
 
+def _sm70_fused_o_einsum_wo_b(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    wo_b_module: torch.nn.Module,
+    equation: str,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """O1 fix: fused SM70 FP8 software-einsum + wo_b RowParallelLinear.
+
+    Mirrors the math of `_sm70_fp8_einsum_bmm` followed by
+    ``wo_b(z.flatten(1))`` but eliminates the explicit ``z`` global-memory
+    materialization and the cross-Python-call boundary, allowing PyTorch
+    to keep the einsum result in caches before the wo_b matmul. Returns
+    the per-rank partial output (TP all-reduce contract unchanged).
+
+    Gated by ``VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB`` (default off).
+    """
+    if equation != "bhr,hdr->bhd":
+        raise RuntimeError(
+            "SM70 fused o_einsum+wo_b only supports 'bhr,hdr->bhd', "
+            f"got {equation!r}."
+        )
+
+    groups = a.shape[1]
+    hidden = a.shape[2]
+    rank = b.shape[1] if b.dim() == 3 else b.shape[0] // groups
+
+    # Reuse the same lazily cached fp16 weight as `_sm70_fp8_einsum_bmm`
+    # so both paths share the (~43 MB) pre-dequant cost.
+    b_f16 = getattr(b, "_sm70_predequant_f16", None)
+    if b_f16 is None:
+        b_3d = b.reshape(groups, rank, hidden)
+        weight_scale_shape = (groups, rank // 128, hidden // 128)
+        b_scale_3d = b_scale.reshape(weight_scale_shape)
+        b_f16 = (
+            b_3d.float()
+            * b_scale_3d.repeat_interleave(128, dim=1).repeat_interleave(
+                128, dim=2
+            )
+        ).half().contiguous()
+        b._sm70_predequant_f16 = b_f16  # type: ignore[attr-defined]
+
+    a_blocks = a_scale.shape[-1]
+    a_deq = a.float() * a_scale.repeat_interleave(hidden // a_blocks, dim=-1)
+
+    # Chained: einsum -> flatten(1) -> wo_b. Keep result in fp16 to match
+    # `out` dtype contract; wo_b applies its own (FP8 or fp16) GEMM.
+    z = torch.einsum("bhr,hdr->bhd", a_deq.half(), b_f16).to(out_dtype)
+    out = wo_b_module(z.flatten(1))
+    if isinstance(out, tuple):
+        out = out[0]
+    return out
+
+
 def deepseek_v4_fp8_einsum_fake(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -1926,24 +2887,36 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 // self.compress_ratio
             )
             M = N + self.window_size + self.max_num_batched_tokens
-            # Default capture sizes: chunk token counts from 1..PREFILL_CHUNK_SIZE
-            # each paired with M (fixed for this model config).
-            # Users can override via compilation config
-            # prefill_cudagraph_capture_sizes if needed.
-            # Example compilation config override:
-            #   compilation_config:
-            #     prefill_cudagraph_capture_sizes: [[2, 820000], [4, 820000]]
-            capture_sizes = [
-                (t, M) for t in range(1, PREFILL_CHUNK_SIZE + 1)
-            ]
-            self._prefill_graph_dispatcher = PrefillGraphDispatcher(
+            # Capture token-count buckets, not request-count buckets. A
+            # single-request prefill can contain thousands of tokens, while
+            # PREFILL_CHUNK_SIZE only bounds how many requests are gathered at
+            # once. Override with VLLM_PREFILL_CUDAGRAPH_CAPTURE_TOKENS=...
+            # for narrower experiments.
+            capture_sizes = _default_prefill_cudagraph_capture_sizes(
+                max_num_batched_tokens=self.max_num_batched_tokens,
+                max_model_len=self.max_model_len,
+                max_M=M,
+            )
+            self._prefill_graph_dispatcher = _get_or_create_prefill_graph_dispatcher(
                 capture_sizes=capture_sizes,
                 padded_heads=self.padded_heads,
                 head_dim=head_dim,
                 scale=scale,
                 attn_sink=attn_sink,
                 device=attn_sink.device,
+                flash_mla_sparse_fwd_fn=flash_mla_sparse_fwd,
+                flashmla_bf16_io_fn=_flashmla_bf16_io,
+                copy_flashmla_output_fn=_copy_flashmla_output,
             )
+            if (
+                _PREFILL_CUDAGRAPH_DEBUG
+                and not self._prefill_graph_dispatcher.debug_validated
+            ):
+                self._prefill_graph_dispatcher.warmup_validate(
+                    flash_mla_sparse_fwd,
+                    _flashmla_bf16_io,
+                    _copy_flashmla_output,
+                )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return DeepseekV4FlashMLASparseBackend
@@ -2048,13 +3021,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             if self.compress_ratio == 4:
                 # C4A: local indices differ per layer (filled by Indexer).
                 assert self.topk_indices_buffer is not None
-                global_indices, topk_lens = compute_global_topk_indices_and_lens(
-                    self.topk_indices_buffer[:num_decode_tokens],
-                    swa_metadata.token_to_req_indices,
-                    attn_metadata.block_table[:num_decodes],
-                    block_size,
-                    is_valid,
-                )
+                with _profile_or_null("decode.compute_global_topk", q):
+                    global_indices, topk_lens = compute_global_topk_indices_and_lens(
+                        self.topk_indices_buffer[:num_decode_tokens],
+                        swa_metadata.token_to_req_indices,
+                        attn_metadata.block_table[:num_decodes],
+                        block_size,
+                        is_valid,
+                    )
                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
             else:
                 # C128A: pre-computed during metadata build.
@@ -2064,7 +3038,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
 
-        q, flash_output = _flashmla_bf16_io(q, output)
+        with _profile_or_null("decode.flashmla_bf16_io", q):
+            q, flash_output = _flashmla_bf16_io(q, output)
         # We treat queries in the same seq as different queries
         # and later we only attend by generated indices.
         # q arrives pre-padded to self.padded_heads by the outer wrapper.
@@ -2078,15 +3053,16 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     torch.bfloat16,
                     q.device,
                 )
-                fallback_kv, fallback_indices, fallback_lens = (
-                    _gather_decode_prefill_fallback_kv_with_indices_(
-                        fallback_kv,
-                        self.swa_cache_layer.kv_cache,
-                        swa_indices,
-                        swa_lens,
-                        swa_metadata.block_size,
+                with _profile_or_null("decode.fallback_gather.swa", q):
+                    fallback_kv, fallback_indices, fallback_lens = (
+                        _gather_decode_prefill_fallback_kv_with_indices_(
+                            fallback_kv,
+                            self.swa_cache_layer.kv_cache,
+                            swa_indices,
+                            swa_lens,
+                            swa_metadata.block_size,
+                        )
                     )
-                )
                 fallback_topk_length: torch.Tensor | None = fallback_lens
             else:
                 assert kv_cache is not None
@@ -2103,42 +3079,45 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     q.device,
                 )
                 compressed_kv = fallback_kv[:, :compressed_topk]
-                compressed_kv, compressed_indices, _ = (
-                    _gather_decode_prefill_fallback_kv_with_indices_(
-                        compressed_kv,
-                        kv_cache,
-                        topk_indices,
-                        topk_lens,
-                        attn_metadata.block_size // self.compress_ratio,
-                        row_stride=total_topk,
+                with _profile_or_null("decode.fallback_gather.compressed", q):
+                    compressed_kv, compressed_indices, _ = (
+                        _gather_decode_prefill_fallback_kv_with_indices_(
+                            compressed_kv,
+                            kv_cache,
+                            topk_indices,
+                            topk_lens,
+                            attn_metadata.block_size // self.compress_ratio,
+                            row_stride=total_topk,
+                        )
                     )
-                )
                 swa_kv = fallback_kv[:, compressed_topk:]
-                swa_kv, swa_fallback_indices, _ = (
-                    _gather_decode_prefill_fallback_kv_with_indices_(
-                        swa_kv,
-                        self.swa_cache_layer.kv_cache,
-                        swa_indices,
-                        swa_lens,
-                        swa_metadata.block_size,
-                        row_stride=total_topk,
-                        offset=compressed_topk,
+                with _profile_or_null("decode.fallback_gather.swa", q):
+                    swa_kv, swa_fallback_indices, _ = (
+                        _gather_decode_prefill_fallback_kv_with_indices_(
+                            swa_kv,
+                            self.swa_cache_layer.kv_cache,
+                            swa_indices,
+                            swa_lens,
+                            swa_metadata.block_size,
+                            row_stride=total_topk,
+                            offset=compressed_topk,
+                        )
                     )
-                )
                 fallback_indices = torch.cat(
                     (compressed_indices, swa_fallback_indices), dim=-1
                 )
             _normalize_flashmla_sm70_prefill_kv_(fallback_kv)
-            flash_output, _, _ = flash_mla_sparse_fwd(
-                q=q.squeeze(1),
-                kv=fallback_kv.view(-1, 1, q.shape[-1]),
-                indices=fallback_indices,
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
-                topk_length=fallback_topk_length,
-                out=flash_output,
-            )
-            _copy_flashmla_output(flash_output, output)
+            with _profile_or_null("decode.attn.fallback_sparse_prefill", q):
+                flash_output, _, _ = flash_mla_sparse_fwd(
+                    q=q.squeeze(1),
+                    kv=fallback_kv.view(-1, 1, q.shape[-1]),
+                    indices=fallback_indices,
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=fallback_topk_length,
+                    out=flash_output,
+                )
+                _copy_flashmla_output(flash_output, output)
             return
 
         # Prepare SWA cache (num_blocks, swa_block_size, 1, head_bytes)
@@ -2172,24 +3151,25 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             "allocate one for this layer type."
         )
 
-        out, _ = flash_mla_with_kvcache(
-            q=q,
-            k_cache=swa_cache,
-            block_table=None,
-            head_dim_v=512,
-            tile_scheduler_metadata=tile_metadata,
-            cache_seqlens=None,
-            is_fp8_kvcache=True,
-            indices=swa_indices,
-            topk_length=swa_lens,
-            softmax_scale=self.scale,
-            attn_sink=self.attn_sink,
-            extra_k_cache=kv_cache if not swa_only else None,
-            extra_indices_in_kvcache=topk_indices,
-            extra_topk_length=topk_lens,
-            out=flash_output.unsqueeze(1),
-        )
-        _copy_flashmla_output(out.squeeze(1), output)
+        with _profile_or_null("decode.attn.direct_flashmla", q):
+            out, _ = flash_mla_with_kvcache(
+                q=q,
+                k_cache=swa_cache,
+                block_table=None,
+                head_dim_v=512,
+                tile_scheduler_metadata=tile_metadata,
+                cache_seqlens=None,
+                is_fp8_kvcache=True,
+                indices=swa_indices,
+                topk_length=swa_lens,
+                softmax_scale=self.scale,
+                attn_sink=self.attn_sink,
+                extra_k_cache=kv_cache if not swa_only else None,
+                extra_indices_in_kvcache=topk_indices,
+                extra_topk_length=topk_lens,
+                out=flash_output.unsqueeze(1),
+            )
+            _copy_flashmla_output(out.squeeze(1), output)
 
     def _forward_prefill(
         self,
@@ -2267,27 +3247,43 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 # Gather compressed KV
                 assert attn_metadata is not None
                 block_table = attn_metadata.block_table[num_decodes:]
-                dequantize_and_gather_k_cache(
-                    kv[:chunk_size],
-                    compressed_k_cache,
-                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
-                    gather_lens=None,
-                    block_table=block_table[chunk_start:chunk_end],
-                    block_size=attn_metadata.block_size // self.compress_ratio,
-                    offset=0,
-                )
+                with _profile_or_null(
+                    "prefill.compressed_gather",
+                    q,
+                    extra={
+                        "chunk_idx": chunk_idx,
+                        "num_chunk_tokens": int(chunk_size),
+                    },
+                ):
+                    dequantize_and_gather_k_cache(
+                        kv[:chunk_size],
+                        compressed_k_cache,
+                        seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                        gather_lens=None,
+                        block_table=block_table[chunk_start:chunk_end],
+                        block_size=attn_metadata.block_size // self.compress_ratio,
+                        offset=0,
+                    )
 
             # Gather SWA KV
             swa_block_table = swa_metadata.block_table[num_decodes:]
-            dequantize_and_gather_k_cache(
-                kv[:chunk_size],
-                swa_k_cache,
-                seq_lens=seq_lens[chunk_start:chunk_end],
-                gather_lens=gather_lens[chunk_start:chunk_end],
-                block_table=swa_block_table[chunk_start:chunk_end],
-                block_size=swa_metadata.block_size,
-                offset=N,
-            )
+            with _profile_or_null(
+                "prefill.swa_gather",
+                q,
+                extra={
+                    "chunk_idx": chunk_idx,
+                    "num_chunk_tokens": int(chunk_size),
+                },
+            ):
+                dequantize_and_gather_k_cache(
+                    kv[:chunk_size],
+                    swa_k_cache,
+                    seq_lens=seq_lens[chunk_start:chunk_end],
+                    gather_lens=gather_lens[chunk_start:chunk_end],
+                    block_table=swa_block_table[chunk_start:chunk_end],
+                    block_size=swa_metadata.block_size,
+                    offset=N,
+                )
             kv_chunk = kv[:chunk_size]
             _normalize_flashmla_sm70_prefill_kv_(kv_chunk)
             if trace_prefill:
@@ -2309,19 +3305,27 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
-            combined_indices, combined_lens = combine_topk_swa_indices(
-                topk_indices[query_start:query_end],
-                query_start_loc[
-                    num_decodes + chunk_start : num_decodes + chunk_end + 1
-                ],
-                seq_lens[chunk_start:chunk_end],
-                gather_lens[chunk_start:chunk_end],
-                self.window_size,
-                self.compress_ratio,
-                top_k,
-                M,
-                N,
-            )
+            with _profile_or_null(
+                "prefill.combine_indices",
+                q,
+                extra={
+                    "chunk_idx": chunk_idx,
+                    "num_chunk_tokens": int(chunk_size),
+                },
+            ):
+                combined_indices, combined_lens = combine_topk_swa_indices(
+                    topk_indices[query_start:query_end],
+                    query_start_loc[
+                        num_decodes + chunk_start : num_decodes + chunk_end + 1
+                    ],
+                    seq_lens[chunk_start:chunk_end],
+                    gather_lens[chunk_start:chunk_end],
+                    self.window_size,
+                    self.compress_ratio,
+                    top_k,
+                    M,
+                    N,
+                )
             if trace_prefill:
                 _trace_tensor_summary(
                     f"{self.prefix}.prefill.combined_indices", combined_indices
@@ -2339,15 +3343,18 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             # sequence is eligible for graph replay.
             graph_replayed = False
             if self._prefill_graph_dispatcher is not None:
-                graph_replayed = self._prefill_graph_dispatcher.try_graph_replay(
-                    q_chunk=q[query_start:query_end],
-                    kv_flat=kv.view(-1, 1, q.shape[-1]),
-                    combined_indices=combined_indices.unsqueeze(1),
-                    combined_lens=combined_lens,
-                    output_slice=output_slice,
-                    num_chunk_tokens=num_chunk_tokens,
-                    M=M,
-                )
+                with _profile_or_null("prefill.flashmla_graph_replay", q):
+                    graph_replayed = self._prefill_graph_dispatcher.try_graph_replay(
+                        q_chunk=q[query_start:query_end],
+                        kv_flat=kv.view(-1, 1, q.shape[-1]),
+                        combined_indices=combined_indices.unsqueeze(1),
+                        combined_lens=combined_lens,
+                        output_slice=output_slice,
+                        num_chunk_tokens=num_chunk_tokens,
+                        num_chunk_reqs=chunk_size,
+                        M=M,
+                        attn_sink=self.attn_sink,
+                    )
 
             # Debug mode: run eager too and compare outputs
             if _PREFILL_CUDAGRAPH_DEBUG and graph_replayed:
@@ -2379,21 +3386,38 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     output_slice.copy_(graph_output)
 
             if not graph_replayed:
-                q_chunk, output_chunk = _flashmla_bf16_io(
-                    q[query_start:query_end],
-                    output_slice,
-                )
-                if trace_prefill:
-                    _trace_tensor_summary(f"{self.prefix}.prefill.q_chunk", q_chunk)
-                flash_output, max_logits, lse = flash_mla_sparse_fwd(
-                    q=q_chunk,
-                    kv=kv.view(-1, 1, q.shape[-1]),
-                    indices=combined_indices.unsqueeze(1),
-                    sm_scale=self.scale,
-                    attn_sink=self.attn_sink,
-                    topk_length=combined_lens,
-                    out=output_chunk,
-                )
+                if _DEEPSEEK_V4_PROFILE_ENABLED or _DEEPSEEK_V4_PROFILE_NVTX:
+                    try:
+                        combined_lens_max = int(combined_lens.max().item())
+                    except Exception:
+                        combined_lens_max = None
+                else:
+                    combined_lens_max = None
+                with _profile_or_null(
+                    "prefill.flashmla_sparse_fwd",
+                    q,
+                    extra={
+                        "chunk_idx": chunk_idx,
+                        "num_chunk_tokens": int(num_chunk_tokens),
+                        "combined_lens_max": combined_lens_max,
+                    },
+                ):
+                    q_chunk, output_chunk = _flashmla_bf16_io(
+                        q[query_start:query_end],
+                        output_slice,
+                    )
+                    if trace_prefill:
+                        _trace_tensor_summary(f"{self.prefix}.prefill.q_chunk", q_chunk)
+                    flash_output, max_logits, lse = flash_mla_sparse_fwd(
+                        q=q_chunk,
+                        kv=kv.view(-1, 1, q.shape[-1]),
+                        indices=combined_indices.unsqueeze(1),
+                        sm_scale=self.scale,
+                        attn_sink=self.attn_sink,
+                        topk_length=combined_lens,
+                        out=output_chunk,
+                    )
+                    _copy_flashmla_output(flash_output, output_slice)
                 if trace_prefill:
                     _trace_tensor_summary(
                         f"{self.prefix}.prefill.flash_output", flash_output
@@ -2402,7 +3426,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         f"{self.prefix}.prefill.max_logits", max_logits
                     )
                     _trace_tensor_summary(f"{self.prefix}.prefill.lse", lse)
-                _copy_flashmla_output(flash_output, output_slice)
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
@@ -2464,7 +3487,23 @@ class DeepseekV4Indexer(nn.Module):
         self.config = config
         self.quant_config = quant_config
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
-        self.topk_tokens = config.index_topk
+        # O4 fix: Allow override of the indexer top-K via
+        # VLLM_DEEPSEEK_V4_INDEXER_TOPK. Must not exceed the model config's
+        # index_topk (which fixes the topk_indices_buffer allocation width).
+        # Default override value is 0, which falls back to the model config.
+        _cfg_topk = config.index_topk
+        _override_topk = envs.VLLM_DEEPSEEK_V4_INDEXER_TOPK
+        if _override_topk and 0 < _override_topk <= _cfg_topk:
+            self.topk_tokens = _override_topk
+            if _override_topk != _cfg_topk:
+                logger.info_once(
+                    "O4: indexer top-K overridden from %d to %d via "
+                    "VLLM_DEEPSEEK_V4_INDEXER_TOPK",
+                    _cfg_topk,
+                    _override_topk,
+                )
+        else:
+            self.topk_tokens = _cfg_topk
         self.n_head = config.index_n_heads  # 64
         self.head_dim = config.index_head_dim  # 128
         self.rope_dim = config.qk_rope_head_dim  # 64

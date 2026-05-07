@@ -339,3 +339,126 @@ def _torch_inv_rope_fp8_quant_fallback(
 
     fp8_buf.copy_(x_scaled.to(fp8_buf.dtype).view(n_groups, num_tokens, d))
     scale_buf.copy_(scales.squeeze(-1))
+
+
+# -----------------------------------------------------------------------------
+# Custom op wrapping to bypass torch._inductor.fx_passes.post_grad
+# `decompose_triton_kernel_wrapper_functional` pattern-matcher pass, which
+# mishandles our triton kernel's as_strided + transpose output layout on
+# torch 2.9 (eager trace keeps a redundant `stride * 1` mul; inductor trace
+# constant-folds it; the resulting node-count mismatch fires an assertion
+# inside `replace_by_example`, crashing AOT compile).
+# By registering `fused_inv_rope_fp8_quant` as a torch custom op with a
+# matching `fake_impl`, Inductor treats it as an opaque call_function node
+# and never tries to decompose the triton kernel wrapper.
+# -----------------------------------------------------------------------------
+
+from vllm.utils.torch_utils import direct_register_custom_op as _register_op  # noqa: E402
+
+_FUSED_INV_ROPE_EAGER = fused_inv_rope_fp8_quant
+
+
+def _fused_inv_rope_fp8_quant_op(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    quant_group_size: int,
+    tma_aligned_scales: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _FUSED_INV_ROPE_EAGER(
+        o,
+        positions,
+        cos_sin_cache,
+        n_groups=n_groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        quant_group_size=quant_group_size,
+        tma_aligned_scales=tma_aligned_scales,
+    )
+
+
+def _fused_inv_rope_fp8_quant_fake(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    quant_group_size: int,
+    tma_aligned_scales: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm.utils.deep_gemm import get_tma_aligned_size
+
+    num_tokens, num_heads, head_dim = o.shape
+    d = heads_per_group * head_dim
+    num_scale_blocks = d // quant_group_size
+
+    fp8_dtype = torch.float8_e4m3fn
+    tma_aligned_T = get_tma_aligned_size(num_tokens, 4)
+
+    # Shape matches the eager impl's .transpose(0, 1) output:
+    #   fp8_buf: [G, T, D] allocated, then transpose(0,1) -> [T, G, D]
+    fp8_out = torch.empty(
+        (num_tokens, n_groups, d),
+        dtype=fp8_dtype,
+        device=o.device,
+    )
+    if tma_aligned_scales:
+        packed_sf_k = (num_scale_blocks + 3) // 4
+        scale_out = torch.empty(
+            (num_tokens, n_groups, packed_sf_k),
+            dtype=torch.int32,
+            device=o.device,
+        )
+    else:
+        scale_out = torch.empty(
+            (num_tokens, n_groups, num_scale_blocks),
+            dtype=torch.float32,
+            device=o.device,
+        )
+    return fp8_out, scale_out
+
+
+try:
+    _register_op(
+        op_name="fused_inv_rope_fp8_quant",
+        op_func=_fused_inv_rope_fp8_quant_op,
+        mutates_args=[],
+        fake_impl=_fused_inv_rope_fp8_quant_fake,
+    )
+    _FUSED_INV_ROPE_OP = torch.ops.vllm.fused_inv_rope_fp8_quant
+
+
+    def fused_inv_rope_fp8_quant(  # type: ignore[no-redef]
+        o: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        n_groups: int,
+        heads_per_group: int,
+        nope_dim: int = 448,
+        rope_dim: int = 64,
+        quant_group_size: int = 128,
+        tma_aligned_scales: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _FUSED_INV_ROPE_OP(
+            o,
+            positions,
+            cos_sin_cache,
+            n_groups,
+            heads_per_group,
+            nope_dim,
+            rope_dim,
+            quant_group_size,
+            tma_aligned_scales,
+        )
+except (RuntimeError, AttributeError):
+    # Custom op registration may fail in environments without a full torch
+    # library setup (e.g., CPU-only tests that stub out the op registry).
+    # In that case, keep the eager implementation live.
+    pass

@@ -94,3 +94,57 @@ def fused_q_kv_rmsnorm(
         BLOCK_SIZE=block_size,
     )
     return qr_out, kv_out
+
+
+# -----------------------------------------------------------------------------
+# Custom op wrapping: register `fused_q_kv_rmsnorm` as a torch custom op so
+# Inductor treats it as an opaque call_function node. This bypasses the
+# decompose_triton_kernel_wrapper_functional pattern-matcher pass (torch 2.10)
+# which has an assertion bug when tracing our triton wrappers whose fx node
+# count differs between eager and inductor traces.
+# -----------------------------------------------------------------------------
+
+from vllm.utils.torch_utils import direct_register_custom_op as _register_op  # noqa: E402
+
+_FUSED_QK_RMSNORM_EAGER = fused_q_kv_rmsnorm
+
+
+def _fused_q_kv_rmsnorm_op(
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _FUSED_QK_RMSNORM_EAGER(qr, kv, q_weight, kv_weight, eps)
+
+
+def _fused_q_kv_rmsnorm_fake(
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(qr), torch.empty_like(kv)
+
+
+try:
+    _register_op(
+        op_name="fused_q_kv_rmsnorm",
+        op_func=_fused_q_kv_rmsnorm_op,
+        mutates_args=[],
+        fake_impl=_fused_q_kv_rmsnorm_fake,
+    )
+    _FUSED_QK_RMSNORM_OP = torch.ops.vllm.fused_q_kv_rmsnorm
+
+    def fused_q_kv_rmsnorm(  # type: ignore[no-redef]
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        q_weight: torch.Tensor,
+        kv_weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _FUSED_QK_RMSNORM_OP(qr, kv, q_weight, kv_weight, eps)
+except (RuntimeError, AttributeError):
+    pass
