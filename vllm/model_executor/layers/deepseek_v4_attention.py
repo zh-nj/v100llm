@@ -2624,6 +2624,7 @@ def _should_use_torch_fp8_einsum_fallback(a: torch.Tensor) -> bool:
     return torch.cuda.get_device_capability(a.device)[0] < 8
 
 
+@torch._dynamo.allow_in_graph
 def _deepseek_v4_fp8_einsum_torch_fallback(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -2654,6 +2655,78 @@ def _deepseek_v4_fp8_einsum_torch_fallback(
     out.copy_(result.to(out.dtype))
 
 
+def _sm70_fp8_weight_predequant_impl(
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    groups: int,
+    rank: int,
+    hidden: int,
+) -> torch.Tensor:
+    """FP8 weight pre-dequantization to fp16 (shielded custom-op body).
+
+    Materializes the [groups, rank, hidden] fp8 weight tensor ``b`` and its
+    blocked [groups, rank/128, hidden/128] fp32 scale ``b_scale`` into a
+    contiguous [groups, rank, hidden] fp16 tensor using the same scale
+    broadcast pattern as ``_sm70_fp8_einsum_bmm``.
+
+    This function is registered as a torch custom op so inductor treats
+    it as opaque and does NOT generate a ``*fp8e4nv`` Triton kernel from
+    its body (SM70 Triton rejects fp8e4nv; see
+    `.kiro/specs/deepseek-v4-flash-prefill-throughput/`).
+    """
+    b_3d = b.reshape(groups, rank, hidden)
+    weight_scale_shape = (groups, rank // 128, hidden // 128)
+    b_scale_3d = b_scale.reshape(weight_scale_shape)
+    return (
+        b_3d.float()
+        * b_scale_3d.repeat_interleave(128, dim=1).repeat_interleave(
+            128, dim=2
+        )
+    ).half().contiguous()
+
+
+def _sm70_fp8_weight_predequant_fake(
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    groups: int,
+    rank: int,
+    hidden: int,
+) -> torch.Tensor:
+    return torch.empty(
+        (groups, rank, hidden), dtype=torch.float16, device=b.device
+    )
+
+
+try:
+    direct_register_custom_op(
+        op_name="sm70_fp8_weight_predequant",
+        op_func=_sm70_fp8_weight_predequant_impl,
+        mutates_args=[],
+        fake_impl=_sm70_fp8_weight_predequant_fake,
+    )
+    _SM70_FP8_WEIGHT_PREDEQUANT = torch.ops.vllm.sm70_fp8_weight_predequant
+except (RuntimeError, AttributeError):
+    # Fallback to direct call if custom-op registry is unavailable
+    # (e.g. in tests that stub torch.library).
+    _SM70_FP8_WEIGHT_PREDEQUANT = _sm70_fp8_weight_predequant_impl
+
+
+def _sm70_ensure_predequant_weight(b: torch.Tensor, b_scale: torch.Tensor,
+                                   groups: int, rank: int, hidden: int) -> torch.Tensor:
+    """Populate ``b._sm70_predequant_f16`` (via the shielded custom op) and return it.
+
+    The fp16 weight cache lives on the original fp8 weight tensor so both
+    ``_sm70_fp8_einsum_bmm`` and ``_sm70_fused_o_einsum_wo_b`` share the
+    ~43MB pre-dequant cost.
+    """
+    b_f16 = getattr(b, "_sm70_predequant_f16", None)
+    if b_f16 is None:
+        b_f16 = _SM70_FP8_WEIGHT_PREDEQUANT(b, b_scale, groups, rank, hidden)
+        b._sm70_predequant_f16 = b_f16  # type: ignore[attr-defined]
+    return b_f16
+
+
+@torch._dynamo.allow_in_graph
 def _sm70_fp8_einsum_bmm(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -2668,6 +2741,12 @@ def _sm70_fp8_einsum_bmm(
     (~43 MB extra VRAM).  At runtime, the activation (a) is dequanted to fp16,
     then einsum runs in fp16 for halved bandwidth vs the previous fp32 path.
     Eliminates repeated weight dequant (~1.5x faster than re-dequant every call).
+
+    Decorated with ``@torch._dynamo.disable`` so torch.compile / inductor
+    do not descend into this function body. This prevents inductor from
+    generating a ``*fp8e4nv`` Triton kernel from the weight pre-dequant
+    cache-miss branch when this is reached during compiled prefill
+    (see `.kiro/specs/deepseek-v4-flash-prefill-throughput/`).
     """
     if equation != "bhr,hdr->bhd":
         raise RuntimeError(
@@ -2680,18 +2759,7 @@ def _sm70_fp8_einsum_bmm(
     rank = b.shape[1] if b.dim() == 3 else b.shape[0] // groups
 
     # Lazily pre-dequant b (weight) to fp16 and cache
-    b_f16 = getattr(b, "_sm70_predequant_f16", None)
-    if b_f16 is None:
-        b_3d = b.reshape(groups, rank, hidden)
-        weight_scale_shape = (groups, rank // 128, hidden // 128)
-        b_scale_3d = b_scale.reshape(weight_scale_shape)
-        b_f16 = (
-            b_3d.float()
-            * b_scale_3d.repeat_interleave(128, dim=1).repeat_interleave(
-                128, dim=2
-            )
-        ).half().contiguous()  # [groups, rank, hidden]
-        b._sm70_predequant_f16 = b_f16  # type: ignore[attr-defined]
+    b_f16 = _sm70_ensure_predequant_weight(b, b_scale, groups, rank, hidden)
 
     # Dequant a (activation) to fp16
     a_blocks = a_scale.shape[-1]
@@ -2722,6 +2790,13 @@ def _sm70_fused_o_einsum_wo_b(
     the per-rank partial output (TP all-reduce contract unchanged).
 
     Gated by ``VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB`` (default on).
+
+    Decorated with ``@torch._dynamo.disable`` so torch.compile /
+    inductor does not descend into this function body when the fused
+    path is reached from a compiled graph. This prevents inductor from
+    generating a ``*fp8e4nv`` Triton kernel from the weight pre-dequant
+    cache-miss branch below, which SM70 Triton rejects
+    (see `.kiro/specs/deepseek-v4-flash-prefill-throughput/`).
     """
     if equation != "bhr,hdr->bhd":
         raise RuntimeError(
@@ -2735,18 +2810,7 @@ def _sm70_fused_o_einsum_wo_b(
 
     # Reuse the same lazily cached fp16 weight as `_sm70_fp8_einsum_bmm`
     # so both paths share the (~43 MB) pre-dequant cost.
-    b_f16 = getattr(b, "_sm70_predequant_f16", None)
-    if b_f16 is None:
-        b_3d = b.reshape(groups, rank, hidden)
-        weight_scale_shape = (groups, rank // 128, hidden // 128)
-        b_scale_3d = b_scale.reshape(weight_scale_shape)
-        b_f16 = (
-            b_3d.float()
-            * b_scale_3d.repeat_interleave(128, dim=1).repeat_interleave(
-                128, dim=2
-            )
-        ).half().contiguous()
-        b._sm70_predequant_f16 = b_f16  # type: ignore[attr-defined]
+    b_f16 = _sm70_ensure_predequant_weight(b, b_scale, groups, rank, hidden)
 
     # R4: fused FP8 a dequant -> FP16 in one Triton pass, skipping the
     # fp32 materialization and `repeat_interleave` scale expansion that
