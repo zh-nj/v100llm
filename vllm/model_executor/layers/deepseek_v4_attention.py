@@ -2356,7 +2356,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # memory roundtrip. Gated by VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB; only
         # used on the SM70 software-FP8 fallback path. SM80+ unchanged.
         if (
-            _env_flag("VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB")
+            _env_flag("VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB", default=True)
             and _should_use_torch_fp8_einsum_fallback(o_fp8)
         ):
             with _profile_or_null("wrapper.wo_b", o_fp8):
@@ -2716,7 +2716,7 @@ def _sm70_fused_o_einsum_wo_b(
     to keep the einsum result in caches before the wo_b matmul. Returns
     the per-rank partial output (TP all-reduce contract unchanged).
 
-    Gated by ``VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB`` (default off).
+    Gated by ``VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB`` (default on).
     """
     if equation != "bhr,hdr->bhd":
         raise RuntimeError(

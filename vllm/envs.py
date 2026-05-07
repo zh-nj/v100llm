@@ -108,6 +108,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_NAN_TRACE: bool = False
     VLLM_DEEPSEEK_V4_INDEXER_TOPK: int = 0
     VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE: bool = True
+    VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB: bool = False
+    VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS: int = 4
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -948,6 +950,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", "1"))
+    ),
+    # O1 fix gate: if set to 1, SM70 DeepSeek V4 fuses
+    # `wrapper.o_fp8_einsum` and `wrapper.wo_b` into a single Python
+    # call (`_sm70_fused_o_einsum_wo_b`) to eliminate the intermediate
+    # `z` global-memory roundtrip on the FP8 software-einsum fallback.
+    "VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB": lambda: bool(
+        int(os.getenv("VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB", "1"))
+    ),
+    # O3 fix: num_warps for the SM70 qnorm+RoPE+KV-insert Triton kernel
+    # under CUDA-graph decode (grid=1 degenerate). Default 4.
+    "VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS": lambda: int(
+        os.getenv("VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS", "4")
     ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (

@@ -108,6 +108,8 @@ def test_deepseek_v4_sm70_experimental_envs_are_registered() -> None:
         "VLLM_DEEPSEEK_V4_NAN_TRACE",
         "VLLM_DEEPSEEK_V4_INDEXER_TOPK",
         "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE",
+        "VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB",
+        "VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS",
     }
 
     assert expected_envs.issubset(environment_variables)
