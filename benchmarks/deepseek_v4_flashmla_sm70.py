@@ -11,6 +11,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -199,11 +200,18 @@ def choice_contains_generated_delta(choice: dict[str, Any]) -> bool:
     return "content" in delta and "role" not in delta
 
 
+def resolve_prompt(args: argparse.Namespace) -> str:
+    prompt_file = getattr(args, "prompt_file", None)
+    if prompt_file is not None:
+        return Path(prompt_file).read_text(encoding="utf-8")
+    return args.prompt
+
+
 def run_openai_stream(args: argparse.Namespace) -> int:
     endpoint = args.endpoint.rstrip("/") + "/chat/completions"
     payload = {
         "model": args.model,
-        "messages": [{"role": "user", "content": args.prompt}],
+        "messages": [{"role": "user", "content": resolve_prompt(args)}],
         "temperature": 0.0,
         "max_tokens": args.max_tokens,
         "stream": True,
@@ -220,7 +228,9 @@ def run_openai_stream(args: argparse.Namespace) -> int:
     )
     start = time.perf_counter()
     first_token_time = None
+    prompt_tokens = None
     completion_tokens = None
+    total_tokens = None
     finish_reason = None
     pieces: list[str] = []
     delta_chunks = 0
@@ -236,6 +246,10 @@ def run_openai_stream(args: argparse.Namespace) -> int:
                 usage = chunk.get("usage")
                 if usage and usage.get("completion_tokens") is not None:
                     completion_tokens = int(usage["completion_tokens"])
+                if usage and usage.get("prompt_tokens") is not None:
+                    prompt_tokens = int(usage["prompt_tokens"])
+                if usage and usage.get("total_tokens") is not None:
+                    total_tokens = int(usage["total_tokens"])
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
@@ -259,7 +273,9 @@ def run_openai_stream(args: argparse.Namespace) -> int:
     result = {
         "TTFT": None if first_token_time is None else first_token_time - start,
         "total_s": end - start,
+        "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
         "delta_chunks_when_usage_missing": delta_chunks,
         "decode_window_s": decode_window_s,
         "decode_tokens_per_s": decode_tokens_per_s,
@@ -274,19 +290,158 @@ def run_openai_stream(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_openai_logprobs(args: argparse.Namespace) -> int:
+    endpoint = args.endpoint.rstrip("/") + "/completions"
+    payload = {
+        "model": args.model,
+        "prompt": resolve_prompt(args),
+        "temperature": 0.0,
+        "max_tokens": args.max_tokens,
+        "logprobs": args.logprobs,
+        "stream": False,
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {args.api_key}",
+        },
+        method="POST",
+    )
+    start = time.perf_counter()
+    try:
+        with urllib.request.urlopen(request, timeout=args.timeout) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        print(json.dumps({"request_failed": str(exc)}, indent=2))
+        return 1
+
+    total_s = time.perf_counter() - start
+    choice = (response_payload.get("choices") or [{}])[0]
+    logprobs = choice.get("logprobs") or {}
+    tokens = logprobs.get("tokens") or []
+    token_logprobs = logprobs.get("token_logprobs") or []
+    top_logprobs = logprobs.get("top_logprobs") or []
+    usage = response_payload.get("usage") or {}
+    result = {
+        "total_s": total_s,
+        "finish_reason": choice.get("finish_reason"),
+        "text_preview": (choice.get("text") or "")[: args.preview_chars],
+        "first_token": tokens[0] if tokens else None,
+        "first_token_logprob": token_logprobs[0] if token_logprobs else None,
+        "first_token_top_logprobs": top_logprobs[0] if top_logprobs else None,
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+    }
+    if args.bench_mode is not None:
+        result["mode"] = args.bench_mode
+    if args.prompt_name is not None:
+        result["prompt_name"] = args.prompt_name
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def summarize_phase_profile(
+    path: Path,
+    top_n: int | None = None,
+    skip_records: int = 0,
+) -> dict[str, Any]:
+    totals_by_phase_rank: dict[str, dict[tuple[Any, Any], float]] = defaultdict(
+        lambda: defaultdict(float)
+    )
+    counts_by_phase: dict[str, int] = defaultdict(int)
+    total_us_by_phase: dict[str, float] = defaultdict(float)
+    ranks: set[tuple[Any, Any]] = set()
+    record_count = 0
+
+    with path.open(encoding="utf-8") as profile:
+        for line_no, line in enumerate(profile):
+            if line_no < skip_records:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            phase = str(row.get("phase", "unknown"))
+            elapsed_us = float(row["elapsed_us"])
+            rank_key = (row.get("pid"), row.get("cuda_device"))
+            ranks.add(rank_key)
+            totals_by_phase_rank[phase][rank_key] += elapsed_us
+            counts_by_phase[phase] += 1
+            total_us_by_phase[phase] += elapsed_us
+            record_count += 1
+
+    phases = []
+    for phase, rank_totals in totals_by_phase_rank.items():
+        records = counts_by_phase[phase]
+        total_us = total_us_by_phase[phase]
+        phases.append(
+            {
+                "phase": phase,
+                "records": records,
+                "rank_count": len(rank_totals),
+                "total_ms_all_ranks": total_us / 1000.0,
+                "max_rank_ms": max(rank_totals.values()) / 1000.0,
+                "avg_us": total_us / records if records else 0.0,
+            }
+        )
+    phases.sort(key=lambda row: row["max_rank_ms"], reverse=True)
+    if top_n is not None:
+        phases = phases[:top_n]
+
+    return {
+        "path": str(path),
+        "record_count": record_count,
+        "rank_count": len(ranks),
+        "phases": phases,
+    }
+
+
+def print_phase_profile_summary(summary: dict[str, Any]) -> None:
+    print(f"path: {summary['path']}")
+    print(f"records: {summary['record_count']}")
+    print(f"ranks: {summary['rank_count']}")
+    print("phase,records,ranks,total_ms_all_ranks,max_rank_ms,avg_us")
+    for row in summary["phases"]:
+        print(
+            f"{row['phase']},{row['records']},{row['rank_count']},"
+            f"{row['total_ms_all_ranks']:.3f},{row['max_rank_ms']:.3f},"
+            f"{row['avg_us']:.1f}"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["inspect", "openai-stream"], default="inspect")
+    parser.add_argument(
+        "--mode",
+        choices=["inspect", "openai-stream", "openai-logprobs", "phase-summary"],
+        default="inspect",
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--endpoint", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--api-key", default="EMPTY")
     parser.add_argument("--model", default=str(MODEL_PATH))
     parser.add_argument("--prompt", default="你好，请用一句话说明你是谁。")
+    parser.add_argument("--prompt-file", type=Path)
     parser.add_argument("--prompt-name")
     parser.add_argument("--bench-mode", choices=["eager", "full_decode_only"])
     parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument("--logprobs", type=int, default=5)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--preview-chars", type=int, default=400)
+    parser.add_argument(
+        "--phase-profile-path",
+        type=Path,
+        default=Path(
+            os.getenv(
+                "VLLM_DEEPSEEK_V4_PROFILE_RAW_PATH",
+                "/tmp/deepseek_v4_phase_profile_live.jsonl",
+            )
+        ),
+    )
+    parser.add_argument("--phase-top-n", type=int, default=16)
+    parser.add_argument("--phase-skip-records", type=int, default=0)
     args = parser.parse_args()
 
     if args.mode == "inspect":
@@ -300,6 +455,19 @@ def main() -> int:
                 print(f"- {'ok' if check['ok'] else 'missing'}: {check['name']}")
             print(f"model: {report['model']}")
         return 0 if report["static_ready"] else 2
+    if args.mode == "phase-summary":
+        report = summarize_phase_profile(
+            args.phase_profile_path,
+            args.phase_top_n,
+            args.phase_skip_records,
+        )
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print_phase_profile_summary(report)
+        return 0
+    if args.mode == "openai-logprobs":
+        return run_openai_logprobs(args)
     return run_openai_stream(args)
 
 

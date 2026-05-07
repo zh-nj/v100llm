@@ -24,6 +24,9 @@ from vllm.model_executor.layers.deepseek_v4_attention import (
     DeepseekV4Indexer,
     DeepseekV4MLAModules,
     DeepseekV4MultiHeadLatentAttentionWrapper,
+    _profile_layer,
+    _profile_or_null,
+    _profile_step,
 )
 from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
 from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
@@ -857,34 +860,36 @@ class DeepseekV4MoE(nn.Module):
             return self._forward_fused_moe(hidden_states, input_ids)
 
         org_shape = hidden_states.shape
-        router_logits, _ = self.gate(hidden_states)
-        topk_weights, topk_ids = fused_topk_bias(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            scoring_func=self.scoring_func,
-            e_score_correction_bias=self.gate.e_score_correction_bias.data
-            if self.gate.e_score_correction_bias is not None
-            else None,
-            topk=self.n_activated_experts,
-            renormalize=self.renormalize,
-            indices_type=self.hash_indices_dtype,
-            input_tokens=input_ids,
-            hash_indices_table=self.gate.tid2eid,
-            routed_scaling_factor=self.routed_scaling_factor,
-        )
+        with _profile_or_null("decoder.moe.routing", hidden_states):
+            router_logits, _ = self.gate(hidden_states)
+            topk_weights, topk_ids = fused_topk_bias(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.gate.e_score_correction_bias.data
+                if self.gate.e_score_correction_bias is not None
+                else None,
+                topk=self.n_activated_experts,
+                renormalize=self.renormalize,
+                indices_type=self.hash_indices_dtype,
+                input_tokens=input_ids,
+                hash_indices_table=self.gate.tid2eid,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
-        final_hidden_states = self.experts(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            activation_clamp=activation_clamp,
-        )
+        with _profile_or_null("decoder.moe.experts", hidden_states):
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation_clamp=activation_clamp,
+            )
 
-        if self.shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
-            final_hidden_states += shared_output
+            if self.shared_experts is not None:
+                shared_output = self.shared_experts(hidden_states)
+                final_hidden_states += shared_output
 
         if self.tp_size > 1:
             final_hidden_states = (
@@ -901,18 +906,21 @@ class DeepseekV4MoE(nn.Module):
         org_shape = hidden_states.shape
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                input_ids=input_ids,
-            )
+            with _profile_or_null("decoder.moe.experts", hidden_states):
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=hidden_states,
+                    input_ids=input_ids,
+                )
         else:
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+            with _profile_or_null("decoder.moe.routing", hidden_states):
+                router_logits, _ = self.gate(hidden_states)
+            with _profile_or_null("decoder.moe.experts", hidden_states):
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
 
         if isinstance(final_hidden_states, tuple):
             shared_output, final_hidden_states = final_hidden_states
@@ -1220,38 +1228,43 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
     ) -> torch.Tensor:
-        residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
-        )
-        _trace_nonfinite_tensor(f"{self.prefix}.attn_hc_pre", x)
-        _trace_nonfinite_tensor(f"{self.prefix}.attn_hc_post_mix", post)
-        _trace_nonfinite_tensor(f"{self.prefix}.attn_hc_res_mix", comb)
-        x = self.attn_norm(x)
-        _trace_nonfinite_tensor(f"{self.prefix}.attn_norm", x)
-        x = self.attn(positions, x, None)
-        _trace_nonfinite_tensor(f"{self.prefix}.attn", x)
-        x = self.hc_post(x, residual, post, comb)
-        if _should_clamp_sm70_fp16_hc_output(x):
-            _clamp_sm70_fp16_hc_output_(x)
-        _trace_nonfinite_tensor(f"{self.prefix}.attn_hc_post", x)
+        compress_ratio = getattr(self.attn, "compress_ratio", 0)
+        layer_idx = getattr(self.attn, "layer_id", None)
+        with _profile_layer(layer_idx=layer_idx, compress_ratio=compress_ratio):
+            residual = x
+            with _profile_or_null("decoder.mhc_pre_attn", x):
+                x, post, comb = self.hc_pre(
+                    x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                )
+                _trace_nonfinite_tensor(f"{self.prefix}.attn_hc_pre", x)
+                _trace_nonfinite_tensor(f"{self.prefix}.attn_hc_post_mix", post)
+                _trace_nonfinite_tensor(f"{self.prefix}.attn_hc_res_mix", comb)
+                x = self.attn_norm(x)
+                _trace_nonfinite_tensor(f"{self.prefix}.attn_norm", x)
+            x = self.attn(positions, x, None)
+            _trace_nonfinite_tensor(f"{self.prefix}.attn", x)
+            with _profile_or_null("decoder.mhc_post_attn", x):
+                x = self.hc_post(x, residual, post, comb)
+                if _should_clamp_sm70_fp16_hc_output(x):
+                    _clamp_sm70_fp16_hc_output_(x)
+            _trace_nonfinite_tensor(f"{self.prefix}.attn_hc_post", x)
 
-        residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
-        )
-        _trace_nonfinite_tensor(f"{self.prefix}.ffn_hc_pre", x)
-        _trace_nonfinite_tensor(f"{self.prefix}.ffn_hc_post_mix", post)
-        _trace_nonfinite_tensor(f"{self.prefix}.ffn_hc_res_mix", comb)
-        x = self.ffn_norm(x)
-        _trace_nonfinite_tensor(f"{self.prefix}.ffn_norm", x)
-        x = self.ffn(x, input_ids)
-        _trace_nonfinite_tensor(f"{self.prefix}.ffn", x)
-        x = self.hc_post(x, residual, post, comb)
-        if _should_clamp_sm70_fp16_hc_output(x):
-            _clamp_sm70_fp16_hc_output_(x)
-        _trace_nonfinite_tensor(f"{self.prefix}.ffn_hc_post", x)
-        return x
+            residual = x
+            x, post, comb = self.hc_pre(
+                x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            )
+            _trace_nonfinite_tensor(f"{self.prefix}.ffn_hc_pre", x)
+            _trace_nonfinite_tensor(f"{self.prefix}.ffn_hc_post_mix", post)
+            _trace_nonfinite_tensor(f"{self.prefix}.ffn_hc_res_mix", comb)
+            x = self.ffn_norm(x)
+            _trace_nonfinite_tensor(f"{self.prefix}.ffn_norm", x)
+            x = self.ffn(x, input_ids)
+            _trace_nonfinite_tensor(f"{self.prefix}.ffn", x)
+            x = self.hc_post(x, residual, post, comb)
+            if _should_clamp_sm70_fp16_hc_output(x):
+                _clamp_sm70_fp16_hc_output_(x)
+            _trace_nonfinite_tensor(f"{self.prefix}.ffn_hc_post", x)
+            return x
 
 
 @support_torch_compile
@@ -1348,12 +1361,35 @@ class DeepseekV4Model(nn.Module):
         _trace_nonfinite_tensor(f"{self.prefix}.embed", hidden_states)
         hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states = layer(
-                hidden_states,
-                positions,
-                input_ids,
-            )
+        # Detect phase kind from attn_metadata for profiling.
+        try:
+            forward_context = get_forward_context()
+            attn_metadata = forward_context.attn_metadata
+        except Exception:
+            attn_metadata = None
+        phase_kind: str | None
+        if isinstance(attn_metadata, dict) and attn_metadata:
+            sample = next(iter(attn_metadata.values()))
+            num_prefills = getattr(sample, "num_prefills", 0) or 0
+            phase_kind = "prefill" if num_prefills > 0 else "decode"
+        elif attn_metadata is None:
+            phase_kind = None
+        else:
+            num_prefills = getattr(attn_metadata, "num_prefills", 0) or 0
+            phase_kind = "prefill" if num_prefills > 0 else "decode"
+        token_count = (
+            int(hidden_states.shape[0]) if hasattr(hidden_states, "shape") else 0
+        )
+
+        with _profile_step(
+            step_idx=None, phase_kind=phase_kind, token_count=token_count
+        ):
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                hidden_states = layer(
+                    hidden_states,
+                    positions,
+                    input_ids,
+                )
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
