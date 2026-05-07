@@ -492,12 +492,23 @@ class DefaultMoERunner(MoERunner):
         run_shared_experts_before: bool = True,
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        try:
+            from vllm.model_executor.layers.deepseek_v4_attention import (
+                _profile_or_null,
+            )
+        except Exception:
+            from contextlib import nullcontext
+
+            def _profile_or_null(label, ref):  # type: ignore[no-redef]
+                return nullcontext()
+
         shared_input = shared_input if shared_input is not None else hidden_states
         shared_output: torch.Tensor | None = None
 
         # Run this before quant_method to avoid inplace issues.
         if run_shared_experts_before:
-            shared_output = self._apply_shared_experts(shared_input, False)
+            with _profile_or_null("moe.runner.shared_experts_pre", shared_input):
+                shared_output = self._apply_shared_experts(shared_input, False)
 
         if self.quant_method.is_monolithic:
             result = self.quant_method.apply_monolithic(
@@ -506,19 +517,21 @@ class DefaultMoERunner(MoERunner):
                 router_logits=router_logits,
             )
         else:
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+            with _profile_or_null("moe.runner.select_experts", hidden_states):
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
 
-            result = self.quant_method.apply(
-                layer=layer,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts_input=shared_input,
-            )
+            with _profile_or_null("moe.runner.quant_apply", hidden_states):
+                result = self.quant_method.apply(
+                    layer=layer,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts_input=shared_input,
+                )
 
         if isinstance(result, tuple):
             assert shared_output is None
@@ -528,7 +541,8 @@ class DefaultMoERunner(MoERunner):
 
         if not run_shared_experts_before and self.has_separate_shared_experts:
             assert shared_output is None
-            shared_output = self._apply_shared_experts(shared_input, True)
+            with _profile_or_null("moe.runner.shared_experts_post", shared_input):
+                shared_output = self._apply_shared_experts(shared_input, True)
 
         return shared_output, hidden_states
 
@@ -796,6 +810,20 @@ class DefaultMoERunner(MoERunner):
         shared_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Optional sub-phase profiling hook (zero cost when profiling off).
+        try:
+            from vllm.model_executor.layers.deepseek_v4_attention import (
+                _profile_or_null,
+            )
+        except Exception:
+            _profile_or_null = None  # type: ignore[assignment]
+
+        def _prof(label: str, ref: torch.Tensor):
+            if _profile_or_null is None:
+                from contextlib import nullcontext
+                return nullcontext()
+            return _profile_or_null(label, ref)
+
         self.use_shared_experts_stream = (
             current_platform.is_cuda()
             and self.has_separate_shared_experts
@@ -816,32 +844,37 @@ class DefaultMoERunner(MoERunner):
         # The shared experts stream must be set up before calling the gate so they
         # can be overlapped.
         if not run_shared_experts_before:
-            self._maybe_setup_shared_experts_stream(
-                hidden_states,
-                shared_input,
-            )
+            with _prof("moe.runner.setup_shared_stream", hidden_states):
+                self._maybe_setup_shared_experts_stream(
+                    hidden_states,
+                    shared_input,
+                )
 
-        router_logits = self._maybe_gate(hidden_states, router_logits)
+        with _prof("moe.runner.gate", hidden_states):
+            router_logits = self._maybe_gate(hidden_states, router_logits)
 
         # TODO(bnell): parts of the dispatch/combine steps will go away once
         # #32567 lands and the remaining kernels are made MKs.  The PCP
         # code will probably remain
-        hidden_states, router_logits = self._maybe_dispatch(
-            layer,
-            hidden_states,
-            router_logits,
-        )
+        with _prof("moe.runner.dispatch", hidden_states):
+            hidden_states, router_logits = self._maybe_dispatch(
+                layer,
+                hidden_states,
+                router_logits,
+            )
 
-        shared_output, hidden_states = self._apply_quant_method(
-            layer=layer,
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            shared_input=shared_input,
-            run_shared_experts_before=run_shared_experts_before,
-            input_ids=input_ids,
-        )
+        with _prof("moe.runner.apply_quant_method", hidden_states):
+            shared_output, hidden_states = self._apply_quant_method(
+                layer=layer,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                shared_input=shared_input,
+                run_shared_experts_before=run_shared_experts_before,
+                input_ids=input_ids,
+            )
 
-        return self._maybe_combine(
-            shared_output,
-            hidden_states,
-        )
+        with _prof("moe.runner.combine", hidden_states):
+            return self._maybe_combine(
+                shared_output,
+                hidden_states,
+            )

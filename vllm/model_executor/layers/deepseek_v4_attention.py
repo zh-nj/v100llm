@@ -24,6 +24,9 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+from vllm.model_executor.layers.fp8_a_dequant_triton import (
+    sm70_fp8_a_dequant_to_fp16,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import fp8_einsum
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -2740,12 +2743,14 @@ def _sm70_fused_o_einsum_wo_b(
         ).half().contiguous()
         b._sm70_predequant_f16 = b_f16  # type: ignore[attr-defined]
 
-    a_blocks = a_scale.shape[-1]
-    a_deq = a.float() * a_scale.repeat_interleave(hidden // a_blocks, dim=-1)
+    # R4: fused FP8 a dequant -> FP16 in one Triton pass, skipping the
+    # fp32 materialization and `repeat_interleave` scale expansion that
+    # the old path used.
+    a_fp16 = sm70_fp8_a_dequant_to_fp16(a, a_scale)
 
     # Chained: einsum -> flatten(1) -> wo_b. Keep result in fp16 to match
     # `out` dtype contract; wo_b applies its own (FP8 or fp16) GEMM.
-    z = torch.einsum("bhr,hdr->bhd", a_deq.half(), b_f16).to(out_dtype)
+    z = torch.einsum("bhr,hdr->bhd", a_fp16, b_f16).to(out_dtype)
     out = wo_b_module(z.flatten(1))
     if isinstance(out, tuple):
         out = out[0]
