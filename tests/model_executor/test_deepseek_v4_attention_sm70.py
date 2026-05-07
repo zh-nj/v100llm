@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from types import SimpleNamespace
 
 import torch
 
 from vllm.model_executor.layers import deepseek_v4_attention as d4a
-from vllm.model_executor.layers.deepseek_v4_attention import DeepseekV4MLAAttention
+from vllm.model_executor.layers.deepseek_v4_attention import (
+    DeepseekV4MLAAttention,
+    PrefillCaptureSize,
+    PrefillGraphDispatcher,
+)
 
 
 def test_forward_decode_uses_bf16_flashmla_io_for_fp16_model(monkeypatch):
@@ -99,6 +104,24 @@ def test_sm70_fp8_cache_exponents_preserve_upstream_positive_scales():
     torch.testing.assert_close(preserved, exponents)
     max_dequant = 448.0 * torch.exp2(preserved.max())
     assert max_dequant.item() == 448.0 * 256.0
+
+
+def test_sm70_decode_uses_direct_flashmla_by_default_with_opt_out(
+    monkeypatch,
+):
+    q = SimpleNamespace(is_cuda=True, device=torch.device("cuda", 0))
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda _device=None: (7, 0)
+    )
+    monkeypatch.delenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", raising=False)
+
+    assert not d4a._should_use_sm70_decode_prefill_fallback(q, swa_only=False)
+    assert not d4a._should_use_sm70_decode_prefill_fallback(q, swa_only=True)
+
+    monkeypatch.setenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", "0")
+
+    assert d4a._should_use_sm70_decode_prefill_fallback(q, swa_only=False)
+    assert d4a._should_use_sm70_decode_prefill_fallback(q, swa_only=True)
 
 
 def test_sm70_decode_prefill_fallback_builds_local_indices():
@@ -372,3 +395,236 @@ def test_forward_decode_uses_sparse_prefill_fallback_for_sm70_compressed(
     )
     assert captured["topk_length"] is None
     torch.testing.assert_close(output, torch.full_like(output, 3))
+
+
+def test_prefill_cudagraph_default_capture_sizes_cover_token_counts():
+    sizes = d4a._default_prefill_cudagraph_capture_sizes(
+        max_num_batched_tokens=4096,
+        max_model_len=4096,
+        max_M=8192,
+    )
+
+    assert sizes[:4] == [(1, 8192), (2, 8192), (4, 8192), (8, 8192)]
+    assert (1024, 8192) in sizes
+    assert (4096, 8192) in sizes
+    assert sizes[-1] == (4096, 8192)
+
+
+def test_prefill_graph_dispatcher_allocates_private_storage(monkeypatch):
+    def fail_workspace_manager():
+        raise AssertionError("scratch workspace manager must not be used")
+
+    monkeypatch.setattr(d4a, "current_workspace_manager", fail_workspace_manager)
+
+    dispatcher = PrefillGraphDispatcher(
+        capture_sizes=[(2, 4)],
+        padded_heads=1,
+        head_dim=2,
+        scale=1.0,
+        attn_sink=torch.zeros(1),
+        device=torch.device("cpu"),
+    )
+
+    assert dispatcher.enabled
+    assert dispatcher.q_padded.shape == (2, 1, 2)
+    assert dispatcher.kv_padded.shape == (d4a.PREFILL_CHUNK_SIZE, 4, 2)
+
+
+def test_prefill_graph_replay_uses_runtime_kv_workspace():
+    dispatcher = object.__new__(PrefillGraphDispatcher)
+    dispatcher.padded_heads = 1
+    dispatcher.head_dim = 2
+    dispatcher.scale = 1.0
+    dispatcher.attn_sink_workspace = torch.zeros(1)
+    dispatcher.device = torch.device("cpu")
+    dispatcher.enabled = True
+    dispatcher.graph_dispatch_count = 0
+    dispatcher.eager_dispatch_count = 0
+    dispatcher.sizes = [PrefillCaptureSize(max_tokens=2, max_M=4, graph=None)]
+    dispatcher.q_padded = torch.zeros(2, 1, 2, dtype=torch.float16)
+    dispatcher.indices_padded = torch.full((2, 1, 4), -1, dtype=torch.int32)
+    dispatcher.topk_length_padded = torch.zeros(2, dtype=torch.int32)
+    dispatcher.kv_padded = torch.zeros(4, 4, 2, dtype=torch.bfloat16)
+    dispatcher.output_padded = torch.zeros(2, 1, 2, dtype=torch.float16)
+    dispatcher.flash_output_bf16 = torch.zeros(2, 1, 2, dtype=torch.bfloat16)
+
+    class FakeGraph:
+        def replay(self):
+            dispatcher.output_padded.fill_(float(dispatcher.kv_padded[0, 0, 0]))
+
+    dispatcher.sizes[0].graph = FakeGraph()
+    q = torch.ones(2, 1, 2, dtype=torch.float16)
+    kv = torch.full((4, 4, 2), 7.0, dtype=torch.bfloat16)
+    output = torch.empty_like(q)
+
+    replayed = dispatcher.try_graph_replay(
+        q_chunk=q,
+        kv_flat=kv.view(-1, 1, 2),
+        combined_indices=torch.tensor([[[0, 1, -1]], [[2, -1, -1]]], dtype=torch.int32),
+        combined_lens=torch.tensor([2, 1], dtype=torch.int32),
+        output_slice=output,
+        num_chunk_tokens=2,
+        num_chunk_reqs=2,
+        M=4,
+        attn_sink=torch.tensor([3.0]),
+    )
+
+    assert replayed
+    torch.testing.assert_close(
+        dispatcher.kv_padded[:2], kv[:2], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        dispatcher.kv_padded[2:], torch.zeros_like(dispatcher.kv_padded[2:])
+    )
+    torch.testing.assert_close(output, torch.full_like(output, 7.0))
+    torch.testing.assert_close(dispatcher.attn_sink_workspace, torch.tensor([3.0]))
+
+
+def test_prefill_graph_replay_copies_per_token_lens_and_request_kv():
+    dispatcher = object.__new__(PrefillGraphDispatcher)
+    dispatcher.padded_heads = 1
+    dispatcher.head_dim = 2
+    dispatcher.scale = 1.0
+    dispatcher.attn_sink_workspace = torch.zeros(1)
+    dispatcher.device = torch.device("cpu")
+    dispatcher.enabled = True
+    dispatcher.graph_dispatch_count = 0
+    dispatcher.eager_dispatch_count = 0
+    dispatcher.sizes = [PrefillCaptureSize(max_tokens=4, max_M=4, graph=None)]
+    dispatcher.q_padded = torch.zeros(4, 1, 2, dtype=torch.float16)
+    dispatcher.indices_padded = torch.full((4, 1, 4), -1, dtype=torch.int32)
+    dispatcher.topk_length_padded = torch.zeros(4, dtype=torch.int32)
+    dispatcher.kv_padded = torch.zeros(4, 4, 2, dtype=torch.bfloat16)
+    dispatcher.output_padded = torch.zeros(4, 1, 2, dtype=torch.float16)
+    dispatcher.flash_output_bf16 = torch.zeros(4, 1, 2, dtype=torch.bfloat16)
+
+    class FakeGraph:
+        def replay(self):
+            torch.testing.assert_close(
+                dispatcher.topk_length_padded,
+                torch.tensor([2, 3, 4, 0], dtype=torch.int32),
+            )
+            torch.testing.assert_close(
+                dispatcher.kv_padded[1:],
+                torch.zeros_like(dispatcher.kv_padded[1:]),
+            )
+            dispatcher.output_padded.fill_(5)
+
+    dispatcher.sizes[0].graph = FakeGraph()
+    q = torch.ones(3, 1, 2, dtype=torch.float16)
+    kv = torch.full((4, 4, 2), 7.0, dtype=torch.bfloat16)
+    output = torch.empty_like(q)
+
+    replayed = dispatcher.try_graph_replay(
+        q_chunk=q,
+        kv_flat=kv.view(-1, 1, 2),
+        combined_indices=torch.tensor(
+            [[[0, 1, -1]], [[2, 3, -1]], [[1, 2, 3]]],
+            dtype=torch.int32,
+        ),
+        combined_lens=torch.tensor([2, 3, 4], dtype=torch.int32),
+        output_slice=output,
+        num_chunk_tokens=3,
+        num_chunk_reqs=1,
+        M=4,
+    )
+
+    assert replayed
+    torch.testing.assert_close(output, torch.full_like(output, 5.0))
+
+
+def test_prefill_graph_dispatcher_cache_reuses_shape_and_device(monkeypatch):
+    d4a._PREFILL_GRAPH_DISPATCHER_CACHE.clear()
+    created = []
+
+    class FakeDispatcher:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        def capture_graphs(self, *_args):
+            pass
+
+    monkeypatch.setattr(d4a, "PrefillGraphDispatcher", FakeDispatcher)
+    attn_sink = torch.zeros(64, dtype=torch.float32)
+    capture_sizes = [(1024, 3200)]
+
+    first = d4a._get_or_create_prefill_graph_dispatcher(
+        capture_sizes=capture_sizes,
+        padded_heads=64,
+        head_dim=512,
+        scale=1.0,
+        attn_sink=attn_sink,
+        device=torch.device("cpu"),
+        flash_mla_sparse_fwd_fn=lambda **_: None,
+        flashmla_bf16_io_fn=lambda q, out: (q, out),
+        copy_flashmla_output_fn=lambda flash_out, out: None,
+    )
+    second = d4a._get_or_create_prefill_graph_dispatcher(
+        capture_sizes=list(capture_sizes),
+        padded_heads=64,
+        head_dim=512,
+        scale=1.0,
+        attn_sink=attn_sink + 1,
+        device=torch.device("cpu"),
+        flash_mla_sparse_fwd_fn=lambda **_: None,
+        flashmla_bf16_io_fn=lambda q, out: (q, out),
+        copy_flashmla_output_fn=lambda flash_out, out: None,
+    )
+
+    assert first is second
+    assert len(created) == 1
+
+
+def test_deepseek_v4_phase_profiler_accumulates_and_resets():
+    profiler = d4a._DEEPSEEK_V4_PROFILE
+    profiler.reset()
+
+    profiler.record("prefill.swa_gather", 100.0)
+    profiler.record("prefill.swa_gather", 50.0)
+    profiler.record("decode.attn", 25.0)
+
+    snapshot = profiler.snapshot(reset=True)
+
+    assert snapshot["prefill.swa_gather"]["count"] == 2
+    assert snapshot["prefill.swa_gather"]["total_us"] == 150.0
+    assert snapshot["prefill.swa_gather"]["avg_us"] == 75.0
+    assert snapshot["decode.attn"]["count"] == 1
+    assert profiler.snapshot() == {}
+
+
+def test_deepseek_v4_phase_profiler_exports_metric_sink(monkeypatch):
+    events = []
+
+    class FakeMetrics:
+        def record(self, label, elapsed_us):
+            events.append((label, elapsed_us))
+
+    monkeypatch.setattr(
+        d4a, "_DEEPSEEK_V4_PROFILE_PROMETHEUS", FakeMetrics(), raising=False
+    )
+    profiler = d4a._DeepseekV4PhaseProfiler()
+
+    profiler.record("prefill.flashmla_sparse_fwd", 12.5)
+
+    assert events == [("prefill.flashmla_sparse_fwd", 12.5)]
+
+
+def test_deepseek_v4_phase_profiler_exports_raw_trace(monkeypatch, tmp_path):
+    trace_path = tmp_path / "phase.jsonl"
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_PROFILE_RAW_PATH", str(trace_path))
+    monkeypatch.setattr(d4a, "_DEEPSEEK_V4_PROFILE_RAW_TRACE", None, raising=False)
+
+    profiler = d4a._DeepseekV4PhaseProfiler()
+    profiler.record("decode.attn.direct_flashmla", 42.0)
+
+    rows = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert len(rows) == 1
+    row = rows[0]
+    # Required core fields must match; additional context fields (step_id,
+    # layer_idx, compress_ratio, step_kind, step_token_count) are optional
+    # and default to None when not recorded inside a _profile_step /
+    # _profile_layer context.
+    assert row["phase"] == "decode.attn.direct_flashmla"
+    assert row["elapsed_us"] == 42.0
+    assert "pid" in row
+    assert "cuda_device" in row

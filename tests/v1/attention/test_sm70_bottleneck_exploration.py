@@ -131,17 +131,26 @@ class TestDefect12DecodeFallbackIndices:
     **Validates: Requirements 1.2**
     """
 
-    def test_should_use_sm70_decode_prefill_fallback_returns_true(self):
-        """On SM70, the decode prefill fallback must be active."""
+    def test_should_use_sm70_decode_prefill_fallback_returns_true(self, monkeypatch):
+        """On SM70, the decode prefill fallback must remain reachable when the
+        direct-decode opt-in is disabled. This encodes the original bug
+        condition (Requirements 1.2): without the direct-decode path, SM70
+        takes the fallback on V100. After the direct-decode fix landed, the
+        default is opt-in (env VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE=1); this
+        test explicitly disables the opt-in to exercise the legacy fallback.
+        """
         from vllm.model_executor.layers.deepseek_v4_attention import (
             _should_use_sm70_decode_prefill_fallback,
         )
+        monkeypatch.setenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", "0")
         q = torch.randn(1, 64, 512, dtype=torch.float16, device="cuda")
         assert _should_use_sm70_decode_prefill_fallback(q, swa_only=True), (
-            "SM70 decode prefill fallback should return True on V100"
+            "SM70 decode prefill fallback should return True on V100 when "
+            "direct-decode opt-in is disabled"
         )
         assert _should_use_sm70_decode_prefill_fallback(q, swa_only=False), (
-            "SM70 decode prefill fallback should return True on V100"
+            "SM70 decode prefill fallback should return True on V100 when "
+            "direct-decode opt-in is disabled"
         )
 
     def test_build_indices_uses_torch_ops(self):

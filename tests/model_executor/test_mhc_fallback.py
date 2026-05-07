@@ -128,7 +128,7 @@ def test_mhc_sm70_fast_path_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> 
     assert not mhc._is_sm70_fast_path_available()
 
 
-def test_mhc_sm70_fast_path_requires_explicit_opt_in(
+def test_mhc_sm70_fast_path_defaults_on_for_sm70(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm.model_executor.layers import mhc
@@ -141,7 +141,7 @@ def test_mhc_sm70_fast_path_requires_explicit_opt_in(
     )
     monkeypatch.delenv("VLLM_SM70_MHC_FAST", raising=False)
 
-    assert not mhc._is_sm70_fast_path_available()
+    assert mhc._is_sm70_fast_path_available()
 
     monkeypatch.setenv("VLLM_SM70_MHC_FAST", "1")
 
