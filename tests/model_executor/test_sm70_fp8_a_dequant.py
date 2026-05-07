@@ -63,6 +63,60 @@ def test_sm70_fp8_a_dequant_matches_reference(T, G, D, block_size):
 
 
 @cuda_required
+@pytest.mark.parametrize("T,G,D,block_size", [
+    (32, 4, 512, 128),
+    (7, 2, 384, 128),
+])
+def test_sm70_fp8_a_dequant_handles_non_contiguous_scale(T, G, D, block_size):
+    """Regression: production scale tensors from fused_inv_rope_fp8_quant
+    are built via ``as_strided`` with stride(-1) != 1. The kernel MUST
+    read ``a_scale.stride(-1)`` explicitly instead of assuming 1.
+
+    See `.kiro/specs/deepseek-v4-flash-prefill-throughput/` for the full
+    bug story; this test reproduces the layout that caused silent
+    garbage output on the DeepSeek V4 SM70 fused O einsum + wo_b path.
+    """
+    from vllm.model_executor.layers.fp8_a_dequant_triton import (
+        sm70_fp8_a_dequant_to_fp16,
+    )
+
+    torch.manual_seed(1)
+    device = "cuda"
+    n_scale = D // block_size
+
+    # Match production: fp8_buf [G, T, D] then transposed -> [T, G, D]
+    fp8_g_major = (torch.randn(G, T, D, device=device) * 3.0).to(
+        dtype=torch.float8_e4m3fn
+    )
+    a = fp8_g_major.transpose(0, 1)
+
+    # scale_buf via as_strided: [G, T, n_scale] with stride(-1) = tma_aligned_T
+    # (simulate tma_aligned_T = T padded)
+    tma_aligned_T = max(T, 4)
+    scale_numel = G * n_scale * tma_aligned_T
+    scale_raw = (torch.rand(scale_numel, device=device) + 0.1).to(torch.float32)
+    scale_g_major = scale_raw.as_strided(
+        (G, T, n_scale),
+        (n_scale * tma_aligned_T, 1, tma_aligned_T),
+    )
+    a_scale = scale_g_major.transpose(0, 1)
+    assert a_scale.stride(-1) != 1, (
+        f"test precondition: scale should be non-contiguous on dim -1, "
+        f"got stride={a_scale.stride()}"
+    )
+
+    out = sm70_fp8_a_dequant_to_fp16(a, a_scale)
+    ref = _ref_dequant(a, a_scale)
+    denormal_mask = (a.view(torch.uint8) & 0x78) == 0
+    diff = (out - ref).abs()
+    diff[denormal_mask] = 0
+    scale_max = a_scale.max().item()
+    abs_tol = 5e-3 * max(1.0, scale_max * 10)
+    torch.testing.assert_close(diff, torch.zeros_like(diff),
+                                rtol=0, atol=abs_tol)
+
+
+@cuda_required
 def test_sm70_fp8_a_dequant_zero_tokens():
     from vllm.model_executor.layers.fp8_a_dequant_triton import (
         sm70_fp8_a_dequant_to_fp16,

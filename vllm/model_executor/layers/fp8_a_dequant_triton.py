@@ -58,6 +58,7 @@ def _fp8_a_dequant_to_fp16_kernel(
     a_stride_g,
     scale_stride_t,
     scale_stride_g,
+    scale_stride_k,
     out_stride_t,
     out_stride_g,
     BLOCK_D: tl.constexpr,
@@ -69,6 +70,12 @@ def _fp8_a_dequant_to_fp16_kernel(
     along the hidden dim (for DeepSeek V4 fp8 this is 128).
     BLOCK_D must divide SCALE_GROUP evenly (use BLOCK_D == SCALE_GROUP
     for simplest implementation).
+
+    ``scale_stride_k`` is the stride of ``a_scale`` along the last dim
+    (the scale-block-index dim). Production layouts from
+    ``fused_inv_rope_fp8_quant`` produce non-contiguous scale tensors
+    via ``as_strided`` where ``scale.stride(-1) = tma_aligned_T != 1``,
+    so this stride MUST be passed explicitly instead of assuming 1.
     """
     t = tl.program_id(0)
     g = tl.program_id(1)
@@ -83,7 +90,12 @@ def _fp8_a_dequant_to_fp16_kernel(
     a_f32 = _fp8_e4m3_uint8_to_fp32(a_u8)
 
     scale_idx = d_start // SCALE_GROUP
-    scale_ptr = a_scale_ptr + t * scale_stride_t + g * scale_stride_g + scale_idx
+    scale_ptr = (
+        a_scale_ptr
+        + t * scale_stride_t
+        + g * scale_stride_g
+        + scale_idx * scale_stride_k
+    )
     scale = tl.load(scale_ptr).to(tl.float32)
 
     out_vals = (a_f32 * scale).to(tl.float16)
@@ -148,7 +160,7 @@ def sm70_fp8_a_dequant_to_fp16(
         out,
         T, G, D,
         a.stride(0), a.stride(1),
-        a_scale.stride(0), a_scale.stride(1),
+        a_scale.stride(0), a_scale.stride(1), a_scale.stride(2),
         out.stride(0), out.stride(1),
         BLOCK_D=BLOCK_D,
         SCALE_GROUP=block_size,
