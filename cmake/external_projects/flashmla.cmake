@@ -100,8 +100,13 @@ if(FLASHMLA_HAS_SM70)
         FLASH_MLA_SM70_SPARSE_DECODE_USE_MMA_884_ONLINE 1 "^(0|1)$")
     _flashmla_get_env_int(FLASHMLA_SM70_SPARSE_PREFILL_CTA_THREADS
         FLASH_MLA_SM70_SPARSE_PREFILL_CTA_THREADS 256 "^(128|256)$")
+    # V100 has 96 KB shared memory per SM; K_TILE=32 uses 38.3 KB/block
+    # (2 blocks/SM), K_TILE=16 uses 20 KB/block (4 blocks/SM, 2x occupancy)
+    # and measures +37% prefill throughput on DeepSeek V4 Flash. See
+    # `.kiro/specs/deepseek-v4-flash-prefill-throughput/`.
+    # Allowed values: {16, 32, 64}; env var overrides this default.
     _flashmla_get_env_int(FLASHMLA_SM70_SPARSE_PREFILL_K_TILE
-        FLASH_MLA_SM70_SPARSE_PREFILL_K_TILE 32 "^(16|32|64)$")
+        FLASH_MLA_SM70_SPARSE_PREFILL_K_TILE 16 "^(16|32|64)$")
     _flashmla_get_env_int(FLASHMLA_SM70_SPARSE_PREFILL_USE_MMA_884_QK
         FLASH_MLA_SM70_SPARSE_PREFILL_USE_MMA_884_QK 0 "^(0|1)$")
     _flashmla_get_env_int(FLASHMLA_SM70_SPARSE_PREFILL_USE_MMA_884_PV
