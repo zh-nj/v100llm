@@ -5,6 +5,7 @@ import torch
 from torch.nn import Module
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.deepseek_v4_attention import _profile_or_null
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     FusedMoEConfig,
@@ -15,6 +16,9 @@ from vllm.model_executor.layers.fused_moe.activation import (
     apply_moe_activation,
 )
 from vllm.model_executor.layers.fused_moe.utils import swiglu_limit_func
+from vllm.model_executor.layers.fused_moe.swiglu_limit_triton import (
+    sm70_fused_swiglu_limit,
+)
 from vllm.model_executor.layers.quantization.awq_sm70_moe import (
     _DEFAULT_PERSISTENT_MAX_TOKENS,
     _moe_permute_accepts_scale_and_m_indices,
@@ -338,37 +342,38 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
 
         topk_ids_i32 = buffers["topk_ids_i32"]
         topk_ids_i32.copy_(topk_ids, non_blocking=True)
-        if _moe_permute_accepts_scale_and_m_indices():
-            torch.ops._moe_C.moe_permute(
-                x,
-                topk_ids_i32,
-                buffers["token_expert_indices"],
-                None,
-                layer.sm70_num_experts,
-                layer.sm70_num_experts,
-                top_k,
-                None,
-                buffers["permuted_input"],
-                buffers["expert_offsets64"],
-                buffers["inv_permuted_idx"],
-                buffers["permuted_idx"],
-                buffers["m_indices"],
-            )
-        else:
-            torch.ops._moe_C.moe_permute(
-                x,
-                topk_ids_i32,
-                buffers["token_expert_indices"],
-                None,
-                layer.sm70_num_experts,
-                layer.sm70_num_experts,
-                top_k,
-                buffers["permuted_input"],
-                buffers["expert_offsets64"],
-                buffers["inv_permuted_idx"],
-                buffers["permuted_idx"],
-            )
-        buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
+        with _profile_or_null("moe.experts.permute", x):
+            if _moe_permute_accepts_scale_and_m_indices():
+                torch.ops._moe_C.moe_permute(
+                    x,
+                    topk_ids_i32,
+                    buffers["token_expert_indices"],
+                    None,
+                    layer.sm70_num_experts,
+                    layer.sm70_num_experts,
+                    top_k,
+                    None,
+                    buffers["permuted_input"],
+                    buffers["expert_offsets64"],
+                    buffers["inv_permuted_idx"],
+                    buffers["permuted_idx"],
+                    buffers["m_indices"],
+                )
+            else:
+                torch.ops._moe_C.moe_permute(
+                    x,
+                    topk_ids_i32,
+                    buffers["token_expert_indices"],
+                    None,
+                    layer.sm70_num_experts,
+                    layer.sm70_num_experts,
+                    top_k,
+                    buffers["permuted_input"],
+                    buffers["expert_offsets64"],
+                    buffers["inv_permuted_idx"],
+                    buffers["permuted_idx"],
+                )
+            buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
 
         activation = self._activation()
         w13_bias = getattr(layer, "w13_bias", None)
@@ -381,77 +386,90 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
             or has_swiglu_limit
         )
         if use_unfused_activation:
+            with _profile_or_null("moe.experts.gemm_w13", x):
+                ops.sm70_mxfp4_moe_gemm_out(
+                    buffers["gate_up"],
+                    buffers["permuted_input"],
+                    buffers["expert_offsets"],
+                    layer.w13_strided_ptrs_w,
+                    layer.w13_strided_ptrs_s,
+                    layer.sm70_num_experts,
+                    layer.sm70_w13_k_dim,
+                    layer.sm70_w13_n_dim,
+                    self.group_size,
+                    False,
+                )
+            if w13_bias is not None:
+                with _profile_or_null("moe.experts.add_bias_w13", x):
+                    ops.sm70_moe_add_bias_out(
+                        buffers["gate_up"],
+                        buffers["expert_offsets"],
+                        w13_bias,
+                        layer.sm70_num_experts,
+                    )
+            with _profile_or_null("moe.experts.activation", x):
+                if activation == MoEActivation.SILU and has_swiglu_limit:
+                    sm70_fused_swiglu_limit(
+                        buffers["intermediate"],
+                        buffers["gate_up"],
+                        float(swiglu_limit),
+                    )
+                elif activation == MoEActivation.SILU:
+                    sm70_fused_swiglu_limit(
+                        buffers["intermediate"],
+                        buffers["gate_up"],
+                        0.0,
+                    )
+                else:
+                    apply_moe_activation(
+                        activation,
+                        buffers["intermediate"],
+                        buffers["gate_up"],
+                    )
+        else:
+            with _profile_or_null("moe.experts.gemm_w13_fused_silu", x):
+                ops.sm70_mxfp4_moe_gemm_out(
+                    buffers["intermediate"],
+                    buffers["permuted_input"],
+                    buffers["expert_offsets"],
+                    layer.w13_strided_ptrs_w,
+                    layer.w13_strided_ptrs_s,
+                    layer.sm70_num_experts,
+                    layer.sm70_w13_k_dim,
+                    layer.sm70_w13_n_dim,
+                    self.group_size,
+                    True,
+                )
+        with _profile_or_null("moe.experts.gemm_w2", x):
             ops.sm70_mxfp4_moe_gemm_out(
-                buffers["gate_up"],
-                buffers["permuted_input"],
+                buffers["sorted_output"],
+                buffers["intermediate"],
                 buffers["expert_offsets"],
-                layer.w13_strided_ptrs_w,
-                layer.w13_strided_ptrs_s,
+                layer.w2_strided_ptrs_w,
+                layer.w2_strided_ptrs_s,
                 layer.sm70_num_experts,
-                layer.sm70_w13_k_dim,
-                layer.sm70_w13_n_dim,
+                layer.sm70_w2_k_dim,
+                layer.sm70_w2_n_dim,
                 self.group_size,
                 False,
             )
-            if w13_bias is not None:
+        if w2_bias is not None:
+            with _profile_or_null("moe.experts.add_bias_w2", x):
                 ops.sm70_moe_add_bias_out(
-                    buffers["gate_up"],
+                    buffers["sorted_output"],
                     buffers["expert_offsets"],
-                    w13_bias,
+                    w2_bias,
                     layer.sm70_num_experts,
                 )
-            if activation == MoEActivation.SILU and has_swiglu_limit:
-                swiglu_limit_func(
-                    buffers["intermediate"],
-                    buffers["gate_up"],
-                    float(swiglu_limit),
-                )
-            else:
-                apply_moe_activation(
-                    activation,
-                    buffers["intermediate"],
-                    buffers["gate_up"],
-                )
-        else:
-            ops.sm70_mxfp4_moe_gemm_out(
-                buffers["intermediate"],
-                buffers["permuted_input"],
-                buffers["expert_offsets"],
-                layer.w13_strided_ptrs_w,
-                layer.w13_strided_ptrs_s,
-                layer.sm70_num_experts,
-                layer.sm70_w13_k_dim,
-                layer.sm70_w13_n_dim,
-                self.group_size,
-                True,
+        with _profile_or_null("moe.experts.unpermute", x):
+            torch.ops._moe_C.moe_unpermute(
+                buffers["sorted_output"][:, : layer.sm70_hidden_logical_size],
+                topk_weights,
+                buffers["inv_permuted_idx"],
+                buffers["expert_offsets64"],
+                top_k,
+                output,
             )
-        ops.sm70_mxfp4_moe_gemm_out(
-            buffers["sorted_output"],
-            buffers["intermediate"],
-            buffers["expert_offsets"],
-            layer.w2_strided_ptrs_w,
-            layer.w2_strided_ptrs_s,
-            layer.sm70_num_experts,
-            layer.sm70_w2_k_dim,
-            layer.sm70_w2_n_dim,
-            self.group_size,
-            False,
-        )
-        if w2_bias is not None:
-            ops.sm70_moe_add_bias_out(
-                buffers["sorted_output"],
-                buffers["expert_offsets"],
-                w2_bias,
-                layer.sm70_num_experts,
-            )
-        torch.ops._moe_C.moe_unpermute(
-            buffers["sorted_output"][:, : layer.sm70_hidden_logical_size],
-            topk_weights,
-            buffers["inv_permuted_idx"],
-            buffers["expert_offsets64"],
-            top_k,
-            output,
-        )
         return output
 
     def apply_monolithic(
