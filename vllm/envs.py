@@ -93,7 +93,21 @@ if TYPE_CHECKING:
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
-    VLLM_SM70_MHC_FAST: bool = False
+    VLLM_SM70_MHC_FAST: bool = True
+    VLLM_PREFILL_CUDAGRAPH: bool = False
+    VLLM_PREFILL_CUDAGRAPH_DEBUG: bool = False
+    VLLM_PREFILL_CUDAGRAPH_PERF_GATE: bool = False
+    VLLM_PREFILL_CUDAGRAPH_CAPTURE_TOKENS: str | None = None
+    VLLM_DEEPSEEK_V4_PROFILE: bool = False
+    VLLM_DEEPSEEK_V4_PROFILE_NVTX: bool = False
+    VLLM_DEEPSEEK_V4_PROFILE_LOG_EVERY: int = 200
+    VLLM_DEEPSEEK_V4_PROFILE_RAW_PATH: str | None = None
+    VLLM_DEEPSEEK_V4_PROFILE_MODE: Literal["queue", "eager"] = "queue"
+    VLLM_DEEPSEEK_V4_PROFILE_STEP_LIMIT: int = 0
+    VLLM_DEEPSEEK_V4_PROFILE_PHASE_FILTER: Literal["decode", "prefill", "both"] = "both"
+    VLLM_DEEPSEEK_V4_NAN_TRACE: bool = False
+    VLLM_DEEPSEEK_V4_INDEXER_TOPK: int = 0
+    VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE: bool = True
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -882,6 +896,59 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, SM70 mHC uses the fused Triton fast path instead of the
     # torch correctness fallback.
     "VLLM_SM70_MHC_FAST": lambda: bool(int(os.getenv("VLLM_SM70_MHC_FAST", "1"))),
+    # DeepSeek V4 Flash SM70 experimental prefill/decode profiling switches.
+    "VLLM_PREFILL_CUDAGRAPH": lambda: bool(
+        int(os.getenv("VLLM_PREFILL_CUDAGRAPH", "0"))
+    ),
+    "VLLM_PREFILL_CUDAGRAPH_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_PREFILL_CUDAGRAPH_DEBUG", "0"))
+    ),
+    "VLLM_PREFILL_CUDAGRAPH_PERF_GATE": lambda: bool(
+        int(os.getenv("VLLM_PREFILL_CUDAGRAPH_PERF_GATE", "0"))
+    ),
+    "VLLM_PREFILL_CUDAGRAPH_CAPTURE_TOKENS": lambda: os.getenv(
+        "VLLM_PREFILL_CUDAGRAPH_CAPTURE_TOKENS"
+    ),
+    "VLLM_DEEPSEEK_V4_PROFILE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_PROFILE", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_PROFILE_NVTX": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_PROFILE_NVTX", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_PROFILE_LOG_EVERY": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_PROFILE_LOG_EVERY", "200")
+    ),
+    "VLLM_DEEPSEEK_V4_PROFILE_RAW_PATH": lambda: os.getenv(
+        "VLLM_DEEPSEEK_V4_PROFILE_RAW_PATH"
+    ),
+    "VLLM_DEEPSEEK_V4_PROFILE_MODE": env_with_choices(
+        "VLLM_DEEPSEEK_V4_PROFILE_MODE", "queue", ["queue", "eager"],
+        case_sensitive=False,
+    ),
+    "VLLM_DEEPSEEK_V4_PROFILE_STEP_LIMIT": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_PROFILE_STEP_LIMIT", "0")
+    ),
+    "VLLM_DEEPSEEK_V4_PROFILE_PHASE_FILTER": env_with_choices(
+        "VLLM_DEEPSEEK_V4_PROFILE_PHASE_FILTER",
+        "both",
+        ["decode", "prefill", "both"],
+        case_sensitive=False,
+    ),
+    "VLLM_DEEPSEEK_V4_NAN_TRACE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_NAN_TRACE", "0"))
+    ),
+    # O4 fix: Override the indexer top-K quality knob (0 = use model config
+    # default; recommended override 256 for ~30% reduction in
+    # impl.indexer_kv_compress_overlap on SM70 decode). Set via env var
+    # `VLLM_DEEPSEEK_V4_INDEXER_TOPK=256`. Must be ≤ the model config's
+    # index_topk (typically 2048 for V3.2 / 512 effective for V4 Flash) to
+    # keep the topk_indices_buffer allocation valid.
+    "VLLM_DEEPSEEK_V4_INDEXER_TOPK": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_INDEXER_TOPK", "0")
+    ),
+    "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", "1"))
+    ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (
         os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "0").strip().lower()

@@ -95,6 +95,34 @@ def test_is_envs_cache_enabled() -> None:
     assert not envs._is_envs_cache_enabled()
 
 
+def test_deepseek_v4_sm70_experimental_envs_are_registered() -> None:
+    expected_envs = {
+        "VLLM_PREFILL_CUDAGRAPH",
+        "VLLM_PREFILL_CUDAGRAPH_DEBUG",
+        "VLLM_PREFILL_CUDAGRAPH_PERF_GATE",
+        "VLLM_PREFILL_CUDAGRAPH_CAPTURE_TOKENS",
+        "VLLM_DEEPSEEK_V4_PROFILE",
+        "VLLM_DEEPSEEK_V4_PROFILE_NVTX",
+        "VLLM_DEEPSEEK_V4_PROFILE_LOG_EVERY",
+        "VLLM_DEEPSEEK_V4_PROFILE_RAW_PATH",
+        "VLLM_DEEPSEEK_V4_NAN_TRACE",
+        "VLLM_DEEPSEEK_V4_INDEXER_TOPK",
+        "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE",
+    }
+
+    assert expected_envs.issubset(environment_variables)
+
+
+def test_deepseek_v4_sm70_direct_and_mhc_default_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", raising=False)
+    monkeypatch.delenv("VLLM_SM70_MHC_FAST", raising=False)
+
+    assert envs.VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE
+    assert envs.VLLM_SM70_MHC_FAST
+
+
 class TestEnvWithChoices:
     """Test cases for env_with_choices function."""
 
