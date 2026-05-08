@@ -29,6 +29,8 @@ from vllm.model_executor.utils import set_weight_attrs
 class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
     """SM70 direct MXFP4 MoE method using TurboMind grouped GEMM."""
 
+    compile_boundary_output_dtype = torch.float16
+
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
         self.group_size = 32

@@ -900,6 +900,14 @@ def _mhc_pre_torch_fallback(
     return post_mix, comb_mix, layer_input
 
 
+def _mhc_pre_fake_layer_input_dtype(residual: torch.Tensor) -> torch.dtype:
+    if not _TILELANG_AVAILABLE or not has_deep_gemm():
+        if _is_sm70_fast_path_available():
+            return torch.float16
+        return residual.dtype
+    return torch.bfloat16
+
+
 def _mhc_pre_fake(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -934,7 +942,7 @@ def _mhc_pre_fake(
     layer_input = torch.empty(
         *outer_shape,
         hidden_size,
-        dtype=torch.bfloat16,
+        dtype=_mhc_pre_fake_layer_input_dtype(residual),
         device=residual.device,
     )
 

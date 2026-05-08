@@ -23,6 +23,50 @@ def _ref_dequant(a_fp8: torch.Tensor, a_scale: torch.Tensor) -> torch.Tensor:
     return a_deq.half()
 
 
+def test_fused_inv_rope_fp8_quant_fake_preserves_production_strides():
+    """The custom-op fake layout feeds stride constants to Inductor.
+
+    If the fake scale output is contiguous, compiled SM70 dequant bakes
+    ``scale_stride_k=1`` and reproduces the old garbage-output bug even though
+    eager execution passes the correct dynamic stride.
+    """
+    from vllm.utils.deep_gemm import get_tma_aligned_size
+    from vllm.v1.attention.ops.deepseek_v4_ops.fused_inv_rope_fp8_quant import (
+        _fused_inv_rope_fp8_quant_fake,
+    )
+
+    T = 7
+    n_groups = 2
+    heads_per_group = 3
+    head_dim = 512
+    D = heads_per_group * head_dim
+    quant_group_size = 128
+    num_scale_blocks = D // quant_group_size
+    tma_aligned_T = get_tma_aligned_size(T, 4)
+
+    o = torch.empty(T, n_groups * heads_per_group, head_dim, dtype=torch.float16)
+    positions = torch.empty(T, dtype=torch.int64)
+    cos_sin_cache = torch.empty(32, 64, dtype=torch.float32)
+
+    fp8_out, scale_out = _fused_inv_rope_fp8_quant_fake(
+        o,
+        positions,
+        cos_sin_cache,
+        n_groups,
+        heads_per_group,
+        448,
+        64,
+        quant_group_size,
+        False,
+    )
+
+    assert fp8_out.shape == (T, n_groups, D)
+    assert fp8_out.stride() == (D, T * D, 1)
+    assert scale_out.shape == (T, n_groups, num_scale_blocks)
+    assert scale_out.stride() == (1, num_scale_blocks * tma_aligned_T,
+                                  tma_aligned_T)
+
+
 @cuda_required
 @pytest.mark.parametrize("T,G,D,block_size", [
     (1, 1, 128, 128),

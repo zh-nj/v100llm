@@ -36,6 +36,10 @@ def _shield_enabled() -> bool:
     return os.environ.get("VLLM_SM70_COMPILE_BOUNDARY_SHIELD", "1") == "1"
 
 
+def is_boundary_shield_enabled() -> bool:
+    return _shield_enabled()
+
+
 def ensure_boundary_dtype(x: torch.Tensor, expected: torch.dtype) -> torch.Tensor:
     """Return ``x`` cast to ``expected`` dtype if and only if it differs.
 

@@ -402,26 +402,35 @@ def _fused_inv_rope_fp8_quant_fake(
     fp8_dtype = torch.float8_e4m3fn
     tma_aligned_T = get_tma_aligned_size(num_tokens, 4)
 
-    # Shape matches the eager impl's .transpose(0, 1) output:
-    #   fp8_buf: [G, T, D] allocated, then transpose(0,1) -> [T, G, D]
-    fp8_out = torch.empty(
-        (num_tokens, n_groups, d),
+    # Layout must match the eager impl's .transpose(0, 1) outputs, not just
+    # their shapes. Inductor specializes downstream Triton stride arguments
+    # from fake tensors; returning contiguous scales here silently bakes
+    # scale_stride_k=1 and corrupts SM70 dequant under torch.compile.
+    fp8_buf = torch.empty(
+        (n_groups, num_tokens, d),
         dtype=fp8_dtype,
         device=o.device,
     )
+    fp8_out = fp8_buf.transpose(0, 1)
     if tma_aligned_scales:
         packed_sf_k = (num_scale_blocks + 3) // 4
         scale_out = torch.empty(
-            (num_tokens, n_groups, packed_sf_k),
+            n_groups * packed_sf_k * tma_aligned_T,
             dtype=torch.int32,
             device=o.device,
-        )
+        ).as_strided(
+            (n_groups, num_tokens, packed_sf_k),
+            (packed_sf_k * tma_aligned_T, 1, tma_aligned_T),
+        ).transpose(0, 1)
     else:
         scale_out = torch.empty(
-            (num_tokens, n_groups, num_scale_blocks),
+            n_groups * num_scale_blocks * tma_aligned_T,
             dtype=torch.float32,
             device=o.device,
-        )
+        ).as_strided(
+            (n_groups, num_tokens, num_scale_blocks),
+            (num_scale_blocks * tma_aligned_T, 1, tma_aligned_T),
+        ).transpose(0, 1)
     return fp8_out, scale_out
 
 

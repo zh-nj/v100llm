@@ -29,6 +29,10 @@ from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.sm70_compile_boundary_shield import (
+    ensure_boundary_dtype,
+    is_boundary_shield_enabled,
+)
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import (
@@ -74,6 +78,80 @@ def _resolve_layer_name(layer_name: str | ModuleName) -> str:
     return layer_name.value if isinstance(layer_name, ModuleName) else layer_name
 
 
+def _layer_moe_input_dtype(layer: torch.nn.Module, fallback: torch.dtype) -> torch.dtype:
+    if _is_sm70_mxfp4_quant_method(getattr(layer, "quant_method", None)):
+        return torch.float16
+    runner = getattr(layer, "runner", None)
+    if _is_sm70_mxfp4_quant_method(getattr(runner, "quant_method", None)):
+        return torch.float16
+    moe_config = getattr(layer, "moe_config", None)
+    return getattr(moe_config, "in_dtype", fallback)
+
+
+def _is_sm70_mxfp4_quant_method(quant_method: object | None) -> bool:
+    while quant_method is not None:
+        if getattr(quant_method, "compile_boundary_output_dtype", None) == torch.float16:
+            return True
+        if quant_method.__class__.__name__ == "Mxfp4SM70MoEMethod":
+            return True
+        quant_method = getattr(quant_method, "old_quant_method", None)
+    return False
+
+
+def _fake_moe_fallback_dtype(fallback: torch.dtype) -> torch.dtype:
+    # AOT fake dispatch can run after ForwardContext is cleared. In the SM70
+    # DSV4F compile bug shape, unresolved fp32 means the RMSNorm boundary
+    # intermediate, while the real MoE kernels return fp16 model activations.
+    if is_boundary_shield_enabled() and fallback == torch.float32:
+        return torch.float16
+    return fallback
+
+
+def _fake_layer_moe_input_dtype(
+    layer_name: str | ModuleName, fallback: torch.dtype
+) -> torch.dtype:
+    try:
+        resolved_name = _resolve_layer_name(layer_name)
+        if not is_forward_context_available():
+            return _fake_moe_fallback_dtype(fallback)
+        forward_context = get_forward_context()
+        if resolved_name == "from_forward_context":
+            all_moe_layers = forward_context.all_moe_layers
+            if all_moe_layers is None:
+                return _fake_moe_fallback_dtype(fallback)
+            moe_layer_index = forward_context.moe_layer_index
+            if moe_layer_index >= len(all_moe_layers):
+                return _fake_moe_fallback_dtype(fallback)
+            resolved_name = all_moe_layers[moe_layer_index]
+        layer = forward_context.no_compile_layers.get(resolved_name)
+        if layer is None:
+            return _fake_moe_fallback_dtype(fallback)
+        expected_dtype = _layer_moe_input_dtype(layer, fallback)
+        if expected_dtype == fallback:
+            return _fake_moe_fallback_dtype(fallback)
+        return expected_dtype
+    except Exception:
+        return _fake_moe_fallback_dtype(fallback)
+
+
+def _empty_like_moe_output(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if x.dtype == dtype:
+        return torch.empty_like(x)
+    return torch.empty_like(x, dtype=dtype)
+
+
+def _ensure_moe_result_dtype(
+    states: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None],
+    expected_dtype: torch.dtype,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+    if isinstance(states, tuple):
+        return tuple(
+            ensure_boundary_dtype(s, expected_dtype) if s is not None else None
+            for s in states
+        )
+    return ensure_boundary_dtype(states, expected_dtype)
+
+
 def _moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -82,12 +160,18 @@ def _moe_forward(
     input_ids: torch.Tensor | None,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    expected_dtype = _layer_moe_input_dtype(layer, hidden_states.dtype)
+    hidden_states = ensure_boundary_dtype(hidden_states, expected_dtype)
+    if shared_experts_input is not None:
+        shared_experts_input = ensure_boundary_dtype(
+            shared_experts_input, expected_dtype
+        )
     # TODO(bnell): this can be removed after MK migration is complete.
     layer.ensure_moe_quant_config_init()
     runner = layer.runner
     with runner._sequence_parallel_context():
         if runner.use_dp_chunking:
-            return runner.forward_impl_chunked(
+            result = runner.forward_impl_chunked(
                 layer,
                 hidden_states,
                 router_logits,
@@ -95,13 +179,14 @@ def _moe_forward(
                 input_ids,
             )
         else:
-            return runner.forward_impl(
+            result = runner.forward_impl(
                 layer,
                 hidden_states,
                 router_logits,
                 shared_experts_input,
                 input_ids,
             )
+        return _ensure_moe_result_dtype(result, expected_dtype)
 
 
 def _moe_forward_fake(
@@ -111,8 +196,9 @@ def _moe_forward_fake(
     layer_name: _layer_name_type,
     input_ids: torch.Tensor | None,
 ) -> torch.Tensor:
-    del router_logits, shared_experts_input, layer_name, input_ids
-    return torch.empty_like(hidden_states)
+    del router_logits, shared_experts_input, input_ids
+    expected_dtype = _fake_layer_moe_input_dtype(layer_name, hidden_states.dtype)
+    return _empty_like_moe_output(hidden_states, expected_dtype)
 
 
 def _moe_forward_shared(
@@ -123,12 +209,18 @@ def _moe_forward_shared(
     input_ids: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    expected_dtype = _layer_moe_input_dtype(layer, hidden_states.dtype)
+    hidden_states = ensure_boundary_dtype(hidden_states, expected_dtype)
+    if shared_experts_input is not None:
+        shared_experts_input = ensure_boundary_dtype(
+            shared_experts_input, expected_dtype
+        )
     # TODO(bnell): this can be removed after MK migration is complete.
     layer.ensure_moe_quant_config_init()
     runner = layer.runner
     with runner._sequence_parallel_context():
         if runner.use_dp_chunking:
-            return runner.forward_impl_chunked(
+            result = runner.forward_impl_chunked(
                 layer,
                 hidden_states,
                 router_logits,
@@ -136,13 +228,14 @@ def _moe_forward_shared(
                 input_ids,
             )
         else:
-            return runner.forward_impl(
+            result = runner.forward_impl(
                 layer,
                 hidden_states,
                 router_logits,
                 shared_experts_input,
                 input_ids,
             )
+        return _ensure_moe_result_dtype(result, expected_dtype)
 
 
 def _moe_forward_shared_fake(
@@ -152,17 +245,18 @@ def _moe_forward_shared_fake(
     layer_name: _layer_name_type,
     input_ids: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del router_logits, layer_name, input_ids
+    del router_logits, input_ids
+    expected_dtype = _fake_layer_moe_input_dtype(layer_name, hidden_states.dtype)
     # Output shapes:
     # - fused_out: same as hidden_states (routed experts use transformed size)
     # - shared_out: same as shared_experts_input if provided, else same as
     #               hidden_states
     # (For latent MoE: shared experts use original hidden_size, not latent size)
-    fused_out = torch.empty_like(hidden_states)
+    fused_out = _empty_like_moe_output(hidden_states, expected_dtype)
     if shared_experts_input is not None:
-        shared_out = torch.empty_like(shared_experts_input)
+        shared_out = _empty_like_moe_output(shared_experts_input, expected_dtype)
     else:
-        shared_out = torch.empty_like(hidden_states)
+        shared_out = _empty_like_moe_output(hidden_states, expected_dtype)
     return shared_out, fused_out
 
 
@@ -443,6 +537,27 @@ class DefaultMoERunner(MoERunner):
             assert len(trunc_sizes) == 1
             return func(states, trunc_sizes[0])
 
+    def _compile_boundary_output_dtype(self) -> torch.dtype:
+        return getattr(
+            self.quant_method,
+            "compile_boundary_output_dtype",
+            self.moe_config.in_dtype,
+        )
+
+    def _ensure_compile_boundary_outputs(
+        self,
+        states: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None],
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        if not is_boundary_shield_enabled():
+            return states
+        expected_dtype = self._compile_boundary_output_dtype()
+        if isinstance(states, tuple):
+            return tuple(
+                ensure_boundary_dtype(s, expected_dtype) if s is not None else None
+                for s in states
+            )
+        return ensure_boundary_dtype(states, expected_dtype)
+
     def _encode_layer_name(self) -> str | ModuleName:
         if HAS_OPAQUE_TYPE:
             return ModuleName(self.layer_name)
@@ -686,6 +801,7 @@ class DefaultMoERunner(MoERunner):
             self._encode_layer_name(),
             input_ids,
         )
+        fused_output = self._ensure_compile_boundary_outputs(fused_output)
 
         return self._maybe_reduce_output(fused_output, og_hidden_dims)
 
@@ -872,6 +988,10 @@ class DefaultMoERunner(MoERunner):
                 run_shared_experts_before=run_shared_experts_before,
                 input_ids=input_ids,
             )
+
+        shared_output, hidden_states = self._ensure_compile_boundary_outputs(
+            (shared_output, hidden_states)
+        )
 
         with _prof("moe.runner.combine", hidden_states):
             return self._maybe_combine(

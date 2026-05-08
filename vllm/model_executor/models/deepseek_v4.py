@@ -50,6 +50,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.sm70_compile_boundary_shield import (
+    ensure_boundary_dtype,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -72,6 +75,57 @@ from .utils import (
 
 logger = init_logger(__name__)
 _SM70_FP16_HC_OUTPUT_MAX = float(torch.finfo(torch.float16).max)
+
+
+def _compile_boundary_output_dtype_from_experts(
+    experts: torch.nn.Module, fallback: torch.dtype
+) -> torch.dtype:
+    for quant_method in (
+        getattr(experts, "quant_method", None),
+        getattr(experts, "base_quant_method", None),
+        getattr(getattr(experts, "runner", None), "quant_method", None),
+    ):
+        while quant_method is not None:
+            dtype = getattr(quant_method, "compile_boundary_output_dtype", None)
+            if dtype is not None:
+                return dtype
+            if quant_method.__class__.__name__ == "Mxfp4SM70MoEMethod":
+                return torch.float16
+            quant_method = getattr(quant_method, "old_quant_method", None)
+    return fallback
+
+
+def _deepseek_v4_moe_shared_add_op(
+    routed_output: torch.Tensor,
+    shared_output: torch.Tensor,
+) -> torch.Tensor:
+    return routed_output + shared_output
+
+
+def _deepseek_v4_moe_shared_add_fake(
+    routed_output: torch.Tensor,
+    shared_output: torch.Tensor,
+) -> torch.Tensor:
+    del shared_output
+    return torch.empty_like(routed_output)
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_moe_shared_add",
+    op_func=_deepseek_v4_moe_shared_add_op,
+    fake_impl=_deepseek_v4_moe_shared_add_fake,
+)
+
+
+def _combine_moe_shared_outputs(
+    routed_output: torch.Tensor,
+    shared_output: torch.Tensor,
+) -> torch.Tensor:
+    if routed_output.is_cuda:
+        return torch.ops.vllm.deepseek_v4_moe_shared_add(
+            routed_output, shared_output
+        )
+    return _deepseek_v4_moe_shared_add_op(routed_output, shared_output)
 
 
 def _trace_nonfinite_tensor(label: str, tensor: torch.Tensor) -> None:
@@ -928,7 +982,16 @@ class DeepseekV4MoE(nn.Module):
                 assert shared_output is None
             else:
                 assert shared_output is not None
-                final_hidden_states += shared_output
+                expected_dtype = _compile_boundary_output_dtype_from_experts(
+                    self.experts, final_hidden_states.dtype
+                )
+                final_hidden_states = ensure_boundary_dtype(
+                    final_hidden_states, expected_dtype
+                )
+                shared_output = ensure_boundary_dtype(shared_output, expected_dtype)
+                final_hidden_states = _combine_moe_shared_outputs(
+                    final_hidden_states, shared_output
+                )
 
         if self.tp_size > 1:
             final_hidden_states = (

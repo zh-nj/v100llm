@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fp8_a_dequant_triton import (
 )
 from vllm.model_executor.layers.sm70_compile_boundary_shield import (
     ensure_boundary_dtype,
+    is_boundary_shield_enabled,
 )
 from vllm.model_executor.layers.sm70_fp16_einsum_bmm import (
     sm70_fp16_einsum_bhr_hdr_bhd,
@@ -2114,6 +2115,41 @@ def _copy_flashmla_output(
         output.copy_(flash_output.to(output.dtype))
 
 
+def _attention_boundary_output_dtype(
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+) -> torch.dtype:
+    if is_boundary_shield_enabled():
+        return qr.dtype
+    return hidden_states.dtype
+
+
+def _attention_projection_output_dtype(
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+) -> torch.dtype:
+    if is_boundary_shield_enabled():
+        return qr.dtype
+    return hidden_states.dtype
+
+
+def _resolve_attention_output_boundary(
+    output: torch.Tensor,
+    q: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if output.dtype == q.dtype or not is_boundary_shield_enabled():
+        return output, None
+    return torch.empty_like(output, dtype=q.dtype), output
+
+
+def _copy_attention_output_boundary(
+    internal_output: torch.Tensor,
+    boundary_output: torch.Tensor | None,
+) -> None:
+    if boundary_output is not None:
+        boundary_output.copy_(internal_output)
+
+
 @dataclass
 class DeepseekV4MLAModules:
     """Modules used in DeepseekV4 MLA."""
@@ -2325,7 +2361,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         num_tokens = hidden_states.shape[0]
         o_padded = torch.empty(
             (num_tokens, self.padded_heads, self.head_dim),
-            dtype=hidden_states.dtype,
+            dtype=_attention_boundary_output_dtype(hidden_states, qr),
             device=hidden_states.device,
         )
 
@@ -2378,7 +2414,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     wo_a_scale,
                     self.wo_b,
                     "bhr,hdr->bhd",
-                    hidden_states.dtype,
+                    _attention_projection_output_dtype(hidden_states, qr),
                 )
             if _should_clamp_sm70_fp16_attention_output(out):
                 _clamp_sm70_fp16_attention_output_(out)
@@ -2389,7 +2425,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         z = torch.empty(
             (num_tokens, self.n_local_groups, self.o_lora_rank),
             device=o.device,
-            dtype=hidden_states.dtype,
+            dtype=_attention_projection_output_dtype(hidden_states, qr),
         )
         with _profile_or_null("wrapper.o_fp8_einsum", z):
             torch.ops.vllm.deepseek_v4_fp8_einsum(
@@ -3064,6 +3100,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         assert output.shape == q.shape, (
             f"output buffer shape {output.shape} must match q shape {q.shape}"
         )
+        boundary_output: torch.Tensor | None
+        output, boundary_output = _resolve_attention_output_boundary(output, q)
         assert output.dtype == q.dtype, (
             f"output buffer dtype {output.dtype} must match q dtype {q.dtype}"
         )
@@ -3111,6 +3149,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 swa_only=swa_only,
                 output=output[:num_decode_tokens],
             )
+        _copy_attention_output_boundary(output, boundary_output)
 
     # NOTE: _forward_decode is entirely unaffected by the prefill CUDA graph
     # feature.  PrefillGraphDispatcher operates only within _forward_prefill's
