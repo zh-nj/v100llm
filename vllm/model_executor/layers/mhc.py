@@ -357,6 +357,18 @@ def _mhc_pre_sm70_fast(
     hc_hidden_size = hc_mult * hidden_size
     outer_shape = residual.shape[:-2]
 
+    # Force contiguous residual up front. Under the FULL_DECODE_ONLY compile
+    # graph partitioner, the residual arriving at this boundary may have
+    # non-natural strides (from a view/reshape that inductor left behind);
+    # the downstream .reshape(num_tokens, hc_hidden_size) silently returns a
+    # non-contiguous view which the Triton load-then-cast-to-half path has
+    # been observed to fault on at T=2048. Contiguous is cheap when already
+    # so (torch.Tensor.is_contiguous short-circuit) and guarantees the
+    # Triton kernel sees canonical strides.
+    # See .kiro/specs/deepseek-v4-flash-compile-path-regression/.
+    if not residual.is_contiguous():
+        residual = residual.contiguous()
+
     residual_flat = residual.reshape(-1, hc_mult, hidden_size)
     num_tokens = residual_flat.shape[0]
     residual_vec = residual_flat.reshape(num_tokens, hc_hidden_size)
@@ -696,6 +708,14 @@ def mhc_pre(
 
     if not _TILELANG_AVAILABLE or not has_deep_gemm():
         if _is_sm70_fast_path_available():
+            # Inductor graph-partitioner may export a non-fp16 residual at
+            # this custom-op boundary (see compile-path-regression spec).
+            # Shield the SM70 fast path's fp16 contract explicitly; strict
+            # no-op when dtype already matches.
+            from vllm.model_executor.layers.sm70_compile_boundary_shield import (
+                ensure_boundary_dtype,
+            )
+            residual = ensure_boundary_dtype(residual, torch.float16)
             return _mhc_pre_sm70_fast(
                 residual,
                 fn,
@@ -988,6 +1008,11 @@ def mhc_post(
 ) -> torch.Tensor:
     if not _TILELANG_AVAILABLE:
         if _is_sm70_fast_path_available():
+            from vllm.model_executor.layers.sm70_compile_boundary_shield import (
+                ensure_boundary_dtype,
+            )
+            x = ensure_boundary_dtype(x, torch.float16)
+            residual = ensure_boundary_dtype(residual, torch.float16)
             return _mhc_post_sm70_fast(
                 x, residual, post_layer_mix, comb_res_mix
             )

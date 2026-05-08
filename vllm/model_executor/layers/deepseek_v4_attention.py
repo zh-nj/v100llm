@@ -27,6 +27,9 @@ from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.layers.fp8_a_dequant_triton import (
     sm70_fp8_a_dequant_to_fp16,
 )
+from vllm.model_executor.layers.sm70_compile_boundary_shield import (
+    ensure_boundary_dtype,
+)
 from vllm.model_executor.layers.sm70_fp16_einsum_bmm import (
     sm70_fp16_einsum_bhr_hdr_bhd,
 )
@@ -2419,6 +2422,26 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         positions: torch.Tensor,
         out: torch.Tensor,  # [num_tokens, padded_heads, head_dim], written in place
     ) -> None:
+        # Inductor graph-partitioner dtype shield: under FULL_DECODE_ONLY the
+        # compiled subgraph may export the pre-cast fp32 RMSNorm intermediate
+        # here instead of the fp16 post-cast value. Downstream fp16 Linear
+        # layers (indexer weights_proj, compressor qkv) then fail with a
+        # dtype mismatch. Re-cast once at the custom-op boundary; this is a
+        # strict no-op when dtype already matches (R4 hot path unchanged).
+        # qr always arrives at the model dtype (it's computed by fused_wqa_wkv
+        # upstream of the partition split and never hits the fp32 RMSNorm path),
+        # so use it as the authoritative dtype source.
+        # See .kiro/specs/deepseek-v4-flash-compile-path-regression/.
+        hidden_states = ensure_boundary_dtype(hidden_states, qr.dtype)
+
+        # Aux-stream overlap is re-enabled by default (R4 behavior). An
+        # escape-hatch env var ``VLLM_SM70_AUX_STREAM_OVERLAP=0`` disables
+        # it for debugging the inductor graph-partitioner interaction
+        # described in
+        # .kiro/specs/deepseek-v4-flash-compile-path-regression/.
+        import os
+        _aux_overlap = os.environ.get("VLLM_SM70_AUX_STREAM_OVERLAP", "1") == "1"
+
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
@@ -2457,7 +2480,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     kv_insert_and_compress,
                     self.ln_events[0],
                     self.ln_events[1],
-                    self.aux_stream,
+                    self.aux_stream if _aux_overlap else None,
                 )
         elif self.compressor is not None:
             # Compressor on default, kv_insert on aux.
@@ -2470,7 +2493,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     ),
                     self.ln_events[0],
                     self.ln_events[1],
-                    self.aux_stream,
+                    self.aux_stream if _aux_overlap else None,
                 )
         else:
             # SWA-only layer: no compressor, no overlap.
@@ -3684,6 +3707,14 @@ class DeepseekV4Indexer(nn.Module):
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
+        # Belt-and-suspenders shield — attention_impl already casts
+        # hidden_states, but when this indexer is driven from a different
+        # path (e.g. direct call from a test or a non-FULL_DECODE_ONLY
+        # compile config) the same partitioner behavior could export an
+        # fp32 tensor here. Cost is zero when dtype already matches.
+        hidden_states = ensure_boundary_dtype(
+            hidden_states, self.weights_proj.weight.dtype
+        )
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         k = self.compressor(hidden_states, positions, rotary_emb)
