@@ -117,15 +117,17 @@ if(FLASHMLA_HAS_SM70)
         FLASH_MLA_SM70_SPARSE_DECODE_DOUBLE_BUFFER 0 "^(0|1)$")
     _flashmla_get_env_int(FLASHMLA_SM70_SPARSE_PREFILL_DOUBLE_BUFFER
         FLASH_MLA_SM70_SPARSE_PREFILL_DOUBLE_BUFFER 0 "^(0|1)$")
-    # Round 3 of deepseek-v4-flash-prefill-throughput spec:
-    # batch HEADS_PER_BLOCK heads-of-the-same-query per CUDA block so
-    # the KV tile is staged once and reused. HPB=4 gives 4x KV reuse
-    # at 3 CTAs/SM on V100 (from 4 CTAs/SM at HPB=1). Default stays at
-    # 1 until Round 3 kernel correctness is validated end-to-end;
+    # Round 4 of deepseek-v4-flash-prefill-throughput spec:
+    # batch HEADS_PER_BLOCK heads-of-the-same-query per CUDA block
+    # with WARP-SPECIALIZATION so heads execute in parallel and share
+    # the KV tile staged once per block. HPB=4 gives 4x KV reuse at
+    # 3 CTAs/SM on V100 (from 4 CTAs/SM at HPB=1) and measured
+    # +21% prefill tok/s on DeepSeek V4 Flash (93.61 -> 112.89 tok/s
+    # on prompt_3k unique; decode unchanged within noise at 19.83).
     # env var FLASH_MLA_SM70_SPARSE_PREFILL_HEADS_PER_BLOCK overrides.
     # Allowed values: {1, 2, 4, 8}.
     _flashmla_get_env_int(FLASHMLA_SM70_SPARSE_PREFILL_HEADS_PER_BLOCK
-        FLASH_MLA_SM70_SPARSE_PREFILL_HEADS_PER_BLOCK 1 "^(1|2|4|8)$")
+        FLASH_MLA_SM70_SPARSE_PREFILL_HEADS_PER_BLOCK 4 "^(1|2|4|8)$")
 
     if(NOT FLASHMLA_SM70_SPARSE_DECODE_USE_MMA_884_ONLINE STREQUAL "0")
         set(FLASHMLA_SM70_SPARSE_DECODE_USE_MMA_884_QK 1)
