@@ -9,7 +9,10 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.sm70_mqa_logits import sm70_fp8_paged_mqa_logits
+from vllm.model_executor.layers.sm70_mqa_logits import (
+    sm70_fp8_mqa_logits,
+    sm70_fp8_paged_mqa_logits,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
@@ -73,6 +76,26 @@ def _fp8_mqa_logits_torch_fallback(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
 ) -> torch.Tensor:
+    # R5a (opt-in, default OFF): Route to the SM70 Triton kernel that
+    # uses a 1-program-per-(m, n) layout with manual FP8 E4M3 bit decode.
+    #
+    # Measurement on V100 TP=8 prompt_3k prefill showed this path
+    # regresses -18% vs the torch/cuBLAS eager fallback. The 1-program
+    # grid amortizes poorly when M and N both grow with sequence length
+    # (grid ≈ M*N ≈ 3.2M programs for M=N=1792) because each program
+    # does a single 8-head × 64-D scalar dot product.
+    #
+    # For prefill, the torch fallback path (fp32 cuBLAS einsum) is
+    # faster for this indexer phase; keep the Triton path reachable via
+    # VLLM_SM70_MQA_LOGITS_TRITON=1 for decode-like small-M shapes
+    # where torch.einsum is known to be slower.
+    import os
+    if (
+        os.environ.get("VLLM_SM70_MQA_LOGITS_TRITON", "0") == "1"
+        and _can_use_sm70_torch_indexer_fallback(use_fp4_cache=False)
+    ):
+        return sm70_fp8_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+
     k_fp8, k_scale = kv
     seq_len_kv = k_fp8.shape[0]
     q_f32 = q.float()
@@ -606,9 +629,10 @@ class SparseAttnIndexer(CustomOp):
             and _can_use_sm70_torch_indexer_fallback(use_fp4_cache)
         ):
             logger.warning_once(
-                "DeepGEMM is not installed; using SM70 torch fallback for "
-                "Sparse Attention Indexer logits. This path is for correctness "
-                "smoke only and is not performance optimized."
+                "DeepGEMM is not installed; using SM70 Triton fallback for "
+                "Sparse Attention Indexer logits (prefill + decode). This "
+                "path handles FP8 E4M3 via manual bit-decode and is "
+                "correctness-safe on Volta."
             )
 
     def forward_native(

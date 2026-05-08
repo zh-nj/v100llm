@@ -27,6 +27,9 @@ from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.layers.fp8_a_dequant_triton import (
     sm70_fp8_a_dequant_to_fp16,
 )
+from vllm.model_executor.layers.sm70_fp16_einsum_bmm import (
+    sm70_fp16_einsum_bhr_hdr_bhd,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import fp8_einsum
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -2767,8 +2770,17 @@ def _sm70_fp8_einsum_bmm(
         hidden // a_blocks, dim=-1
     )  # [T, G, D] fp32
 
-    # fp16 einsum — halved bandwidth, acceptable precision (rtol < 1e-3)
-    result = torch.einsum("bhr,hdr->bhd", a_deq.half(), b_f16)
+    # fp16 einsum — halved bandwidth, acceptable precision (rtol < 1e-3).
+    # R5b: route through the dedicated SM70 Triton BMM kernel instead of
+    # torch.einsum to avoid the multi-kernel reshape+GEMM dispatch chain
+    # that eager PyTorch uses on Volta. Gated by VLLM_SM70_EINSUM_BMM_TRITON
+    # during bring-up so we can bisect it independently from R5a.
+    import os
+    _r5b_on = os.environ.get("VLLM_SM70_EINSUM_BMM_TRITON", "1") == "1"
+    if _r5b_on:
+        result = sm70_fp16_einsum_bhr_hdr_bhd(a_deq.half().contiguous(), b_f16)
+    else:
+        result = torch.einsum("bhr,hdr->bhd", a_deq.half(), b_f16)
     out.copy_(result.to(out.dtype))
 
 
@@ -2819,7 +2831,15 @@ def _sm70_fused_o_einsum_wo_b(
 
     # Chained: einsum -> flatten(1) -> wo_b. Keep result in fp16 to match
     # `out` dtype contract; wo_b applies its own (FP8 or fp16) GEMM.
-    z = torch.einsum("bhr,hdr->bhd", a_fp16, b_f16).to(out_dtype)
+    # R5b: use the dedicated SM70 Triton BMM kernel for the einsum instead
+    # of torch.einsum's eager reshape+GEMM dispatch chain. Gated by
+    # VLLM_SM70_EINSUM_BMM_TRITON (default on) during bring-up.
+    import os
+    _r5b_on = os.environ.get("VLLM_SM70_EINSUM_BMM_TRITON", "1") == "1"
+    if _r5b_on:
+        z = sm70_fp16_einsum_bhr_hdr_bhd(a_fp16, b_f16).to(out_dtype)
+    else:
+        z = torch.einsum("bhr,hdr->bhd", a_fp16, b_f16).to(out_dtype)
     out = wo_b_module(z.flatten(1))
     if isinstance(out, tuple):
         out = out[0]
