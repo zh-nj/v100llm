@@ -333,6 +333,7 @@ class DefaultMoERunner(MoERunner):
         # TODO: Remove this after more extensive testings with TP/DP
         # and other execution modes
         self.use_shared_experts_stream = False
+        self.use_early_shared_experts_stream = False
         if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM:
             logger.debug_once("Disabling MoE shared_experts cuda stream", scope="local")
             self.shared_experts_stream = None
@@ -451,15 +452,25 @@ class DefaultMoERunner(MoERunner):
                 # sync end point immediately after it is done. This is
                 # important to avoid excessive stream allocations by the cuda
                 # graph replay later.
-                with torch.cuda.stream(self.shared_experts_stream):
-                    # Note that hidden_states clone() is necessary here to avoid
-                    # conflict with the main stream
-                    shared_output = self.shared_experts(hidden_states)
-                current_stream().wait_stream(self.shared_experts_stream)
+                shared_output = self._start_shared_experts_stream(hidden_states)
+                self._wait_shared_experts_stream()
             else:
                 shared_output = self.shared_experts(hidden_states)
 
         return shared_output
+
+    def _start_shared_experts_stream(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.shared_experts is not None
+        assert self.shared_experts_stream is not None
+        with torch.cuda.stream(self.shared_experts_stream):
+            return self.shared_experts(hidden_states)
+
+    def _wait_shared_experts_stream(self) -> None:
+        assert self.shared_experts_stream is not None
+        current_stream().wait_stream(self.shared_experts_stream)
 
     def must_reduce_shared_expert_outputs(self) -> bool:
         """
@@ -619,11 +630,19 @@ class DefaultMoERunner(MoERunner):
 
         shared_input = shared_input if shared_input is not None else hidden_states
         shared_output: torch.Tensor | None = None
+        launched_shared_experts = False
 
         # Run this before quant_method to avoid inplace issues.
         if run_shared_experts_before:
             with _profile_or_null("moe.runner.shared_experts_pre", shared_input):
                 shared_output = self._apply_shared_experts(shared_input, False)
+        elif (
+            self.has_separate_shared_experts
+            and getattr(self, "use_early_shared_experts_stream", False)
+        ):
+            with _profile_or_null("moe.runner.shared_experts_launch", shared_input):
+                shared_output = self._start_shared_experts_stream(shared_input)
+            launched_shared_experts = True
 
         if self.quant_method.is_monolithic:
             result = self.quant_method.apply_monolithic(
@@ -650,14 +669,18 @@ class DefaultMoERunner(MoERunner):
 
         if isinstance(result, tuple):
             assert shared_output is None
+            assert not launched_shared_experts
             shared_output, hidden_states = result
         else:
             hidden_states = result
 
         if not run_shared_experts_before and self.has_separate_shared_experts:
-            assert shared_output is None
             with _profile_or_null("moe.runner.shared_experts_post", shared_input):
-                shared_output = self._apply_shared_experts(shared_input, True)
+                if launched_shared_experts:
+                    self._wait_shared_experts_stream()
+                else:
+                    assert shared_output is None
+                    shared_output = self._apply_shared_experts(shared_input, True)
 
         return shared_output, hidden_states
 
@@ -949,6 +972,10 @@ class DefaultMoERunner(MoERunner):
                 hidden_states.shape[0]
                 <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
             )
+        )
+        self.use_early_shared_experts_stream = (
+            self.use_shared_experts_stream
+            and envs.VLLM_MOE_EARLY_SHARED_EXPERTS_STREAM
         )
 
         # Check if we need to run shared experts before matrix multiply because

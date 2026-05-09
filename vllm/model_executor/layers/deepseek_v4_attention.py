@@ -2788,6 +2788,15 @@ def _sm70_ensure_predequant_weight(b: torch.Tensor, b_scale: torch.Tensor,
     return b_f16
 
 
+def _sm70_einsum_bmm_triton_enabled() -> bool:
+    """Whether to use the R5b Triton BMM path.
+
+    R5b is kept opt-in because the production decode shape (T=1) regresses
+    against torch.einsum/cuBLAS GEMV on SM70.
+    """
+    return os.environ.get("VLLM_SM70_EINSUM_BMM_TRITON", "0") == "1"
+
+
 @torch._dynamo.allow_in_graph
 def _sm70_fp8_einsum_bmm(
     a: torch.Tensor,
@@ -2830,12 +2839,12 @@ def _sm70_fp8_einsum_bmm(
     )  # [T, G, D] fp32
 
     # fp16 einsum — halved bandwidth, acceptable precision (rtol < 1e-3).
-    # R5b: route through the dedicated SM70 Triton BMM kernel instead of
-    # torch.einsum to avoid the multi-kernel reshape+GEMM dispatch chain
-    # that eager PyTorch uses on Volta. Gated by VLLM_SM70_EINSUM_BMM_TRITON
-    # during bring-up so we can bisect it independently from R5a.
-    import os
-    _r5b_on = os.environ.get("VLLM_SM70_EINSUM_BMM_TRITON", "1") == "1"
+    # R5b: optionally route through the dedicated SM70 Triton BMM kernel
+    # instead of torch.einsum to avoid the multi-kernel reshape+GEMM dispatch
+    # chain that eager PyTorch uses on Volta. Gated by
+    # VLLM_SM70_EINSUM_BMM_TRITON and default-off after the T=1 decode
+    # regression.
+    _r5b_on = _sm70_einsum_bmm_triton_enabled()
     if _r5b_on:
         result = sm70_fp16_einsum_bhr_hdr_bhd(a_deq.half().contiguous(), b_f16)
     else:
@@ -2890,11 +2899,10 @@ def _sm70_fused_o_einsum_wo_b(
 
     # Chained: einsum -> flatten(1) -> wo_b. Keep result in fp16 to match
     # `out` dtype contract; wo_b applies its own (FP8 or fp16) GEMM.
-    # R5b: use the dedicated SM70 Triton BMM kernel for the einsum instead
-    # of torch.einsum's eager reshape+GEMM dispatch chain. Gated by
-    # VLLM_SM70_EINSUM_BMM_TRITON (default on) during bring-up.
-    import os
-    _r5b_on = os.environ.get("VLLM_SM70_EINSUM_BMM_TRITON", "1") == "1"
+    # R5b: optionally use the dedicated SM70 Triton BMM kernel for the einsum
+    # instead of torch.einsum's eager reshape+GEMM dispatch chain. Gated by
+    # VLLM_SM70_EINSUM_BMM_TRITON and default-off for decode.
+    _r5b_on = _sm70_einsum_bmm_triton_enabled()
     if _r5b_on:
         z = sm70_fp16_einsum_bhr_hdr_bhd(a_fp16, b_f16).to(out_dtype)
     else:

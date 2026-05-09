@@ -98,3 +98,93 @@ def test_default_moe_runner_passes_input_ids_to_router() -> None:
 
     assert runner.router.input_ids is input_ids
     assert output is hidden_states
+
+
+@pytest.mark.parametrize(
+    ("use_early_shared_stream", "expected_events"),
+    [
+        (False, ["select", "quant_apply", "legacy_shared"]),
+        (True, ["shared_start", "select", "quant_apply", "shared_wait"]),
+    ],
+)
+def test_default_moe_runner_streamed_shared_experts_order(
+    use_early_shared_stream: bool,
+    expected_events: list[str],
+) -> None:
+    """Early shared experts launch is opt-in; default keeps legacy ordering."""
+    events: list[str] = []
+
+    class RecordingRouter:
+        def select_experts(
+            self,
+            hidden_states: torch.Tensor,
+            router_logits: torch.Tensor,
+            *,
+            input_ids: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del router_logits, input_ids
+            events.append("select")
+            topk_weights = torch.ones((hidden_states.size(0), 1))
+            topk_ids = torch.zeros((hidden_states.size(0), 1), dtype=torch.int64)
+            return topk_weights, topk_ids
+
+    class RecordingQuantMethod:
+        is_monolithic = False
+        mk_owns_shared_expert = False
+
+        def apply(
+            self,
+            layer: object,
+            x: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            shared_experts_input: torch.Tensor | None,
+        ) -> torch.Tensor:
+            del layer, topk_weights, topk_ids, shared_experts_input
+            events.append("quant_apply")
+            return x
+
+    runner = object.__new__(DefaultMoERunner)
+    runner.router = RecordingRouter()
+    runner.quant_method = RecordingQuantMethod()
+    runner.shared_experts = object()
+    runner.use_shared_experts_stream = True
+    runner.use_early_shared_experts_stream = use_early_shared_stream
+
+    hidden_states = torch.randn((3, 4), dtype=torch.float32)
+    router_logits = torch.randn((3, 8), dtype=torch.float32)
+    shared_input = torch.randn((3, 4), dtype=torch.float32)
+    shared_output = torch.randn((3, 4), dtype=torch.float32)
+
+    def start_shared_experts(hidden_states: torch.Tensor) -> torch.Tensor:
+        assert hidden_states is shared_input
+        events.append("shared_start")
+        return shared_output
+
+    def wait_shared_experts_stream() -> None:
+        events.append("shared_wait")
+
+    def legacy_apply_shared_experts(
+        hidden_states: torch.Tensor,
+        allow_streaming: bool = False,
+    ) -> torch.Tensor:
+        del hidden_states, allow_streaming
+        events.append("legacy_shared")
+        return shared_output
+
+    runner._start_shared_experts_stream = start_shared_experts
+    runner._wait_shared_experts_stream = wait_shared_experts_stream
+    runner._apply_shared_experts = legacy_apply_shared_experts
+
+    shared, output = DefaultMoERunner._apply_quant_method(
+        runner,
+        layer=object(),
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        shared_input=shared_input,
+        run_shared_experts_before=False,
+    )
+
+    assert shared is shared_output
+    assert output is hidden_states
+    assert events == expected_events

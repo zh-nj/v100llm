@@ -251,6 +251,7 @@ if TYPE_CHECKING:
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
+    VLLM_MOE_EARLY_SHARED_EXPERTS_STREAM: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
@@ -1645,6 +1646,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
+    ),
+    # Launches MoE shared_experts on the auxiliary stream before routed expert
+    # GEMMs, then joins after routed experts finish. This forms a real CUDA
+    # graph branch but can hurt full-GPU decode when both branches contend for
+    # tensor cores, so it is opt-in.
+    "VLLM_MOE_EARLY_SHARED_EXPERTS_STREAM": lambda: bool(
+        int(os.getenv("VLLM_MOE_EARLY_SHARED_EXPERTS_STREAM", "0"))
     ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream

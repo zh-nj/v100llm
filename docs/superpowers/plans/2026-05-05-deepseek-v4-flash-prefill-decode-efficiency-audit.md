@@ -45,7 +45,7 @@ python benchmarks/deepseek_v4_flashmla_sm70.py --mode inspect --json
 pid=18714
 endpoint=http://127.0.0.1:18080/v1
 CUDA_VISIBLE_DEVICES=2,3,4,5,6,8,7,9
-VLLM_SM70_MHC_FAST=0
+VLLM_SM70_MHC_FAST=0  # historical fallback run; current validated default is 1
 max_model_len=4096
 max_num_seqs=1
 compilation_config={"mode":"NONE","cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1]}
@@ -378,8 +378,8 @@ python benchmarks/deepseek_v4_flashmla_sm70.py \
 |---|---|---|
 | prefill KV gather / sparse prefill / compressor-indexer 分解 | 887 tokens 已需 `13.46s`，3327 tokens 需 `57.40s` | 从 P1 上调为和 decode direct path 并列的 P0 审计项 |
 | decode fallback elimination | 长上下文 decode 约 `9.2-9.8 tok/s`，且随 prompt 增长下降约 `10-12%` | 仍是 P0，但端到端收益要和 prefill 比例分开估算 |
-| mHC fast path | `VLLM_SM70_MHC_FAST=0` 下 canary exact、自然语言连贯 | 继续保持默认关闭；任何启用都要先 A/B 语义 |
-| FULL_DECODE_ONLY graph | 当前 graph-configured 服务 decode 稳态约 `9-10 tok/s` | 下一轮要保留日志证明 capture/replay，并做 eager/graph A/B |
+| mHC fast path | fallback `VLLM_SM70_MHC_FAST=0` 和 fast `=1` canary 均 exact、自然语言连贯 | 当前 validated default 为 `1`；`0` 仅用于 fallback A/B 或 rollback |
+| FULL_DECODE_ONLY graph | historical fallback mHC graph server decode 稳态约 `9-10 tok/s`；当前 `MHC_FAST=1` graph 复测为 `15.8-19.2 tok/s` | 后续 graph 性能报告必须同时记录 `VLLM_SM70_MHC_FAST` |
 | 8k/32k 长上下文 | 当前 server 只到 `max_model_len=4096` | 需要新 server 或更高 KV 预算后单独测，不从 4k 外推 |
 
 ### 8.5 Prefill CUDA Graph 实验与 phase trace
@@ -465,11 +465,14 @@ VLLM_DEEPSEEK_V4_PROFILE_RAW_PATH=/tmp/deepseek_v4_phase_profile_live.jsonl
 | speed | decode token/s 高于 fallback，32k 不退化 |
 | graph | `FULL_DECODE_ONLY` capture/replay 仍成立 |
 
-### P0: mHC fast path 语义修复后再启用
+### P0: mHC fast path 默认口径与 fallback A/B
 
-现状：`VLLM_SM70_MHC_FAST` 默认关闭，快路径需要显式 opt-in。
+现状：`VLLM_SM70_MHC_FAST` 当前 validated default 为开启；显式设置为 `0`
+只用于 fallback A/B 或 rollback。旧实验记录里的 `MHC_FAST=0` 数字不能作为当前
+默认 decode 性能基线。
 
-目标：在保持默认安全的前提下，修复/验证 SM70 mHC cuBLAS fp16 GEMM + fused Triton path。
+目标：保持 SM70 mHC cuBLAS fp16 GEMM + fused Triton path 的默认语义和速度回归门，
+同时保留 `VLLM_SM70_MHC_FAST=0` 作为明确的 fallback 对照。
 
 验收：
 
@@ -535,7 +538,7 @@ prefill 是动态形状路径，完整 graph capture 收益通常不如 decode �
 | P0 prefill phase 分解 | [x] 已实测归档 | `VLLM_DEEPSEEK_V4_PROFILE=1` 记录 CUDA event/Prometheus/raw JSONL，`phase-summary` 按最慢 rank 聚合；无 prefix cache fallback trace 显示 `prefill.flashmla_sparse_fwd` 最慢 rank `114531.6ms`，远高于 `wrapper.wo_b` `14815.5ms`、indexer/compressor overlap `7499.7ms` | 优化主方向转向 FlashMLA sparse prefill；vLLM 侧继续保留 raw trace 作回归门 |
 | P0 prefill CUDA graph 冻结 | [x] 默认冻结 | `VLLM_PREFILL_CUDAGRAPH` 默认仍为 `0`；graph dispatcher 只在显式开关下创建，且使用私有 graph workspace、per-token lens 和 runtime KV workspace | 只有 graph 在 887/3k 不慢于 eager 且长 prompt 不 timeout 后才考虑默认 |
 | P0 decode fallback elimination | [x] opt-in + live A/B | `VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE=1` 可进入 `decode.attn.direct_flashmla`；fresh eager raw trace 记录 `decode.attn.direct_flashmla`，无 profiler graph server 的 1012/2892/3492 token decode 分别比 fallback 快约 `9.9%/4.5%/4.6%` | 默认仍保留 fallback；direct path 可作为下一轮更长上下文候选 |
-| P0 mHC fast path | [x] opt-in live gate 通过 | `VLLM_SM70_MHC_FAST` 默认值仍为 `0`；`VLLM_SM70_MHC_FAST=1` 单层 numeric A/B 通过，full-model `ZX-42` exact，自然语言 smoke 连贯；1012 token decode `15.98 tok/s`，fallback 为 `9.98 tok/s` | 继续用 3k/near-4k 和 direct+mHC 组合跑回归后再讨论默认 |
+| P0 mHC fast path | [x] live gate 通过并设为当前默认 | `VLLM_SM70_MHC_FAST=1` 单层 numeric A/B 通过，full-model `ZX-42` exact，自然语言 smoke 连贯；旧 1012 token run 中 fast 为 `15.98 tok/s`，fallback 为 `9.98 tok/s`；2026-05-09 复测 897/2825/3328 prompt tokens 时 fast 为 `19.21/15.80/15.95 tok/s`，fallback 为 `11.03/9.88/9.99 tok/s` | 后续测速默认必须保持 `MHC_FAST=1`，只有 rollback/A-B 才显式设 `0` |
 | P0 decode O projection | [x] 第一阶段实测 | `_sm70_fp8_einsum_bmm` 已使用 `_sm70_predequant_f16` 持久 cache；fallback profile 中 `wrapper.o_fp8_einsum` 最慢 rank `303.6ms`，`wrapper.wo_b` `14815.5ms`，低于 sparse prefill 主热点 | grouped matmul 仍可做，但优先级低于 FlashMLA sparse prefill 和 mHC opt-in 扩大验证 |
 | P1 compressor/indexer 长 prompt 审计 | [x] 4k 内审计完成 | phase range 覆盖 `impl.indexer_kv_compress_overlap`、`impl.compressor_kv_insert_overlap`、`prefill.compressed_gather`、`prefill.swa_gather`、`prefill.combine_indices`；4k 内 indexer/compressor 是第二梯队，不是主瓶颈 | 需要更大 `max_model_len` server 跑 8k/32k，确认长上下文是否转为主瓶颈 |
 | P1 FlashMLA sparse prefill tuning | [~] 当前 build 已实测 | vLLM 侧已证明 `prefill.flashmla_sparse_fwd` 是主热点；只读 FlashMLA benchmark 当前默认 `256/32/mma884_online`，`max_topk=8192` 为 `21580.799us`、48 registers、0 spills、25% static occupancy | 完整 `K_TILE=16/32` 与 `CTA=128/256` sweep 需要重编 `/mnt/data/apps/FlashMLA`，当前仓库有 decode 侧未提交改动，暂不触碰 |
@@ -557,6 +560,24 @@ prefill 是动态形状路径，完整 graph capture 收益通常不如 decode �
 | near-4k | 3492 | direct decode | 61.367 | 10.17 | length | 连贯 |
 | 1k | 1012 | `VLLM_SM70_MHC_FAST=1` | 15.277 | 15.98 | length | 连贯 |
 
+### 9.3 CUDA Graph decode 速度回归排查（2026-05-09）
+
+同一份代码、同一 `FULL_DECODE_ONLY` graph、同一 `/tmp/dsv4_cudagraph_speed.py`
+脚本下，只改变 `VLLM_SM70_MHC_FAST`：
+
+| Case | prompt tokens | `MHC_FAST=1` decode tok/s | `MHC_FAST=0` decode tok/s | 结论 |
+|---|---:|---:|---:|---|
+| `ZX-42` | 19 | 31.06 | 16.10 | 两者 canary exact，短输出受固定开销影响较大 |
+| short CN | 12 | 26.68 | 13.24 | 两者连贯 |
+| 1k | 897 | 19.21 | 11.03 | 速度下降来自 fallback mHC |
+| 3k | 2825 | 15.80 | 9.88 | 复现此前约 10 tok/s 低位 |
+| near-4k | 3328 | 15.95 | 9.99 | 复现此前约 10 tok/s 低位 |
+
+两轮都确认 graph capture 生效：`Capturing CUDA graphs (decode, FULL)`，
+`Graph capturing finished ... took 0.11 GiB`，prefix cache hits/queries 均为 0。
+因此 2026-05-09 看到的“默认路径约 10 tok/s”不是 MoE early shared-experts
+overlap 的默认分支泄漏；根因是测速启动口径显式关闭了 mHC fast path。
+
 Direct decode first-token logprob gate：fallback 首 token `-`，logprob `-1.83347`；direct 首 token同为 `-`，logprob `-1.85339`。fresh eager/path proof trace：`/tmp/deepseek_v4_phase_direct_eager_registry_20260506_1029.jsonl` 中出现 `decode.attn.direct_flashmla`，最慢 rank `38.435ms`；启动日志不再出现 custom DeepSeek V4 env unknown warning。
 
 FlashMLA sparse prefill 当前 build 只读 benchmark，命令使用 `PYTHONPATH=/mnt/data/apps/FlashMLA/build/lib.linux-x86_64-cpython-313`、单 V100、`--warmup 1 --runs 1`：
@@ -575,6 +596,6 @@ FlashMLA sparse prefill 当前 build 只读 benchmark，命令使用 `PYTHONPATH
 2. 本轮实测补齐了上一轮缺口：在 `FULL_DECODE_ONLY` 配置、8xV100、`max_model_len=4096` 下，fallback/direct/mHC-fast 都跑了 `ZX-42` semantic gate；direct 和 mHC-fast 都保持 exact canary，mHC-fast 自然语言 smoke 也连贯。
 3. prefill/TTFT 仍是当前 4k 内最直接的端到端瓶颈：1012/2892/3492 prompt tokens 的 fallback TTFT 分别为 `15.616/50.278/60.777s`，direct decode 基本不改变 TTFT。
 4. direct decode opt-in 有稳定但有限收益：1012/2892/3492 prompt tokens 的 decode 从 `9.98/9.44/9.72 tok/s` 提到 `10.97/9.87/10.17 tok/s`；fresh trace 证明路径进入 `decode.attn.direct_flashmla`。
-5. `VLLM_SM70_MHC_FAST=1` 的收益更明显：单层 numeric A/B、full-model canary 和中文 identity smoke 通过，1012-token decode 达 `15.98 tok/s`；但默认仍应保持 `0`，直到 3k/near-4k 和 direct+mHC 组合回归完成。
+5. `VLLM_SM70_MHC_FAST=1` 的收益更明显：单层 numeric A/B、full-model canary 和中文 identity smoke 通过；2026-05-09 的 `FULL_DECODE_ONLY` 复测显示 897/2825/3328 prompt tokens 的 decode 为 `19.21/15.80/15.95 tok/s`，而 fallback `MHC_FAST=0` 为 `11.03/9.88/9.99 tok/s`。当前默认测速口径应保持 `MHC_FAST=1`。
 6. 当前实测没有 8k/32k，因为现有 server 限制为 `max_model_len=4096`。下一轮若要回答长上下文效率，需要重启更大 KV 预算的 server，并同时保存 CUDA Graph capture 日志。
 7. 后续实验报告应同时输出 `TTFT`、手算 `decode_tokens_per_s`、`finish_reason`、语义结论、graph 状态、prefill/decode micro range 分解，否则无法判断时间究竟花在 attention、KV、mHC、MoE 还是 launch/capture 上。

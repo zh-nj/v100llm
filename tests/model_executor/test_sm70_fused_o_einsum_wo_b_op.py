@@ -93,6 +93,21 @@ def test_deepseek_v4_fp8_einsum_torch_fallback_is_dynamo_shielded():
     )
 
 
+def test_sm70_einsum_bmm_triton_defaults_off(monkeypatch):
+    """R5b Triton BMM should remain opt-in after the decode regression."""
+    dsa = pytest.importorskip(
+        "vllm.model_executor.layers.deepseek_v4_attention"
+    )
+    helper = getattr(dsa, "_sm70_einsum_bmm_triton_enabled", None)
+    assert helper is not None
+
+    monkeypatch.delenv("VLLM_SM70_EINSUM_BMM_TRITON", raising=False)
+    assert helper() is False
+
+    monkeypatch.setenv("VLLM_SM70_EINSUM_BMM_TRITON", "1")
+    assert helper() is True
+
+
 def test_sm70_predequant_helper_uses_custom_op():
     """The helper that populates `_sm70_predequant_f16` MUST call the custom op."""
     dsa = pytest.importorskip(

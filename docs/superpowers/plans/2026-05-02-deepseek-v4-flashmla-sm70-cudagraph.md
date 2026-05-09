@@ -15,7 +15,9 @@
 - Repository root `/mnt/data/apps/1Cat-vLLM` is on branch `chore/ignore-project-worktrees`; the DeepSeek V4 target worktree is `/mnt/data/apps/1Cat-vLLM/.worktrees/vllm-0190-upstream-split` on branch `feature/vllm-0190-upstream-split`.
 - Existing bring-up plan: `docs/superpowers/plans/2026-05-01-deepseek-v4-flashmla-sm70.md`.
 - Local FlashMLA source: `/mnt/data/apps/FlashMLA`, branch `feature/sm70-volta-flashmla`, inspected HEAD `a507081`.
-- Eager DeepSeek V4 smoke is semantically correct after keeping `VLLM_SM70_MHC_FAST=0`; the opt-in mHC fast path is not yet semantic-safe.
+- Eager DeepSeek V4 smoke and later CUDA Graph runs are semantically correct with
+  the current default `VLLM_SM70_MHC_FAST=1`; setting it to `0` is now a fallback
+  A/B mode and materially lowers decode throughput.
 - FlashMLA sparse backend and sparse runtime gate already accept SM70, and `_flashmla_C` can be built from the local FlashMLA source.
 - CUDA Graph design says FlashMLA sparse supports uniform batches, so the first production target should be `FULL_DECODE_ONLY`: eager prefill plus full CUDA Graph replay for uniform decode.
 
@@ -32,8 +34,9 @@
   - Keep SM70 decode fallback workspaces graph-stable and avoid graph-capture-host sync in decode.
 - Modify when capture exposes a blocker: `vllm/model_executor/layers/deepseek_compressor.py`
   - Keep prefill-only torch fallbacks outside the decode graph path; replace decode-time host-sync loops only if the capture trace proves they execute during decode capture.
-- Modify when performance canary passes: `vllm/model_executor/layers/mhc.py`
-  - Keep `VLLM_SM70_MHC_FAST=0` as default until exact canaries prove the fast path is semantically equivalent under full-model decode.
+- Modify when performance canary fails: `vllm/model_executor/layers/mhc.py`
+  - Keep `VLLM_SM70_MHC_FAST=1` as the current validated default. Use
+    `VLLM_SM70_MHC_FAST=0` only for fallback A/B or rollback tests.
 - Modify: `docs/models/supported_models.md`
   - Extend the local SM70 note with CUDA Graph launch and acceptance boundaries after successful validation.
 
@@ -50,7 +53,7 @@ export FLASH_MLA_ENABLE_SM70=1
 export FLASH_MLA_DISABLE_SM100=1
 export TORCH_CUDA_ARCH_LIST=7.0
 export VLLM_USE_V1=1
-export VLLM_SM70_MHC_FAST=0
+export VLLM_SM70_MHC_FAST=1
 ```
 
 The initial CUDA Graph server launch must remove `--enforce-eager` and use:
@@ -258,7 +261,7 @@ Run:
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 CUDA_VISIBLE_DEVICES=2,3,4,5,6,8,7,9 \
 VLLM_USE_V1=1 \
-VLLM_SM70_MHC_FAST=0 \
+VLLM_SM70_MHC_FAST=1 \
 python -m vllm.entrypoints.openai.api_server \
   --model /mnt/data6/models/DeepSeek-V4-Flash \
   --served-model-name /mnt/data6/models/DeepSeek-V4-Flash \
@@ -297,7 +300,7 @@ Stop the eager server, then run:
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 CUDA_VISIBLE_DEVICES=2,3,4,5,6,8,7,9 \
 VLLM_USE_V1=1 \
-VLLM_SM70_MHC_FAST=0 \
+VLLM_SM70_MHC_FAST=1 \
 VLLM_LOGGING_LEVEL=DEBUG \
 python -m vllm.entrypoints.openai.api_server \
   --model /mnt/data6/models/DeepSeek-V4-Flash \
@@ -380,7 +383,9 @@ Prefer these fixes by failure class:
 - For decode fallback allocations, route through `current_workspace_manager().get_simultaneous(...)` and keep tensor shapes tied to captured `BatchDescriptor`.
 - For decode-time host sync, replace `.item()`/Python loops with Triton or tensorized code only on the path proven to execute during decode capture.
 - For NCCL/all-reduce capture failures, use the existing vLLM graph-capture communicator path instead of introducing a separate synchronization primitive.
-- For mHC semantic mismatch, keep `VLLM_SM70_MHC_FAST=0` as default and repair the opt-in fast path under a full-model semantic canary before enabling it.
+- For an mHC semantic mismatch, explicitly set `VLLM_SM70_MHC_FAST=0` as a
+  rollback/fallback A/B mode, then repair the fast path under a full-model
+  semantic canary before restoring the validated default.
 
 - [x] **Step 4: Re-run the focused test and graph server smoke**
 
@@ -490,8 +495,9 @@ Append to `docs/models/supported_models.md`:
 ```markdown
 CUDA Graph note for local SM70: DeepSeek V4 Flash on V100 is validated first
 with eager prefill and `FULL_DECODE_ONLY` decode graphs. Use
-`VLLM_SM70_MHC_FAST=0` unless the exact `ZX-42` canary and identity smoke both
-pass after enabling the opt-in mHC fast path.
+the default `VLLM_SM70_MHC_FAST=1` path after the exact `ZX-42` canary and
+identity smoke both pass. Set `VLLM_SM70_MHC_FAST=0` only for fallback A/B or
+rollback comparison, because it materially lowers decode throughput.
 ```
 
 Run:
