@@ -72,11 +72,21 @@ def _build_kernel_factory():
         threads: int = 128,
         has_sink: bool = True,
         has_topk_length: bool = True,
+        output_dtype_str: str = "float16",
     ):
         """Emit a fresh JIT-compiled TileLang kernel for the given config.
 
         Argument order matches the @tilelang.jit outputs contract:
           Q, KV, Indices, Sink, TopkLen  ->  Output, MaxLogits, Lse
+
+        `output_dtype_str` ∈ {"float16", "bfloat16"}:
+          - fp16: kernel emits fp16 Output; wrapper casts to bf16
+            externally (extra ~330 ms torch copy kernel per prefill
+            in the DSv4F e2e workload).
+          - bf16: kernel emits bf16 Output directly, saving the extra
+            copy. Q/KV inputs are still fp16 (that conversion stays in
+            the wrapper since inline Cast on the hot KV-gather loop
+            breaks tilelang's layout optimization — tested, 3x slower).
         """
         assert dim == tilelang.math.next_power_of_2(dim)
         assert tail_dim == 0 or tail_dim == tilelang.math.next_power_of_2(tail_dim)
@@ -104,7 +114,8 @@ def _build_kernel_factory():
         lse_shape = [batch, seq_len, heads]
         indices_dtype = T.int32
         topk_len_dtype = T.int32
-        dtype = T.float16
+        dtype = T.float16  # Q/KV I/O and smem compute dtype
+        out_dtype = T.bfloat16 if output_dtype_str == "bfloat16" else T.float16
         accum_dtype = T.float32
         _shape_refs = (
             q_shape, kv_shape, indices_shape, sink_shape,
@@ -135,7 +146,7 @@ def _build_kernel_factory():
             Indices: T.Tensor(indices_shape, indices_dtype),
             Sink: T.Tensor(sink_shape, accum_dtype),
             TopkLen: T.Tensor(topk_len_shape, topk_len_dtype),
-            Output: T.Tensor(o_shape, dtype),
+            Output: T.Tensor(o_shape, out_dtype),
             MaxLogits: T.Tensor(max_shape, accum_dtype),
             Lse: T.Tensor(lse_shape, accum_dtype),
         ):
@@ -265,7 +276,14 @@ def _build_kernel_factory():
                 for h_i, d_i in T.Parallel(H_per_block, D):
                     acc_o[h_i, d_i] = acc_o[h_i, d_i] / sumexp[h_i]
 
-                T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+                # Output store: fp32 acc_o -> out_dtype HBM directly
+                # (fold bf16 cast into the kernel when out_dtype=bf16).
+                if output_dtype_str == "bfloat16":
+                    for h_i, d_i in T.Parallel(H_per_block, D):
+                        Output[b_i, s_i, H0 + h_i, d_i] = T.Cast(
+                            out_dtype, acc_o[h_i, d_i])
+                else:
+                    T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
 
         return main
 
@@ -287,25 +305,28 @@ def _get_kernel(
     block_I: int,
     num_stages: int,
     threads: int,
+    output_dtype_str: str = "float16",
 ):
     global _KERNEL_FACTORY
     if _KERNEL_FACTORY is None:
         _KERNEL_FACTORY = _build_kernel_factory()
     key = (heads, dim, tail_dim, topk, sm_scale, has_sink,
-           has_topk_length, block_I, num_stages, threads)
+           has_topk_length, block_I, num_stages, threads,
+           output_dtype_str)
     if key not in _KERNEL_CACHE:
         logger.info(
             "TileLang sparse MLA: JIT compiling for "
             "heads=%d dim=%d tail=%d topk=%d sink=%s topk_len=%s "
-            "(BI=%d stages=%d threads=%d) — takes ~45s",
+            "out=%s (BI=%d stages=%d threads=%d) — takes ~45s",
             heads, dim, tail_dim, topk, has_sink, has_topk_length,
-            block_I, num_stages, threads,
+            output_dtype_str, block_I, num_stages, threads,
         )
         _KERNEL_CACHE[key] = _KERNEL_FACTORY(
             heads=heads, dim=dim, tail_dim=tail_dim, topk=topk,
             sm_scale=sm_scale, block_I=block_I, num_stages=num_stages,
             threads=threads, has_sink=has_sink,
             has_topk_length=has_topk_length,
+            output_dtype_str=output_dtype_str,
         )
         logger.info("TileLang sparse MLA: compile complete")
     return _KERNEL_CACHE[key]
@@ -337,6 +358,11 @@ def flash_mla_sparse_fwd_tilelang(
     assert tail_dim in (0, 64), f"unsupported tail_dim {tail_dim}"
 
     input_dtype = q.dtype
+    # Q/KV go in as fp16 (V100 MMA requirement). Output goes out as
+    # the input dtype directly when bf16 — fold the bf16 cast into
+    # the kernel's final store (saves ~330 ms torch copy kernel per
+    # prefill at the DSv4F production shape).
+    output_dtype_str = "bfloat16" if input_dtype == torch.bfloat16 else "float16"
     q_fp16 = q.to(torch.float16) if q.dtype != torch.float16 else q
     kv_fp16 = kv.to(torch.float16) if kv.dtype != torch.float16 else kv
 
@@ -363,6 +389,7 @@ def flash_mla_sparse_fwd_tilelang(
         sm_scale=sm_scale, has_sink=has_sink,
         has_topk_length=has_topk_length,
         block_I=block_I, num_stages=num_stages, threads=threads,
+        output_dtype_str=output_dtype_str,
     )
 
     out_tl, max_tl, lse_tl = kernel(
@@ -372,7 +399,10 @@ def flash_mla_sparse_fwd_tilelang(
     max_logits = max_tl.squeeze(0)
     lse = lse_tl.squeeze(0)
 
-    if input_dtype != torch.float16:
+    # If output_dtype_str="bfloat16", output is already bf16 from the
+    # kernel; no cast needed. Only cast when we asked for fp16 output
+    # but caller wanted something else.
+    if output_dtype_str == "float16" and input_dtype != torch.float16:
         output = output.to(input_dtype)
 
     if out is not None:
