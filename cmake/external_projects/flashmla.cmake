@@ -177,6 +177,12 @@ if(FLASHMLA_HAS_SM70)
         list(APPEND FlashMLA_SM70_COMPILE_DEFINITIONS FLASH_MLA_METER_QK_SUB)
         message(STATUS "FlashMLA SM70: QK sub-stage metering ENABLED")
     endif()
+
+    # Opt-in s4a sub-stage metering (5 slots inside the PV MMA dim_group loop).
+    if(DEFINED ENV{FLASH_MLA_METER_S4A_SUB} AND "$ENV{FLASH_MLA_METER_S4A_SUB}" MATCHES "^(1|true|TRUE|yes|YES|on|ON)$")
+        list(APPEND FlashMLA_SM70_COMPILE_DEFINITIONS FLASH_MLA_METER_S4A_SUB)
+        message(STATUS "FlashMLA SM70: s4a sub-stage metering ENABLED")
+    endif()
 endif()
 
 # Vendor FlashMLA interface into vLLM with torch-ops shim.
