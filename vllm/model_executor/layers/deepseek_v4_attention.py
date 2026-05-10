@@ -3062,28 +3062,44 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         _kv_lora = getattr(_hf, "kv_lora_rank", 512)
                         _rope = getattr(_hf, "qk_rope_head_dim", 64)
 
-                        # H16 prewarm widening: cover the most common
-                        # combined_topk values the dispatcher can hit.
-                        # combined_topk = ceil((topk + window_size) / 128) * 128
-                        # so 128-multiples are the only possibility. The
-                        # dispatcher now falls back to FlashMLA on
-                        # uncached shapes, so prewarm only targets the
-                        # most-likely values to cap startup time.
+                        # H18 prewarm list: DSv4F has three combined_topk
+                        # paths, chosen by the layer's compress_ratio.
+                        # `top_k` does NOT depend on input length; it
+                        # comes from the topk_indices buffer width, which
+                        # is a model-config constant per layer type.
                         #
-                        # Observed runtime values for DSv4F at
-                        # VLLM_DEEPSEEK_V4_INDEXER_TOPK=256:
-                        #   topk=128  — SWA-only / small chunks
-                        #   topk=384  — main MLA path (256 + 128 window)
-                        #   topk=640  — decode-fallback / extended window
-                        _topk_guess = envs.VLLM_DEEPSEEK_V4_INDEXER_TOPK or 256
+                        #   compress_ratio=0 / SWA-only / decode fallback:
+                        #     top_k=0 (uses swa_indices directly)
+                        #     -> combined_topk = window_size-aligned = 128
+                        #   compress_ratio=128 (C128A):
+                        #     top_k = c128a_max_compressed
+                        #            = ceil(max_model_len/128/128)*128
+                        #     -> combined_topk = ceil((that+window)/128)*128
+                        #   compress_ratio=4 (MLA main):
+                        #     top_k = topk_indices_buffer.shape[-1]
+                        #            = config.index_topk
+                        #       (NOT the VLLM env override — that controls
+                        #        the indexer's selection count, not the
+                        #        buffer width that ends up passed to
+                        #        flash_mla_sparse_fwd as `topk`.)
+                        #     -> combined_topk = ceil((index_topk+window)/128)*128
+                        _hf_index_topk = getattr(_hf, "index_topk", 512)
+                        _max_model_len = _vllm_cfg.model_config.max_model_len
                         _mla_combined = (
-                            (_topk_guess + self.window_size + 127) // 128 * 128
+                            (_hf_index_topk + self.window_size + 127)
+                            // 128 * 128
+                        )
+                        _c128a_compressed = (
+                            (_max_model_len // 128 + 127) // 128 * 128
+                        )
+                        _c128a_combined = (
+                            (_c128a_compressed + self.window_size + 127)
+                            // 128 * 128
                         )
                         _prewarm_topks = sorted({
-                            128,              # SWA-only / small chunks
-                            256,              # observed: smaller prefill chunks
-                            _mla_combined,    # main MLA path (usually 384)
-                            _mla_combined + 256,  # fallback (usually 640)
+                            128,                 # SWA-only / decode fallback
+                            _c128a_combined,     # C128A path
+                            _mla_combined,       # MLA main path
                         })
                         for _topk_v in _prewarm_topks:
                             for _d_qk in (_kv_lora + _rope, _kv_lora):
