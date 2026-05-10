@@ -110,6 +110,9 @@ if TYPE_CHECKING:
     VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE: bool = True
     VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB: bool = False
     VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS: int = 4
+    VLLM_SM70_USE_TILELANG_SPARSE_PREFILL: bool = False
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_BI: int = 16
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS: int = 128
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -963,6 +966,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # under CUDA-graph decode (grid=1 degenerate). Default 4.
     "VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS": lambda: int(
         os.getenv("VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS", "4")
+    ),
+    # H15: if set, route `flash_mla_sparse_fwd` through the TileLang
+    # kernel that batches all 64 query heads per block. On V100 (sm70)
+    # the DSv4F production shape (s_q=1803, h_q=64, topk=256) runs
+    # ~3x faster than the hand-tuned FlashMLA SM70 path.
+    # Requires `tilelang` package and a patched tl_templates/cuda/common.h
+    # (see `.kiro/.../patches/patch_tilelang_sm70_bf16_fma2.py`).
+    "VLLM_SM70_USE_TILELANG_SPARSE_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM70_USE_TILELANG_SPARSE_PREFILL", "0"))
+    ),
+    # TileLang sparse MLA tile width (per-tile KV rows). Only BI=16 is
+    # validated on V100; larger values OOM smem, smaller values violate
+    # the SM70 MMA macro's N >= 16 constraint.
+    "VLLM_SM70_TILELANG_SPARSE_PREFILL_BI": lambda: int(
+        os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_BI", "16")
+    ),
+    # TileLang sparse MLA threads per block. 128 is the validated
+    # setting on V100.
+    "VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS": lambda: int(
+        os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS", "128")
     ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (

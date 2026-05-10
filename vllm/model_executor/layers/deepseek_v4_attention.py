@@ -3040,6 +3040,38 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         self.kv_cache = torch.tensor([])
 
+        # H15: TileLang sparse prefill prewarm (avoids ~45s stall on first prefill).
+        if envs.VLLM_SM70_USE_TILELANG_SPARSE_PREFILL:
+            from vllm.platforms import current_platform as _current_platform
+            if _current_platform.is_device_capability_family(70):
+                try:
+                    from vllm.v1.attention.ops.tilelang_sparse_prefill import (
+                        is_tilelang_available,
+                        prewarm_tilelang_sparse_fwd,
+                    )
+                    ok, _ = is_tilelang_available()
+                    if ok:
+                        _topk_guess = envs.VLLM_DEEPSEEK_V4_INDEXER_TOPK or 256
+                        _aligned_topk = (
+                            (_topk_guess + self.window_size + 127) // 128 * 128
+                        )
+                        prewarm_tilelang_sparse_fwd(
+                            heads=self.padded_heads,
+                            d_qk=head_dim,
+                            d_v=512,
+                            topk=_aligned_topk,
+                            device=attn_sink.device,
+                            dtype=torch.bfloat16,
+                            block_I=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI,
+                            threads=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS,
+                        )
+                except Exception as exc:  # pragma: no cover - best-effort
+                    logger.warning(
+                        "TileLang sparse prefill prewarm failed: %s. "
+                        "Falling back to first-call JIT (may cause ~45s stall).",
+                        exc,
+                    )
+
         # Prefill CUDA graph dispatcher (partial capture of attention kernel)
         self._prefill_graph_dispatcher: PrefillGraphDispatcher | None = None
         if _PREFILL_CUDAGRAPH_ENABLED:
