@@ -1115,7 +1115,6 @@ class DeepseekV4Attention(nn.Module):
             max_position=self.max_position_embeddings,
             rope_parameters=rope_parameters,
             is_neox_style=False,
-            dtype=config.torch_dtype,
         )
 
         self.indexer = None
@@ -1185,6 +1184,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream] | None = None,
     ):
         super().__init__()
+
+        # Lazy import to avoid top-level tilelang dependency.
+        # Registers both torch.ops.vllm.mhc_pre and mhc_post.
+        # Moved here from hc_head() forward to ensure the ops are
+        # registered before AOT compile cache loads a graph that
+        # references them (#41090).
+        import vllm.model_executor.layers.mhc  # noqa: F401
+
         config = vllm_config.model_config.hf_config
         self.prefix = prefix
         self.hidden_size = config.hidden_size
@@ -1258,11 +1265,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        # Lazy import to avoid top-level tilelang dependency.
-        # Registers both torch.ops.vllm.mhc_pre and mhc_post,
-        # so hc_post() doesn't need its own import.
-        import vllm.model_executor.layers.mhc  # noqa: F401
-
         post_mix, res_mix, layer_input = torch.ops.vllm.mhc_pre(
             residual=x,
             fn=hc_fn,
