@@ -164,6 +164,13 @@ if(FLASHMLA_HAS_SM70)
         list(APPEND FlashMLA_SM70_COMPILE_DEFINITIONS FLASH_MLA_METER_SPARSE_WS_HPB)
         message(STATUS "FlashMLA SM70: per-stage metering ENABLED")
     endif()
+
+    # Opt-in FINE-grained (12-slot) metering. Can stack with the 6-slot
+    # version; the two sets of counters are independent.
+    if(DEFINED ENV{FLASH_MLA_METER_SPARSE_WS_HPB_FINE} AND "$ENV{FLASH_MLA_METER_SPARSE_WS_HPB_FINE}" MATCHES "^(1|true|TRUE|yes|YES|on|ON)$")
+        list(APPEND FlashMLA_SM70_COMPILE_DEFINITIONS FLASH_MLA_METER_SPARSE_WS_HPB_FINE)
+        message(STATUS "FlashMLA SM70: per-stage FINE metering ENABLED")
+    endif()
 endif()
 
 # Vendor FlashMLA interface into vLLM with torch-ops shim.
