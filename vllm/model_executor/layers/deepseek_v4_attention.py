@@ -3051,25 +3051,39 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     )
                     ok, _ = is_tilelang_available()
                     if ok:
+                        # Two d_qk variants occur in the DSv4F prefill path:
+                        #   - d_qk = kv_lora + rope = 576: main MLA-absorbed
+                        #     sparse prefill
+                        #   - d_qk = kv_lora = 512: some code paths (e.g. the
+                        #     SWA-only / fallback path) pass head_dim-sized Q
+                        # Compile both so first-prefill doesn't JIT-stall.
+                        _vllm_cfg = get_current_vllm_config()
+                        _hf = _vllm_cfg.model_config.hf_config
+                        _kv_lora = getattr(_hf, "kv_lora_rank", 512)
+                        _rope = getattr(_hf, "qk_rope_head_dim", 64)
+
                         _topk_guess = envs.VLLM_DEEPSEEK_V4_INDEXER_TOPK or 256
                         _aligned_topk = (
                             (_topk_guess + self.window_size + 127) // 128 * 128
                         )
-                        prewarm_tilelang_sparse_fwd(
-                            heads=self.padded_heads,
-                            d_qk=head_dim,
-                            d_v=512,
-                            topk=_aligned_topk,
-                            device=attn_sink.device,
-                            dtype=torch.bfloat16,
-                            block_I=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI,
-                            threads=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS,
-                        )
+                        for _d_qk in (_kv_lora + _rope, _kv_lora):
+                            prewarm_tilelang_sparse_fwd(
+                                heads=self.padded_heads,
+                                d_qk=_d_qk,
+                                d_v=512,
+                                topk=_aligned_topk,
+                                device=attn_sink.device,
+                                dtype=torch.bfloat16,
+                                block_I=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI,
+                                threads=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS,
+                            )
                 except Exception as exc:  # pragma: no cover - best-effort
                     logger.warning(
-                        "TileLang sparse prefill prewarm failed: %s. "
-                        "Falling back to first-call JIT (may cause ~45s stall).",
-                        exc,
+                        "TileLang sparse prefill prewarm failed: %s: %s "
+                        "(traceback above). Falling back to first-call JIT "
+                        "(may cause ~45s stall OR fail inside CUDA graph).",
+                        type(exc).__name__, str(exc) or "<no message>",
+                        exc_info=True,
                     )
 
         # Prefill CUDA graph dispatcher (partial capture of attention kernel)

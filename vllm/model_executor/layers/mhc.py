@@ -15,11 +15,18 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 # tilelang is only available on CUDA platforms.  Keep a torch fallback available
 # for correctness smoke on systems without tilelang or DeepGEMM.
+# NOTE: `mhc_post_tilelang` below uses `T.pdl_sync()` / `T.pdl_trigger()` which
+# require SM90+ Programmatic Dependent Launch. On SM70 (Volta), these calls
+# fail TileLang's MarkCudaSyncCalls check. Treat SM70 as "tilelang not
+# available for mhc" so the dedicated SM70 fast path is used instead; this
+# does not affect other tilelang paths (e.g. sparse_prefill) that live in
+# their own modules.
 _TILELANG_AVAILABLE = False
 if TYPE_CHECKING:
     import tilelang
     import tilelang.language as T
-elif current_platform.is_cuda_alike() and has_tilelang():
+elif current_platform.is_cuda_alike() and has_tilelang() \
+        and not current_platform.is_device_capability_family(70):
     import tilelang
     import tilelang.language as T
 

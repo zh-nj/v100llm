@@ -54,6 +54,7 @@ def _build_kernel_factory():
 
     @tilelang.jit(
         out_idx=[-3, -2, -1],
+        target="cuda -arch=sm_70",
         pass_configs={
             tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -78,13 +79,15 @@ def _build_kernel_factory():
           Q, KV, Indices, Sink, TopkLen  ->  Output, MaxLogits, Lse
         """
         assert dim == tilelang.math.next_power_of_2(dim)
-        assert tail_dim == tilelang.math.next_power_of_2(tail_dim)
+        assert tail_dim == 0 or tail_dim == tilelang.math.next_power_of_2(tail_dim)
         assert topk % block_I == 0
         if sm_scale is None:
             sm_scale = (1.0 / (dim + tail_dim)) ** 0.5
 
         LOG2E = 1.4426950408889634
         sm_scale_log2 = sm_scale * LOG2E
+
+        has_tail = tail_dim > 0
 
         batch = T.dynamic("batch")
         seq_len = T.dynamic("seq_len")
@@ -140,9 +143,11 @@ def _build_kernel_factory():
                 seq_len * REPLICATE_H, batch, kv_group, threads=threads
             ) as (bx, by, bz):
                 Q_shared = T.alloc_shared([H_per_block, D], dtype)
-                Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
                 KV_shared = T.alloc_shared([BI, D], dtype)
-                K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+                if has_tail:
+                    Q_tail_shared = T.alloc_shared(
+                        [H_per_block, D_tail], dtype)
+                    K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
                 mask = T.alloc_fragment([BI], "bool")
 
                 acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
@@ -167,7 +172,8 @@ def _build_kernel_factory():
                 H1 = H0 + H_per_block
 
                 T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
-                T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+                if has_tail:
+                    T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
 
                 tl_cur = T.alloc_fragment([1], topk_len_dtype)
                 if has_topk_length:
@@ -188,13 +194,14 @@ def _build_kernel_factory():
                         idx_clamped = T.if_then_else(
                             mask[bi_i], idx_raw, 0)
                         KV_shared[bi_i, d_i] = KV[b_i, idx_clamped, g_i, d_i]
-                    for bi_i, d_i in T.Parallel(BI, D_tail):
-                        idx_raw = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
-                        idx_clamped = T.if_then_else(
-                            mask[bi_i], idx_raw, 0)
-                        K_tail_shared[bi_i, d_i] = KV[
-                            b_i, idx_clamped, g_i, D + d_i
-                        ]
+                    if has_tail:
+                        for bi_i, d_i in T.Parallel(BI, D_tail):
+                            idx_raw = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
+                            idx_clamped = T.if_then_else(
+                                mask[bi_i], idx_raw, 0)
+                            K_tail_shared[bi_i, d_i] = KV[
+                                b_i, idx_clamped, g_i, D + d_i
+                            ]
 
                     for h_i, bi_i in T.Parallel(H_per_block, BI):
                         acc_s[h_i, bi_i] = T.if_then_else(
@@ -204,11 +211,12 @@ def _build_kernel_factory():
                         transpose_B=True,
                         policy=T.GemmWarpPolicy.FullRow,
                     )
-                    T.gemm(
-                        Q_tail_shared, K_tail_shared, acc_s,
-                        transpose_B=True,
-                        policy=T.GemmWarpPolicy.FullRow,
-                    )
+                    if has_tail:
+                        T.gemm(
+                            Q_tail_shared, K_tail_shared, acc_s,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullRow,
+                        )
                     T.copy(m_i, m_i_prev)
                     T.reduce_max(acc_s, m_i, dim=1, clear=False)
                     for h_i in T.Parallel(H_per_block):
