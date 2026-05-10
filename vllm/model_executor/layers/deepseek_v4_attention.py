@@ -3062,21 +3062,41 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         _kv_lora = getattr(_hf, "kv_lora_rank", 512)
                         _rope = getattr(_hf, "qk_rope_head_dim", 64)
 
+                        # H16 prewarm widening: cover the most common
+                        # combined_topk values the dispatcher can hit.
+                        # combined_topk = ceil((topk + window_size) / 128) * 128
+                        # so 128-multiples are the only possibility. The
+                        # dispatcher now falls back to FlashMLA on
+                        # uncached shapes, so prewarm only targets the
+                        # most-likely values to cap startup time.
+                        #
+                        # Observed runtime values for DSv4F at
+                        # VLLM_DEEPSEEK_V4_INDEXER_TOPK=256:
+                        #   topk=128  — SWA-only / small chunks
+                        #   topk=384  — main MLA path (256 + 128 window)
+                        #   topk=640  — decode-fallback / extended window
                         _topk_guess = envs.VLLM_DEEPSEEK_V4_INDEXER_TOPK or 256
-                        _aligned_topk = (
+                        _mla_combined = (
                             (_topk_guess + self.window_size + 127) // 128 * 128
                         )
-                        for _d_qk in (_kv_lora + _rope, _kv_lora):
-                            prewarm_tilelang_sparse_fwd(
-                                heads=self.padded_heads,
-                                d_qk=_d_qk,
-                                d_v=512,
-                                topk=_aligned_topk,
-                                device=attn_sink.device,
-                                dtype=torch.bfloat16,
-                                block_I=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI,
-                                threads=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS,
-                            )
+                        _prewarm_topks = sorted({
+                            128,              # SWA-only / small chunks
+                            256,              # observed: smaller prefill chunks
+                            _mla_combined,    # main MLA path (usually 384)
+                            _mla_combined + 256,  # fallback (usually 640)
+                        })
+                        for _topk_v in _prewarm_topks:
+                            for _d_qk in (_kv_lora + _rope, _kv_lora):
+                                prewarm_tilelang_sparse_fwd(
+                                    heads=self.padded_heads,
+                                    d_qk=_d_qk,
+                                    d_v=512,
+                                    topk=_topk_v,
+                                    device=attn_sink.device,
+                                    dtype=torch.bfloat16,
+                                    block_I=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI,
+                                    threads=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS,
+                                )
                 except Exception as exc:  # pragma: no cover - best-effort
                     logger.warning(
                         "TileLang sparse prefill prewarm failed: %s: %s "

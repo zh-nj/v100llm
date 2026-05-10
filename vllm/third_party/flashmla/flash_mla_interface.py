@@ -236,17 +236,37 @@ def flash_mla_sparse_fwd(
             from vllm.v1.attention.ops.tilelang_sparse_prefill import (
                 flash_mla_sparse_fwd_tilelang,
                 is_tilelang_available,
+                is_tilelang_sparse_fwd_cached,
             )
             ok, reason = is_tilelang_available()
             if ok:
                 block_I = getattr(envs, "VLLM_SM70_TILELANG_SPARSE_PREFILL_BI", 16)
                 threads = getattr(
                     envs, "VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS", 128)
-                return flash_mla_sparse_fwd_tilelang(
+                # Check cache before calling: if not cached, fall through
+                # to FlashMLA rather than JIT-stall (45 s) or crash
+                # inside a CUDA-graph-captured frame.
+                cached = is_tilelang_sparse_fwd_cached(
                     q, kv, indices, sm_scale, d_v,
-                    attn_sink=attn_sink, topk_length=topk_length, out=out,
+                    attn_sink=attn_sink, topk_length=topk_length,
                     block_I=block_I, threads=threads,
                 )
+                if cached:
+                    return flash_mla_sparse_fwd_tilelang(
+                        q, kv, indices, sm_scale, d_v,
+                        attn_sink=attn_sink, topk_length=topk_length, out=out,
+                        block_I=block_I, threads=threads,
+                    )
+                else:
+                    import warnings
+                    warnings.warn(
+                        "TileLang sparse prefill cache miss for shape "
+                        f"s_q={q.shape[0]} h_q={q.shape[1]} d_qk={q.shape[2]} "
+                        f"topk={indices.shape[-1]} (dtype={q.dtype}). "
+                        "Falling back to FlashMLA. Consider extending the "
+                        "prewarm topk list in DeepseekV4MLAAttention.__init__.",
+                        stacklevel=2,
+                    )
             else:
                 import warnings
                 warnings.warn(

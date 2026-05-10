@@ -332,6 +332,69 @@ def _get_kernel(
     return _KERNEL_CACHE[key]
 
 
+def _is_kernel_cached(
+    heads: int,
+    dim: int,
+    tail_dim: int,
+    topk: int,
+    sm_scale: float,
+    has_sink: bool,
+    has_topk_length: bool,
+    block_I: int,
+    num_stages: int,
+    threads: int,
+    output_dtype_str: str = "float16",
+) -> bool:
+    """Return True if a compiled kernel for this config is in the cache.
+
+    Used by the dispatcher to detect cache misses without triggering
+    an expensive JIT compile inside a CUDA-graph-captured frame.
+    """
+    key = (heads, dim, tail_dim, topk, sm_scale, has_sink,
+           has_topk_length, block_I, num_stages, threads,
+           output_dtype_str)
+    return key in _KERNEL_CACHE
+
+
+def is_tilelang_sparse_fwd_cached(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    block_I: int = 16,
+    num_stages: int = 1,
+    threads: int = 128,
+) -> bool:
+    """Public check: would `flash_mla_sparse_fwd_tilelang(q, kv, ...)` hit
+    the kernel cache, or would it trigger a JIT compile?
+
+    The dispatcher uses this to fall back to FlashMLA on cache-miss
+    shapes instead of stalling the request for ~45 s (or failing
+    inside a CUDA-graph-captured frame).
+    """
+    _s_q, h_q, d_qk = q.shape
+    _s_q2, _h_kv, topk = indices.shape
+    dim = d_v
+    tail_dim = d_qk - d_v
+    if tail_dim not in (0, 64):
+        return False
+
+    output_dtype_str = "bfloat16" if q.dtype == torch.bfloat16 else "float16"
+    has_sink = attn_sink is not None
+    has_topk_length = topk_length is not None
+
+    return _is_kernel_cached(
+        heads=h_q, dim=dim, tail_dim=tail_dim, topk=topk,
+        sm_scale=sm_scale, has_sink=has_sink,
+        has_topk_length=has_topk_length,
+        block_I=block_I, num_stages=num_stages, threads=threads,
+        output_dtype_str=output_dtype_str,
+    )
+
+
 def flash_mla_sparse_fwd_tilelang(
     q: torch.Tensor,
     kv: torch.Tensor,
