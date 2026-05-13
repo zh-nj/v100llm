@@ -106,7 +106,13 @@ logger = init_logger(__name__)
 # Prefill is processed in fixed-size chunks; this bounds the bf16 kv-gather
 # workspace allocated at _forward_prefill (and the matching profile-time
 # reservation in attention_impl's dummy-run branch).
-PREFILL_CHUNK_SIZE = 4
+
+
+def _get_prefill_chunk_size() -> int:
+    return max(1, envs.VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE)
+
+
+PREFILL_CHUNK_SIZE = _get_prefill_chunk_size()
 _QK_NOPE_DIM = 448
 _QK_ROPE_DIM = 64
 _QK_FP8_MAX = 448.0

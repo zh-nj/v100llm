@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_PROFILE_PHASE_FILTER: Literal["decode", "prefill", "both"] = "both"
     VLLM_DEEPSEEK_V4_NAN_TRACE: bool = False
     VLLM_DEEPSEEK_V4_INDEXER_TOPK: int = 0
+    VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE: int = 4
     VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE: bool = True
     VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB: bool = True
     VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS: int = 4
@@ -951,6 +952,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep the topk_indices_buffer allocation valid.
     "VLLM_DEEPSEEK_V4_INDEXER_TOPK": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V4_INDEXER_TOPK", "0")
+    ),
+    "VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE", "4")
     ),
     "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", "1"))

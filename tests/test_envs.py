@@ -110,9 +110,22 @@ def test_deepseek_v4_sm70_experimental_envs_are_registered() -> None:
         "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE",
         "VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB",
         "VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS",
+        "VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE",
     }
 
     assert expected_envs.issubset(environment_variables)
+
+
+def test_deepseek_v4_prefill_chunk_size_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE", raising=False)
+
+    assert envs.VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE == 4
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE", "16")
+
+    assert envs.VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE == 16
 
 
 def test_deepseek_v4_sm70_direct_and_mhc_default_on(

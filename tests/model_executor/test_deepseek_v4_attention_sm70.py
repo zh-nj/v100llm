@@ -96,6 +96,17 @@ def test_sm70_attention_output_clamp_keeps_fp16_values_finite():
     assert torch.isnan(out[-1])
 
 
+def test_sm70_prefill_chunk_size_env_overrides_default(monkeypatch):
+    monkeypatch.delenv("VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE", raising=False)
+    assert d4a._get_prefill_chunk_size() == 4
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE", "16")
+    assert d4a._get_prefill_chunk_size() == 16
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE", "0")
+    assert d4a._get_prefill_chunk_size() == 1
+
+
 def test_sm70_fp8_cache_exponents_preserve_upstream_positive_scales():
     exponents = torch.tensor([8.0, 5.0, 1.0, 0.0, -2.0], dtype=torch.float32)
 
