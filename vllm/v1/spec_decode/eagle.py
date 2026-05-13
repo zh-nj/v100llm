@@ -83,6 +83,15 @@ class SpecDecodeBaseProposer:
         self.hidden_size = self.draft_model_config.get_hidden_size()
         self.inputs_embeds_size = self.draft_model_config.get_inputs_embeds_size()
 
+        # DeepSeek V4 MTP consumes the target's pre-hc_head residual stream,
+        # shape (T, hc_mult * hidden_size). Expand the hidden_states buffer
+        # so target_hidden_states fits; detect via draft hf_config.
+        draft_hf_config = self.draft_model_config.hf_config
+        if hasattr(draft_hf_config, "compress_ratios") and hasattr(
+            draft_hf_config, "hc_mult"
+        ):
+            self.hidden_size = self.hidden_size * draft_hf_config.hc_mult
+
         # Unifying eagle, draft model, and parallel drafting support
         self.parallel_drafting: bool = self.speculative_config.parallel_drafting
         self.extra_slots_per_request = (
@@ -1558,6 +1567,10 @@ class SpecDecodeBaseProposer:
         Need this assumption to ensure all drafting layers can use the
         same AttentionMetadata.
         May extend to multiple AttentionMetadata in the future.
+
+        Layers whose ``get_kv_cache_spec`` returns ``None`` (e.g. DeepseekV4
+        ``compress_ratio==1`` MLA dispatch layers, where the actual KV is
+        stored on a sibling SWA cache) are not in any group; skip them.
         """
         kv_cache_groups: dict[str, int] = {}
         for id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
@@ -1569,10 +1582,11 @@ class SpecDecodeBaseProposer:
                     [
                         kv_cache_groups[layer_name]
                         for layer_name in self._draft_attn_layer_names
+                        if layer_name in kv_cache_groups
                     ]
                 )
             )
-            == 1
+            <= 1
         ), "All drafting layers should belong to the same kv cache group"
 
     def initialize_attn_backend(
@@ -1600,7 +1614,17 @@ class SpecDecodeBaseProposer:
 
         attention_groups: dict[tuple[str, str], AttentionGroup] = {}
         if kv_cache_spec is not None:
+            # Match the group we belong to, then only process layers actually
+            # registered in that group. Layers whose ``get_kv_cache_spec``
+            # returns ``None`` (e.g. DeepseekV4 ``compress_ratio==1`` MLA
+            # dispatch layers backed by sibling SWA cache) appear in
+            # ``self._draft_attn_layer_names`` but not in any group; skip them.
+            group_layer_names = set(
+                kv_cache_config.kv_cache_groups[self.kv_cache_gid].layer_names
+            )
             for layer_name in self._draft_attn_layer_names:
+                if layer_name not in group_layer_names:
+                    continue
                 attn_backend = all_attn_layers[layer_name].get_attn_backend()
                 backend_key = attn_backend.full_cls_name()
                 if backend_key not in attention_groups:

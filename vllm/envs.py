@@ -108,9 +108,9 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_NAN_TRACE: bool = False
     VLLM_DEEPSEEK_V4_INDEXER_TOPK: int = 0
     VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE: bool = True
-    VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB: bool = False
+    VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB: bool = True
     VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS: int = 4
-    VLLM_SM70_USE_TILELANG_SPARSE_PREFILL: bool = False
+    VLLM_SM70_USE_TILELANG_SPARSE_PREFILL: bool = True
     VLLM_SM70_TILELANG_SPARSE_PREFILL_BI: int = 16
     VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS: int = 128
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
@@ -254,7 +254,7 @@ if TYPE_CHECKING:
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
-    VLLM_MOE_EARLY_SHARED_EXPERTS_STREAM: bool = False
+    VLLM_MOE_EARLY_SHARED_EXPERTS_STREAM: bool = True
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
@@ -974,7 +974,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Requires `tilelang` package and a patched tl_templates/cuda/common.h
     # (see `.kiro/.../patches/patch_tilelang_sm70_bf16_fma2.py`).
     "VLLM_SM70_USE_TILELANG_SPARSE_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_SM70_USE_TILELANG_SPARSE_PREFILL", "0"))
+        int(os.getenv("VLLM_SM70_USE_TILELANG_SPARSE_PREFILL", "1"))
     ),
     # TileLang sparse MLA tile width (per-tile KV rows). Only BI=16 is
     # validated on V100; larger values OOM smem, smaller values violate
@@ -1672,10 +1672,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Launches MoE shared_experts on the auxiliary stream before routed expert
     # GEMMs, then joins after routed experts finish. This forms a real CUDA
-    # graph branch but can hurt full-GPU decode when both branches contend for
-    # tensor cores, so it is opt-in.
+    # graph branch. It can be disabled for debugging or regressions.
     "VLLM_MOE_EARLY_SHARED_EXPERTS_STREAM": lambda: bool(
-        int(os.getenv("VLLM_MOE_EARLY_SHARED_EXPERTS_STREAM", "0"))
+        int(os.getenv("VLLM_MOE_EARLY_SHARED_EXPERTS_STREAM", "1"))
     ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream
@@ -1826,6 +1825,20 @@ def compile_factors() -> dict[str, object]:
     ignored_factors: set[str] = {
         "MAX_JOBS",
         "VLLM_RPC_BASE_PATH",
+        # DSv4F profiling env vars are observability-only: they gate NVTX
+        # and CUDA-event timing paths inside DeepseekV4 attention/model.
+        # They must NOT change compile-cache keys, otherwise flipping the
+        # profile flag on a warm cache forces a full recompile (which
+        # also fails under torch.compile because NVTX range_push isn't
+        # Dynamo-traceable; code was patched to skip NVTX under compile).
+        "VLLM_DEEPSEEK_V4_PROFILE",
+        "VLLM_DEEPSEEK_V4_PROFILE_NVTX",
+        "VLLM_DEEPSEEK_V4_PROFILE_LOG_EVERY",
+        "VLLM_DEEPSEEK_V4_PROFILE_RAW_PATH",
+        "VLLM_DEEPSEEK_V4_PROFILE_MODE",
+        "VLLM_DEEPSEEK_V4_PROFILE_STEP_LIMIT",
+        "VLLM_DEEPSEEK_V4_PROFILE_PHASE_FILTER",
+        "VLLM_DEEPSEEK_V4_NAN_TRACE",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
         "VLLM_DEBUG_DUMP_PATH",

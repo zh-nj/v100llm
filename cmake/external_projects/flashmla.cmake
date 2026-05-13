@@ -183,6 +183,19 @@ if(FLASHMLA_HAS_SM70)
         list(APPEND FlashMLA_SM70_COMPILE_DEFINITIONS FLASH_MLA_METER_S4A_SUB)
         message(STATUS "FlashMLA SM70: s4a sub-stage metering ENABLED")
     endif()
+
+    # Opt-in decode sparse stage metering (6 stages per tile in the decode kernel).
+    if(DEFINED ENV{FLASH_MLA_METER_SPARSE_DECODE} AND "$ENV{FLASH_MLA_METER_SPARSE_DECODE}" MATCHES "^(1|true|TRUE|yes|YES|on|ON)$")
+        list(APPEND FlashMLA_SM70_COMPILE_DEFINITIONS FLASH_MLA_METER_SPARSE_DECODE)
+        message(STATUS "FlashMLA SM70: decode sparse stage metering ENABLED")
+    endif()
+
+    # Opt-in decode QK sub-stage metering (4 slots inside compute_mma884_qk_group:
+    # load_q, load_k, mma884, store).
+    if(DEFINED ENV{FLASH_MLA_METER_DECODE_QK_SUB} AND "$ENV{FLASH_MLA_METER_DECODE_QK_SUB}" MATCHES "^(1|true|TRUE|yes|YES|on|ON)$")
+        list(APPEND FlashMLA_SM70_COMPILE_DEFINITIONS FLASH_MLA_METER_DECODE_QK_SUB)
+        message(STATUS "FlashMLA SM70: decode QK sub-stage metering ENABLED")
+    endif()
 endif()
 
 # Vendor FlashMLA interface into vLLM with torch-ops shim.

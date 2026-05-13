@@ -1582,7 +1582,6 @@ class DeepseekV4Model(nn.Module):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
 
-
 @torch.compile(backend=current_platform.simple_compile_backend)
 def hc_head(
     hidden_states: torch.Tensor,

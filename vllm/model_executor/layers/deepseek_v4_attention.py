@@ -20,6 +20,9 @@ from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
 
+from vllm.model_executor.layers.deepseek_v4_copy_source_trace import (
+    copy_source_trace,
+)
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
@@ -599,6 +602,16 @@ def _profile_phase(
         return
     use_events = _DEEPSEEK_V4_PROFILE_ENABLED
     use_nvtx = _DEEPSEEK_V4_PROFILE_NVTX
+    # Skip NVTX when being traced by torch.compile / dynamo — Dynamo
+    # cannot trace torch.cuda.nvtx.range_push ("torch.* op returned non-
+    # Tensor"). The NVTX range would only be emitted during compile, not
+    # during real execution, so skipping is safe.
+    if use_nvtx:
+        try:
+            if torch.compiler.is_compiling():
+                use_nvtx = False
+        except AttributeError:
+            pass
     if not use_events and not use_nvtx:
         yield
         return
@@ -682,13 +695,15 @@ def _profile_step(
     ctx.step_token_count = token_count
     pushed_nvtx = False
     if profiling_active and _DEEPSEEK_V4_PROFILE_NVTX and torch.cuda.is_available():
+        # Skip NVTX under torch.compile tracing (Dynamo can't trace range_push).
         try:
-            torch.cuda.nvtx.range_push(
-                f"step[idx={step_idx},type={phase_kind},tokens={token_count}]"
-            )
-            pushed_nvtx = True
-        except Exception:
-            pushed_nvtx = False
+            if not torch.compiler.is_compiling():
+                torch.cuda.nvtx.range_push(
+                    f"step[idx={step_idx},type={phase_kind},tokens={token_count}]"
+                )
+                pushed_nvtx = True
+        except (AttributeError, Exception):
+            pass
     try:
         yield
     finally:
@@ -730,11 +745,12 @@ def _profile_layer(
         and torch.cuda.is_available()
     ):
         try:
-            torch.cuda.nvtx.range_push(
-                f"layer[idx={layer_idx},compress_ratio={compress_ratio}]"
-            )
-            pushed_nvtx = True
-        except Exception:
+            if not torch.compiler.is_compiling():
+                torch.cuda.nvtx.range_push(
+                    f"layer[idx={layer_idx},compress_ratio={compress_ratio}]"
+                )
+                pushed_nvtx = True
+        except (AttributeError, Exception):
             pushed_nvtx = False
     try:
         yield
@@ -748,6 +764,17 @@ def _profile_layer(
 
 
 def _profile_or_null(label: str, ref: torch.Tensor, *, extra: dict | None = None):
+    # This function must return an object that can be used as a context
+    # manager regardless of whether we're under torch.compile tracing.
+    # - Under compile: always return nullcontext() so Dynamo traces a no-op.
+    # - At runtime: optionally return _profile_phase(...) based on env flags.
+    # torch.compiler.is_compiling() is itself safe to call under Dynamo.
+    try:
+        compiling = torch.compiler.is_compiling()
+    except Exception:
+        compiling = False
+    if compiling:
+        return nullcontext()
     if not _DEEPSEEK_V4_PROFILE_ENABLED and not _DEEPSEEK_V4_PROFILE_NVTX:
         return nullcontext()
     return _profile_phase(label, ref, extra=extra)
@@ -1531,12 +1558,14 @@ def _apply_gptj_rope_tail(
     nope_dim = x.shape[-1] - rope_dim
     assert nope_dim >= 0
 
-    out = x.clone().float()
+    with copy_source_trace("qkv_rope.clone_float"):
+        out = x.clone().float()
     rope = out[..., nope_dim:]
     even = rope[..., ::2]
     odd = rope[..., 1::2]
 
-    cos_sin = cos_sin_cache[positions].float()
+    with copy_source_trace("qkv_rope.cos_sin_float"):
+        cos_sin = cos_sin_cache[positions].float()
     view_shape = (positions.shape[0],) + (1,) * (x.ndim - 2) + (half,)
     cos = cos_sin[..., :half].view(view_shape)
     sin = cos_sin[..., half:].view(view_shape)
@@ -1545,7 +1574,8 @@ def _apply_gptj_rope_tail(
     rotated[..., ::2] = even * cos - odd * sin
     rotated[..., 1::2] = odd * cos + even * sin
     out[..., nope_dim:] = rotated
-    return out.to(x.dtype)
+    with copy_source_trace("qkv_rope.output_to_dtype"):
+        return out.to(x.dtype)
 
 
 def _torch_qnorm_rope_kv_insert_fallback(
@@ -1559,10 +1589,13 @@ def _torch_qnorm_rope_kv_insert_fallback(
     block_size: int,
 ) -> None:
     """Torch correctness fallback for SM70, where the fused CUDA op is sm80+."""
-    q_float = q.float()
+    with copy_source_trace("qkv_fallback.q_float"):
+        q_float = q.float()
     variance = q_float.pow(2).mean(dim=-1, keepdim=True)
-    q_norm = (q_float * torch.rsqrt(variance + eps)).to(q.dtype)
-    q.copy_(_apply_gptj_rope_tail(q_norm, positions, cos_sin_cache))
+    with copy_source_trace("qkv_fallback.q_norm_to_dtype"):
+        q_norm = (q_float * torch.rsqrt(variance + eps)).to(q.dtype)
+    with copy_source_trace("qkv_fallback.q_copy_rope"):
+        q.copy_(_apply_gptj_rope_tail(q_norm, positions, cos_sin_cache))
 
     num_tokens = slot_mapping.shape[0]
     if num_tokens == 0:
@@ -1582,7 +1615,8 @@ def _torch_qnorm_rope_kv_insert_fallback(
     block_indices = slots // block_size
     pos_in_block = slots % block_size
 
-    nope = kv_valid[:, :_QK_NOPE_DIM].float()
+    with copy_source_trace("qkv_fallback.kv_nope_float"):
+        nope = kv_valid[:, :_QK_NOPE_DIM].float()
     blocks = nope.view(-1, _QK_NOPE_DIM // _QK_QUANT_BLOCK, _QK_QUANT_BLOCK)
     absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
     exponents = _normalize_sm70_fp8_cache_exponents(
@@ -1590,19 +1624,21 @@ def _torch_qnorm_rope_kv_insert_fallback(
     )
     scales = torch.exp2(exponents)
     fp8_data = (blocks / scales).clamp(-_QK_FP8_MAX, _QK_FP8_MAX)
-    fp8_bytes = (
-        fp8_data.to(torch.float8_e4m3fn)
-        .contiguous()
-        .view(torch.uint8)
-        .view(-1, _QK_NOPE_DIM)
-    )
-    rope_bytes = (
-        kv_valid[:, _QK_NOPE_DIM:]
-        .to(torch.bfloat16)
-        .contiguous()
-        .view(torch.uint8)
-        .view(-1, _QK_ROPE_DIM * 2)
-    )
+    with copy_source_trace("qkv_fallback.kv_fp8_bytes"):
+        fp8_bytes = (
+            fp8_data.to(torch.float8_e4m3fn)
+            .contiguous()
+            .view(torch.uint8)
+            .view(-1, _QK_NOPE_DIM)
+        )
+    with copy_source_trace("qkv_fallback.kv_rope_bf16_bytes"):
+        rope_bytes = (
+            kv_valid[:, _QK_NOPE_DIM:]
+            .to(torch.bfloat16)
+            .contiguous()
+            .view(torch.uint8)
+            .view(-1, _QK_ROPE_DIM * 2)
+        )
     token_data = torch.cat((fp8_bytes, rope_bytes), dim=-1)
 
     num_valid = slots.shape[0]
@@ -1612,7 +1648,12 @@ def _torch_qnorm_rope_kv_insert_fallback(
     )
     k_cache[block_indices[:, None], data_offsets] = token_data
 
-    encoded_scales = (exponents.squeeze(-1) + 127.0).clamp(0, 255).to(torch.uint8)
+    with copy_source_trace("qkv_fallback.kv_scale_to_uint8"):
+        encoded_scales = (
+            (exponents.squeeze(-1) + 127.0)
+            .clamp(0, 255)
+            .to(torch.uint8)
+        )
     scale_data = torch.zeros(
         num_valid,
         _QK_SCALE_BYTES,
@@ -2098,12 +2139,14 @@ def _flashmla_bf16_io(
     q: torch.Tensor,
     output: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    flash_q = q if q.dtype is torch.bfloat16 else q.to(torch.bfloat16)
-    flash_output = (
-        output
-        if output.dtype is torch.bfloat16
-        else torch.empty_like(output, dtype=torch.bfloat16)
-    )
+    with copy_source_trace("flashmla_bf16_io.q_to_bf16"):
+        flash_q = q if q.dtype is torch.bfloat16 else q.to(torch.bfloat16)
+    with copy_source_trace("flashmla_bf16_io.output_alloc_bf16"):
+        flash_output = (
+            output
+            if output.dtype is torch.bfloat16
+            else torch.empty_like(output, dtype=torch.bfloat16)
+        )
     return flash_q, flash_output
 
 
@@ -2112,7 +2155,8 @@ def _copy_flashmla_output(
     output: torch.Tensor,
 ) -> None:
     if flash_output.data_ptr() != output.data_ptr() or flash_output.dtype != output.dtype:
-        output.copy_(flash_output.to(output.dtype))
+        with copy_source_trace("flashmla_bf16_io.output_to_model_dtype"):
+            output.copy_(flash_output.to(output.dtype))
 
 
 def _attention_boundary_output_dtype(
@@ -2468,7 +2512,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # upstream of the partition split and never hits the fp32 RMSNorm path),
         # so use it as the authoritative dtype source.
         # See .kiro/specs/deepseek-v4-flash-compile-path-regression/.
-        hidden_states = ensure_boundary_dtype(hidden_states, qr.dtype)
+        with copy_source_trace("attn.boundary_hidden_states"):
+            hidden_states = ensure_boundary_dtype(hidden_states, qr.dtype)
 
         # Aux-stream overlap is re-enabled by default (R4 behavior). An
         # escape-hatch env var ``VLLM_SM70_AUX_STREAM_OVERLAP=0`` disables
@@ -2597,18 +2642,32 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             # torch inductor 2.9 `decompose_triton_kernel_wrapper_functional`
             # pass that mishandles dynamic-shape stride expressions).
             if _sm70_triton_qnorm_rope_kv_insert_op is not None:
-                _sm70_triton_qnorm_rope_kv_insert_op(
-                    q,
-                    kv,
-                    swa_kv_cache_2d,
-                    swa_metadata.slot_mapping,
-                    positions.to(torch.int64),
-                    self.rotary_emb.cos_sin_cache,
-                    self.eps,
-                    swa_metadata.block_size,
-                )
+                with copy_source_trace("qkv_fused.sm70_triton_op"):
+                    _sm70_triton_qnorm_rope_kv_insert_op(
+                        q,
+                        kv,
+                        swa_kv_cache_2d,
+                        swa_metadata.slot_mapping,
+                        positions.to(torch.int64),
+                        self.rotary_emb.cos_sin_cache,
+                        self.eps,
+                        swa_metadata.block_size,
+                    )
             else:
-                _sm70_triton_qnorm_rope_kv_insert(
+                with copy_source_trace("qkv_fused.sm70_triton_fn"):
+                    _sm70_triton_qnorm_rope_kv_insert(
+                        q,
+                        kv,
+                        swa_kv_cache_2d,
+                        swa_metadata.slot_mapping,
+                        positions.to(torch.int64),
+                        self.rotary_emb.cos_sin_cache,
+                        self.eps,
+                        swa_metadata.block_size,
+                    )
+        else:
+            with copy_source_trace("qkv_fused.cuda_qnorm_rope_kv_insert"):
+                torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                     q,
                     kv,
                     swa_kv_cache_2d,
@@ -2618,17 +2677,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     self.eps,
                     swa_metadata.block_size,
                 )
-        else:
-            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-                q,
-                kv,
-                swa_kv_cache_2d,
-                swa_metadata.slot_mapping,
-                positions.to(torch.int64),
-                self.rotary_emb.cos_sin_cache,
-                self.eps,
-                swa_metadata.block_size,
-            )
 
 
 def deepseek_v4_attention(
@@ -2783,7 +2831,10 @@ def _sm70_ensure_predequant_weight(b: torch.Tensor, b_scale: torch.Tensor,
     """
     b_f16 = getattr(b, "_sm70_predequant_f16", None)
     if b_f16 is None:
-        b_f16 = _SM70_FP8_WEIGHT_PREDEQUANT(b, b_scale, groups, rank, hidden)
+        with copy_source_trace("o_einsum.weight_predequant"):
+            b_f16 = _SM70_FP8_WEIGHT_PREDEQUANT(
+                b, b_scale, groups, rank, hidden
+            )
         b._sm70_predequant_f16 = b_f16  # type: ignore[attr-defined]
     return b_f16
 
@@ -2830,13 +2881,15 @@ def _sm70_fp8_einsum_bmm(
     rank = b.shape[1] if b.dim() == 3 else b.shape[0] // groups
 
     # Lazily pre-dequant b (weight) to fp16 and cache
-    b_f16 = _sm70_ensure_predequant_weight(b, b_scale, groups, rank, hidden)
+    with copy_source_trace("o_einsum.weight_cache"):
+        b_f16 = _sm70_ensure_predequant_weight(b, b_scale, groups, rank, hidden)
 
     # Dequant a (activation) to fp16
     a_blocks = a_scale.shape[-1]
-    a_deq = a.float() * a_scale.repeat_interleave(
-        hidden // a_blocks, dim=-1
-    )  # [T, G, D] fp32
+    with copy_source_trace("o_einsum.activation_fp32_dequant"):
+        a_deq = a.float() * a_scale.repeat_interleave(
+            hidden // a_blocks, dim=-1
+        )  # [T, G, D] fp32
 
     # fp16 einsum — halved bandwidth, acceptable precision (rtol < 1e-3).
     # R5b: optionally route through the dedicated SM70 Triton BMM kernel
@@ -2846,10 +2899,15 @@ def _sm70_fp8_einsum_bmm(
     # regression.
     _r5b_on = _sm70_einsum_bmm_triton_enabled()
     if _r5b_on:
-        result = sm70_fp16_einsum_bhr_hdr_bhd(a_deq.half().contiguous(), b_f16)
+        with copy_source_trace("o_einsum.activation_fp16_contiguous"):
+            a_fp16 = a_deq.half().contiguous()
+        result = sm70_fp16_einsum_bhr_hdr_bhd(a_fp16, b_f16)
     else:
-        result = torch.einsum("bhr,hdr->bhd", a_deq.half(), b_f16)
-    out.copy_(result.to(out.dtype))
+        with copy_source_trace("o_einsum.activation_fp16_cast"):
+            a_fp16 = a_deq.half()
+        result = torch.einsum("bhr,hdr->bhd", a_fp16, b_f16)
+    with copy_source_trace("o_einsum.result_to_output"):
+        out.copy_(result.to(out.dtype))
 
 
 def _sm70_fused_o_einsum_wo_b(
@@ -2890,12 +2948,14 @@ def _sm70_fused_o_einsum_wo_b(
 
     # Reuse the same lazily cached fp16 weight as `_sm70_fp8_einsum_bmm`
     # so both paths share the (~43 MB) pre-dequant cost.
-    b_f16 = _sm70_ensure_predequant_weight(b, b_scale, groups, rank, hidden)
+    with copy_source_trace("o_einsum_wo_b.weight_cache"):
+        b_f16 = _sm70_ensure_predequant_weight(b, b_scale, groups, rank, hidden)
 
     # R4: fused FP8 a dequant -> FP16 in one Triton pass, skipping the
     # fp32 materialization and `repeat_interleave` scale expansion that
     # the old path used.
-    a_fp16 = sm70_fp8_a_dequant_to_fp16(a, a_scale)
+    with copy_source_trace("o_einsum_wo_b.activation_fp8_to_fp16"):
+        a_fp16 = sm70_fp8_a_dequant_to_fp16(a, a_scale)
 
     # Chained: einsum -> flatten(1) -> wo_b. Keep result in fp16 to match
     # `out` dtype contract; wo_b applies its own (FP8 or fp16) GEMM.
@@ -2904,10 +2964,13 @@ def _sm70_fused_o_einsum_wo_b(
     # VLLM_SM70_EINSUM_BMM_TRITON and default-off for decode.
     _r5b_on = _sm70_einsum_bmm_triton_enabled()
     if _r5b_on:
-        z = sm70_fp16_einsum_bhr_hdr_bhd(a_fp16, b_f16).to(out_dtype)
+        with copy_source_trace("o_einsum_wo_b.triton_bmm_to_out_dtype"):
+            z = sm70_fp16_einsum_bhr_hdr_bhd(a_fp16, b_f16).to(out_dtype)
     else:
-        z = torch.einsum("bhr,hdr->bhd", a_fp16, b_f16).to(out_dtype)
-    out = wo_b_module(z.flatten(1))
+        with copy_source_trace("o_einsum_wo_b.einsum_to_out_dtype"):
+            z = torch.einsum("bhr,hdr->bhd", a_fp16, b_f16).to(out_dtype)
+    with copy_source_trace("o_einsum_wo_b.wo_b"):
+        out = wo_b_module(z.flatten(1))
     if isinstance(out, tuple):
         out = out[0]
     return out

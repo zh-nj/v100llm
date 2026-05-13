@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING
 import torch
 
 import vllm.envs as envs
+from vllm.model_executor.layers.deepseek_v4_copy_source_trace import (
+    copy_source_trace,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_deep_gemm, has_tilelang
@@ -373,8 +376,9 @@ def _mhc_pre_sm70_fast(
     # so (torch.Tensor.is_contiguous short-circuit) and guarantees the
     # Triton kernel sees canonical strides.
     # See .kiro/specs/deepseek-v4-flash-compile-path-regression/.
-    if not residual.is_contiguous():
-        residual = residual.contiguous()
+    with copy_source_trace("mhc_pre.residual_contiguous"):
+        if not residual.is_contiguous():
+            residual = residual.contiguous()
 
     residual_flat = residual.reshape(-1, hc_mult, hidden_size)
     num_tokens = residual_flat.shape[0]
@@ -382,9 +386,15 @@ def _mhc_pre_sm70_fast(
 
     # Step 1: GEMM – [N, K] x [hc_mult3, K]^T → [N, hc_mult3]
     # Try TurboMind MMA_884 first (requires N%32==0 padding), fall back to cuBLAS.
-    res_fp16 = residual_vec if residual_vec.dtype == torch.float16 else residual_vec.half()
-    if not res_fp16.is_contiguous():
-        res_fp16 = res_fp16.contiguous()
+    with copy_source_trace("mhc_pre.residual_half"):
+        res_fp16 = (
+            residual_vec
+            if residual_vec.dtype == torch.float16
+            else residual_vec.half()
+        )
+    with copy_source_trace("mhc_pre.residual_half_contiguous"):
+        if not res_fp16.is_contiguous():
+            res_fp16 = res_fp16.contiguous()
 
     _use_tm = getattr(fn, "_sm70_use_turbomind", None)
     if _use_tm is None:
@@ -398,7 +408,8 @@ def _mhc_pre_sm70_fast(
 
         _tm = getattr(fn, "_sm70_tm_prepared", None)
         if _tm is None:
-            fn_fp16 = fn.half()
+            with copy_source_trace("mhc_pre.fn_half"):
+                fn_fp16 = fn.half()
             n_padded = ((hc_mult3 + 31) // 32) * 32
             if n_padded != hc_mult3:
                 fn_padded = torch.zeros(
@@ -407,7 +418,8 @@ def _mhc_pre_sm70_fast(
                 )
                 fn_padded[:hc_mult3] = fn_fp16
             else:
-                fn_padded = fn_fp16.contiguous()
+                with copy_source_trace("mhc_pre.fn_half_contiguous"):
+                    fn_padded = fn_fp16.contiguous()
             prepared = ops.sm70_f16_prepare(fn_padded)
             _tm = {
                 "weight": prepared[0],
@@ -429,7 +441,8 @@ def _mhc_pre_sm70_fast(
         # cuBLAS fp16 fallback (still faster than float32 torch matmul)
         fn_fp16 = getattr(fn, "_sm70_fp16_cache", None)
         if fn_fp16 is None:
-            fn_fp16 = fn.half()
+            with copy_source_trace("mhc_pre.fn_half_cache"):
+                fn_fp16 = fn.half()
             fn._sm70_fp16_cache = fn_fp16  # type: ignore[attr-defined]
         gemm_out = res_fp16 @ fn_fp16.t()
         n_padded = hc_mult3
@@ -451,7 +464,12 @@ def _mhc_pre_sm70_fast(
     BLOCK_H = min(1024, hidden_size)
     RMS_BLOCK = min(4096, hc_hidden_size)
     grid = (num_tokens,)
-    res_fp16_flat = residual_flat if residual_flat.dtype == torch.float16 else residual_flat.half()
+    with copy_source_trace("mhc_pre.residual_flat_half"):
+        res_fp16_flat = (
+            residual_flat
+            if residual_flat.dtype == torch.float16
+            else residual_flat.half()
+        )
     _mhc_pre_post_gemm_kernel[grid](
         gemm_out,
         res_fp16,
@@ -496,17 +514,21 @@ def _mhc_post_sm70_fast(
 
     # Ensure contiguous layout for Triton
     comb_flat = comb_res_mix.reshape(num_tokens, hc_mult * hc_mult)
-    if not comb_flat.is_contiguous():
-        comb_flat = comb_flat.contiguous()
+    with copy_source_trace("mhc_post.comb_contiguous"):
+        if not comb_flat.is_contiguous():
+            comb_flat = comb_flat.contiguous()
     res_flat = residual_flat
-    if not res_flat.is_contiguous():
-        res_flat = res_flat.contiguous()
+    with copy_source_trace("mhc_post.residual_contiguous"):
+        if not res_flat.is_contiguous():
+            res_flat = res_flat.contiguous()
     post_flat = post_layer_mix.reshape(num_tokens, hc_mult)
-    if not post_flat.is_contiguous():
-        post_flat = post_flat.contiguous()
+    with copy_source_trace("mhc_post.post_contiguous"):
+        if not post_flat.is_contiguous():
+            post_flat = post_flat.contiguous()
     x_flat = x.reshape(num_tokens, hidden_size)
-    if not x_flat.is_contiguous():
-        x_flat = x_flat.contiguous()
+    with copy_source_trace("mhc_post.x_contiguous"):
+        if not x_flat.is_contiguous():
+            x_flat = x_flat.contiguous()
 
     out = torch.empty(
         num_tokens, hc_mult, hidden_size,
@@ -722,7 +744,8 @@ def mhc_pre(
             from vllm.model_executor.layers.sm70_compile_boundary_shield import (
                 ensure_boundary_dtype,
             )
-            residual = ensure_boundary_dtype(residual, torch.float16)
+            with copy_source_trace("mhc_pre.boundary_residual"):
+                residual = ensure_boundary_dtype(residual, torch.float16)
             return _mhc_pre_sm70_fast(
                 residual,
                 fn,
@@ -870,7 +893,8 @@ def _mhc_pre_torch_fallback(
     assert hc_base.shape == (hc_mult3,)
 
     outer_shape = residual.shape[:-2]
-    residual_flat = residual.reshape(-1, hc_mult, hidden_size).float()
+    with copy_source_trace("mhc_pre_fallback.residual_float"):
+        residual_flat = residual.reshape(-1, hc_mult, hidden_size).float()
     residual_vec = residual_flat.reshape(-1, hc_hidden_size)
     mixes = residual_vec @ fn.t()
     rms = torch.rsqrt(
@@ -897,9 +921,10 @@ def _mhc_pre_torch_fallback(
         comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
         comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
 
-    layer_input = torch.einsum("nh,nhd->nd", pre_mix, residual_flat).to(
-        residual.dtype
-    )
+    with copy_source_trace("mhc_pre_fallback.layer_input_to_dtype"):
+        layer_input = torch.einsum("nh,nhd->nd", pre_mix, residual_flat).to(
+            residual.dtype
+        )
 
     post_mix = post_mix.reshape(*outer_shape, hc_mult, 1)
     comb_mix = comb_mix.reshape(*outer_shape, hc_mult, hc_mult)
@@ -1026,8 +1051,10 @@ def mhc_post(
             from vllm.model_executor.layers.sm70_compile_boundary_shield import (
                 ensure_boundary_dtype,
             )
-            x = ensure_boundary_dtype(x, torch.float16)
-            residual = ensure_boundary_dtype(residual, torch.float16)
+            with copy_source_trace("mhc_post.boundary_x"):
+                x = ensure_boundary_dtype(x, torch.float16)
+            with copy_source_trace("mhc_post.boundary_residual"):
+                residual = ensure_boundary_dtype(residual, torch.float16)
             return _mhc_post_sm70_fast(
                 x, residual, post_layer_mix, comb_res_mix
             )
@@ -1057,14 +1084,19 @@ def _mhc_post_torch_fallback(
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
     outer_shape = residual.shape[:-2]
-    residual_flat = residual.reshape(-1, hc_mult, hidden_size).float()
-    x_flat = x.reshape(-1, hidden_size).float()
-    post_flat = post_layer_mix.reshape(-1, hc_mult, 1).float()
-    comb_flat = comb_res_mix.reshape(-1, hc_mult, hc_mult).float()
+    with copy_source_trace("mhc_post_fallback.residual_float"):
+        residual_flat = residual.reshape(-1, hc_mult, hidden_size).float()
+    with copy_source_trace("mhc_post_fallback.x_float"):
+        x_flat = x.reshape(-1, hidden_size).float()
+    with copy_source_trace("mhc_post_fallback.post_float"):
+        post_flat = post_layer_mix.reshape(-1, hc_mult, 1).float()
+    with copy_source_trace("mhc_post_fallback.comb_float"):
+        comb_flat = comb_res_mix.reshape(-1, hc_mult, hc_mult).float()
 
     out = torch.einsum("nio,nih->noh", comb_flat, residual_flat)
     out = out + post_flat * x_flat.unsqueeze(-2)
-    return out.reshape(*outer_shape, hc_mult, hidden_size).to(residual.dtype)
+    with copy_source_trace("mhc_post_fallback.output_to_dtype"):
+        return out.reshape(*outer_shape, hc_mult, hidden_size).to(residual.dtype)
 
 
 def _mhc_post_fake(

@@ -125,6 +125,14 @@ def test_deepseek_v4_sm70_direct_and_mhc_default_on(
     assert envs.VLLM_SM70_MHC_FAST
 
 
+def test_moe_early_shared_experts_stream_default_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_MOE_EARLY_SHARED_EXPERTS_STREAM", raising=False)
+
+    assert environment_variables["VLLM_MOE_EARLY_SHARED_EXPERTS_STREAM"]()
+
+
 class TestEnvWithChoices:
     """Test cases for env_with_choices function."""
 

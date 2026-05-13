@@ -250,6 +250,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.bool,
             device=self.device,
         )
+        # Reusable pinned-host staging buffer for token_to_req_indices to
+        # avoid allocating a new pinned tensor every build() call. With small
+        # decode batches this saves ~1 cudaMemcpyAsync + several µs of
+        # cudaHostAlloc/Free per layer-build per step.
+        self._token_to_req_indices_host = torch.zeros(
+            max_tokens, dtype=torch.int32, pin_memory=True
+        )
 
     def build(
         self,
@@ -282,9 +289,20 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
         query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
-        token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
-        token_to_req_indices.copy_(x, non_blocking=True)
+        # Build token→req mapping directly into a reusable pinned host
+        # buffer; avoid allocating a fresh pinned tensor every step (each
+        # such allocation is a cudaHostAlloc/Register, ~100 µs on V100).
+        # numpy.repeat skips kernel dispatch and writes straight into the
+        # pinned host buffer, which then issues a single cudaMemcpyAsync.
+        import numpy as _np
+        num_tokens_total = int(query_start_loc_cpu[-1].item())
+        host_view = self._token_to_req_indices_host[:num_tokens_total]
+        host_view.numpy()[:] = _np.repeat(
+            _np.arange(num_reqs, dtype=_np.int32),
+            query_lens.numpy().astype(_np.int32, copy=False),
+        )
+        token_to_req_indices = self.token_to_req_indices[:num_tokens_total]
+        token_to_req_indices.copy_(host_view, non_blocking=True)
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         is_valid_token.copy_(slot_mapping >= 0)

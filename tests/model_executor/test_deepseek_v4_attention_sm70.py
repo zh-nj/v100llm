@@ -628,3 +628,83 @@ def test_deepseek_v4_phase_profiler_exports_raw_trace(monkeypatch, tmp_path):
     assert row["elapsed_us"] == 42.0
     assert "pid" in row
     assert "cuda_device" in row
+
+
+def test_deepseek_v4_copy_source_trace_emits_nvtx_during_graph_capture(
+    monkeypatch,
+):
+    from vllm.model_executor.layers import deepseek_v4_copy_source_trace as trace
+
+    calls = []
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_COPY_SOURCE_TRACE", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(trace, "_torch_compiler_is_compiling", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda.nvtx,
+        "range_push",
+        lambda label: calls.append(("push", label)),
+    )
+    monkeypatch.setattr(
+        torch.cuda.nvtx,
+        "range_pop",
+        lambda: calls.append(("pop", None)),
+    )
+
+    with trace.copy_source_trace("o_einsum.fp8_a_dequant"):
+        calls.append(("body", None))
+
+    assert calls == [
+        ("push", "copy_source.o_einsum.fp8_a_dequant"),
+        ("body", None),
+        ("pop", None),
+    ]
+
+
+def test_deepseek_v4_copy_source_trace_is_default_off(monkeypatch):
+    from vllm.model_executor.layers import deepseek_v4_copy_source_trace as trace
+
+    calls = []
+    monkeypatch.delenv("VLLM_DEEPSEEK_V4_COPY_SOURCE_TRACE", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(trace, "_torch_compiler_is_compiling", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda.nvtx,
+        "range_push",
+        lambda label: calls.append(("push", label)),
+    )
+    monkeypatch.setattr(
+        torch.cuda.nvtx,
+        "range_pop",
+        lambda: calls.append(("pop", None)),
+    )
+
+    with trace.copy_source_trace("mhc_post.comb_contiguous"):
+        calls.append(("body", None))
+
+    assert calls == [("body", None)]
+
+
+def test_deepseek_v4_copy_source_trace_skips_nvtx_while_torch_compiling(
+    monkeypatch,
+):
+    from vllm.model_executor.layers import deepseek_v4_copy_source_trace as trace
+
+    calls = []
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_COPY_SOURCE_TRACE", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(trace, "_torch_compiler_is_compiling", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda.nvtx,
+        "range_push",
+        lambda label: calls.append(("push", label)),
+    )
+    monkeypatch.setattr(
+        torch.cuda.nvtx,
+        "range_pop",
+        lambda: calls.append(("pop", None)),
+    )
+
+    with trace.copy_source_trace("attn.boundary_hidden_states"):
+        calls.append(("body", None))
+
+    assert calls == [("body", None)]
