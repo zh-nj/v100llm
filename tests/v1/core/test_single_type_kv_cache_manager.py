@@ -188,6 +188,43 @@ def test_sliding_window_possible_cached_prefix():
     )
 
 
+def test_sliding_window_eagle_realigns_after_drop():
+    block_size = 16
+    alignment_tokens = 32
+    sliding_window_spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=2 * block_size,
+    )
+
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=block_size
+    )
+    manager = get_sliding_window_manager(sliding_window_spec, block_pool)
+    block_hash_list = [BlockHash(str(i).encode()) for i in range(4)]
+
+    for i, block_hash in enumerate(block_hash_list):
+        block_pool.cached_block_hash_to_block.insert(
+            make_block_hash_with_group_id(block_hash, 0),
+            block_pool.blocks[i + 10],
+        )
+
+    computed_blocks = manager.find_longest_cache_hit(
+        block_hashes=block_hash_list,
+        max_length=len(block_hash_list) * block_size,
+        kv_cache_group_ids=[0],
+        block_pool=block_pool,
+        kv_cache_spec=sliding_window_spec,
+        use_eagle=True,
+        alignment_tokens=alignment_tokens,
+    )[0]
+
+    assert len(computed_blocks) == 2
+    assert len(computed_blocks) * block_size % alignment_tokens == 0
+
+
 def test_chunked_local_attention_remove_skipped_blocks():
     attention_spec = ChunkedLocalAttentionSpec(
         block_size=2,
