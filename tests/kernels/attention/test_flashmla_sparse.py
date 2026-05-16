@@ -180,6 +180,62 @@ def test_sparse_flashmla_prefill_dispatches_to_tilelang_when_cached(
     assert "called" not in flashmla_calls
 
 
+def test_sparse_flashmla_prefill_warns_and_falls_back_on_tilelang_cache_miss(
+    monkeypatch,
+):
+    import vllm.third_party.flashmla.flash_mla_interface as fm
+
+    monkeypatch.setenv("VLLM_SM70_USE_TILELANG_SPARSE_PREFILL", "1")
+
+    tilelang_mod = types.ModuleType(
+        "vllm.v1.attention.ops.tilelang_sparse_prefill"
+    )
+    calls: list[str] = []
+
+    def fake_is_tilelang_available():
+        return True, None
+
+    def fake_is_tilelang_sparse_fwd_cached(*args, **kwargs):
+        calls.append("cached")
+        return False
+
+    def fake_flash_mla_sparse_fwd_tilelang(*args, **kwargs):
+        calls.append("tilelang")
+        return ("tilelang", None, None)
+
+    tilelang_mod.is_tilelang_available = fake_is_tilelang_available
+    tilelang_mod.is_tilelang_sparse_fwd_cached = fake_is_tilelang_sparse_fwd_cached
+    tilelang_mod.flash_mla_sparse_fwd_tilelang = fake_flash_mla_sparse_fwd_tilelang
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.attention.ops.tilelang_sparse_prefill",
+        tilelang_mod,
+    )
+
+    flashmla_calls = {}
+
+    def fake_sparse_prefill_fwd(*args, **kwargs):
+        flashmla_calls["called"] = True
+        return ("flashmla", None, None)
+
+    monkeypatch.setattr(
+        fm,
+        "flash_mla_cuda",
+        types.SimpleNamespace(sparse_prefill_fwd=fake_sparse_prefill_fwd),
+    )
+
+    q = torch.zeros((1, 64, 576), dtype=torch.bfloat16)
+    kv = torch.zeros((1, 1, 576), dtype=torch.bfloat16)
+    indices = torch.zeros((1, 1, 128), dtype=torch.int32)
+
+    with pytest.warns(UserWarning, match="TileLang sparse prefill cache miss"):
+        out = fm.flash_mla_sparse_fwd(q, kv, indices, 1.0)
+
+    assert out[0] == "flashmla"
+    assert calls == ["cached"]
+    assert flashmla_calls["called"] is True
+
+
 def test_sparse_flashmla_prefill_matches_torch_reference():
     import vllm.v1.attention.ops.flashmla as fm
 
