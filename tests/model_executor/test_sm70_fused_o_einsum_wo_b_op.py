@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Inductor-shield test for SM70 FP8 weight pre-dequant.
+"""Inductor-shield and direct-dequant tests for SM70 FP8 weight pre-dequant.
 
 Round 1 of the deepseek-v4-flash-prefill-throughput spec shields the
 SM70 FP8 weight pre-dequantization path from inductor fusion by
 registering `torch.ops.vllm.sm70_fp8_weight_predequant` as an opaque
-custom op. This prevents inductor from generating a `*fp8e4nv` Triton
-kernel from the weight pre-dequant expression (SM70 Triton does not
-support fp8e4nv).
+custom op. Its body now delegates to a direct fp8->fp16 Triton kernel instead
+of the old `b.float() * repeat_interleave(scale) -> half()` chain.
 
 Additionally `_sm70_fp8_einsum_bmm` and
 `_deepseek_v4_fp8_einsum_torch_fallback` are decorated with
@@ -50,9 +49,8 @@ def _is_dynamo_shielded(fn) -> bool:
 def test_sm70_fp8_weight_predequant_op_registered():
     """The shielding custom op MUST be registered as `torch.ops.vllm.sm70_fp8_weight_predequant`.
 
-    This is the primary fp8e4nv shield: inductor cannot trace into an
-    opaque custom op body and therefore cannot generate an fp8e4nv
-    Triton kernel from the weight dequant expression.
+    This keeps the weight-cache population opaque to Inductor and gives the
+    body a stable place to launch the direct fp8->fp16 predequant kernel.
     """
     # Force the module to import so the custom op gets registered.
     pytest.importorskip(
@@ -118,4 +116,104 @@ def test_sm70_predequant_helper_uses_custom_op():
         "_sm70_ensure_predequant_weight must exist; it is the single "
         "entry point that routes weight pre-dequant through "
         "torch.ops.vllm.sm70_fp8_weight_predequant."
+    )
+
+
+def test_sm70_weight_predequant_impl_uses_direct_helper(monkeypatch):
+    """The custom-op body should avoid the old fp32 weight staging chain."""
+    dsa = pytest.importorskip(
+        "vllm.model_executor.layers.deepseek_v4_attention"
+    )
+
+    calls: list[tuple[torch.Tensor, torch.Tensor, int, int, int]] = []
+
+    def fake_direct_predequant(
+        b: torch.Tensor,
+        b_scale: torch.Tensor,
+        groups: int,
+        rank: int,
+        hidden: int,
+    ) -> torch.Tensor:
+        calls.append((b, b_scale, groups, rank, hidden))
+        return torch.full(
+            (groups, rank, hidden),
+            3.0,
+            dtype=torch.float16,
+            device=b.device,
+        )
+
+    monkeypatch.setattr(
+        dsa,
+        "sm70_fp8_weight_predequant_to_fp16",
+        fake_direct_predequant,
+        raising=False,
+    )
+
+    b = torch.ones((128, 128), dtype=torch.uint8)
+    b_scale = torch.ones((1, 1, 1), dtype=torch.float32)
+    out = dsa._sm70_fp8_weight_predequant_impl(
+        b,
+        b_scale,
+        groups=1,
+        rank=128,
+        hidden=128,
+    )
+
+    assert calls == [(b, b_scale, 1, 128, 128)]
+    torch.testing.assert_close(
+        out,
+        torch.full((1, 128, 128), 3.0, dtype=torch.float16),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_sm70_fp8_einsum_bmm_uses_fused_activation_dequant(monkeypatch):
+    """The non-fused SM70 O-einsum fallback must avoid fp32 activation staging.
+
+    The fused O-einsum+wo_b path already calls `sm70_fp8_a_dequant_to_fp16`.
+    Keep `_sm70_fp8_einsum_bmm` on the same semantic path so any caller of
+    `deepseek_v4_fp8_einsum` on SM70 avoids the old
+    `a.float() * repeat_interleave(scale) -> half()` round-trip.
+    """
+    dsa = pytest.importorskip(
+        "vllm.model_executor.layers.deepseek_v4_attention"
+    )
+
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def fake_dequant(a: torch.Tensor, a_scale: torch.Tensor) -> torch.Tensor:
+        calls.append((a, a_scale))
+        return torch.ones(a.shape, dtype=torch.float16)
+
+    def fake_predequant_weight(
+        b: torch.Tensor,
+        b_scale: torch.Tensor,
+        groups: int,
+        rank: int,
+        hidden: int,
+    ) -> torch.Tensor:
+        del b, b_scale
+        return torch.ones((groups, rank, hidden), dtype=torch.float16)
+
+    monkeypatch.setattr(dsa, "sm70_fp8_a_dequant_to_fp16", fake_dequant)
+    monkeypatch.setattr(
+        dsa, "_sm70_ensure_predequant_weight", fake_predequant_weight
+    )
+    monkeypatch.setattr(dsa, "_sm70_einsum_bmm_triton_enabled", lambda: False)
+
+    a = torch.ones((1, 2, 4), dtype=torch.uint8)
+    a_scale = torch.ones((1, 2, 2), dtype=torch.float32)
+    b = torch.ones((2, 3, 4), dtype=torch.uint8)
+    b_scale = torch.ones((2, 1, 1), dtype=torch.float32)
+    out = torch.empty((1, 2, 3), dtype=torch.float16)
+
+    dsa._sm70_fp8_einsum_bmm(a, a_scale, b, b_scale, out, "bhr,hdr->bhd")
+
+    assert calls == [(a, a_scale)]
+    torch.testing.assert_close(
+        out,
+        torch.full_like(out, 4.0),
+        rtol=0,
+        atol=0,
     )

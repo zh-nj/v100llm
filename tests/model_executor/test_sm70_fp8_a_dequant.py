@@ -68,6 +68,74 @@ def test_fused_inv_rope_fp8_quant_fake_preserves_production_strides():
 
 
 @cuda_required
+def test_sm70_fp8_a_dequant_matches_torch_e4m3fn_byte_semantics():
+    """The fused path must preserve PyTorch E4M3FN decode semantics.
+
+    This covers the subnormal byte band as well as the two NaN encodings. The
+    O-einsum fallback uses this helper as a drop-in replacement for
+    ``a.float().half()`` after scaling, so byte-level decode drift would be a
+    real semantic change rather than just an implementation detail.
+    """
+    from vllm.model_executor.layers.fp8_a_dequant_triton import (
+        sm70_fp8_a_dequant_to_fp16,
+    )
+
+    a_u8 = torch.arange(0, 256, dtype=torch.uint8, device="cuda").view(
+        1, 1, 256
+    )
+    a_scale = torch.ones(1, 1, 1, dtype=torch.float32, device="cuda")
+
+    out = sm70_fp8_a_dequant_to_fp16(a_u8, a_scale)
+    ref = a_u8.view(torch.float8_e4m3fn).float().half()
+
+    torch.testing.assert_close(out, ref, rtol=0, atol=0, equal_nan=True)
+
+
+@cuda_required
+def test_sm70_fp8_weight_predequant_matches_torch_reference():
+    """Weight pre-dequant must match the old fp32 expression exactly."""
+    from vllm.model_executor.layers.fp8_a_dequant_triton import (
+        sm70_fp8_weight_predequant_to_fp16,
+    )
+
+    torch.manual_seed(2)
+    groups, rank, hidden = 2, 256, 256
+    bytes_ = torch.arange(0, 256, dtype=torch.uint8, device="cuda")
+    # Avoid NaN inputs; production quantizers should not emit them and the old
+    # fp32 path would propagate NaNs through the weight cache.
+    bytes_[0x7F] = 0x7E
+    bytes_[0xFF] = 0xFE
+    b_u8 = bytes_.repeat((groups * rank * hidden + 255) // 256)[
+        : groups * rank * hidden
+    ].view(groups, rank, hidden)
+    b = b_u8.view(torch.float8_e4m3fn)
+    b_scale = (
+        torch.rand(
+            groups,
+            rank // 128,
+            hidden // 128,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        + 0.1
+    )
+
+    out = sm70_fp8_weight_predequant_to_fp16(
+        b.reshape(groups * rank, hidden),
+        b_scale,
+        groups,
+        rank,
+        hidden,
+    )
+    ref = (
+        b.float()
+        * b_scale.repeat_interleave(128, dim=1).repeat_interleave(128, dim=2)
+    ).half().contiguous()
+
+    torch.testing.assert_close(out, ref, rtol=0, atol=0, equal_nan=True)
+
+
+@cuda_required
 @pytest.mark.parametrize("T,G,D,block_size", [
     (1, 1, 128, 128),
     (1, 8, 1024, 128),
@@ -89,13 +157,7 @@ def test_sm70_fp8_a_dequant_matches_reference(T, G, D, block_size):
     out = sm70_fp8_a_dequant_to_fp16(a_fp8, a_scale)
     ref = _ref_dequant(a_fp8, a_scale)
 
-    # Our kernel treats denormals as zero (DeepSeek V4 blocked-scale design
-    # absorbs them); the reference uses PyTorch's full FP8 round-trip which
-    # emits small non-zero values for exp=0. Mask those before comparing.
-    denormal_mask = (a_fp8.view(torch.uint8) & 0x78) == 0  # exp == 0
     diff = (out - ref).abs()
-    # Allow the denormal band (max ~4 * scale_max, tiny) to diverge.
-    diff[denormal_mask] = 0
 
     # Remaining FP8 E4M3 round-trip + fp16 accumulation tolerance.
     # E4M3 has 3-bit mantissa -> ~12.5% relative; tol dominated by abs
@@ -151,9 +213,7 @@ def test_sm70_fp8_a_dequant_handles_non_contiguous_scale(T, G, D, block_size):
 
     out = sm70_fp8_a_dequant_to_fp16(a, a_scale)
     ref = _ref_dequant(a, a_scale)
-    denormal_mask = (a.view(torch.uint8) & 0x78) == 0
     diff = (out - ref).abs()
-    diff[denormal_mask] = 0
     scale_max = a_scale.max().item()
     abs_tol = 5e-3 * max(1.0, scale_max * 10)
     torch.testing.assert_close(diff, torch.zeros_like(diff),

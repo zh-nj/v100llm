@@ -29,6 +29,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.layers.fp8_a_dequant_triton import (
     sm70_fp8_a_dequant_to_fp16,
+    sm70_fp8_weight_predequant_to_fp16,
 )
 from vllm.model_executor.layers.sm70_compile_boundary_shield import (
     ensure_boundary_dtype,
@@ -2786,19 +2787,13 @@ def _sm70_fp8_weight_predequant_impl(
     broadcast pattern as ``_sm70_fp8_einsum_bmm``.
 
     This function is registered as a torch custom op so inductor treats
-    it as opaque and does NOT generate a ``*fp8e4nv`` Triton kernel from
-    its body (SM70 Triton rejects fp8e4nv; see
-    `.kiro/specs/deepseek-v4-flash-prefill-throughput/`).
+    weight-cache population as opaque. The body delegates to a manual
+    fp8-byte decode Triton kernel, avoiding the old fp32 copy/mul/fp16-copy
+    eager chain during CUDA graph capture.
     """
-    b_3d = b.reshape(groups, rank, hidden)
-    weight_scale_shape = (groups, rank // 128, hidden // 128)
-    b_scale_3d = b_scale.reshape(weight_scale_shape)
-    return (
-        b_3d.float()
-        * b_scale_3d.repeat_interleave(128, dim=1).repeat_interleave(
-            128, dim=2
-        )
-    ).half().contiguous()
+    return sm70_fp8_weight_predequant_to_fp16(
+        b, b_scale, groups, rank, hidden
+    )
 
 
 def _sm70_fp8_weight_predequant_fake(
@@ -2866,8 +2861,9 @@ def _sm70_fp8_einsum_bmm(
     """SM70 optimised path: pre-dequant weight to fp16 (cached) + fp16 einsum.
 
     The wo_a weight (b) is dequantized to fp16 once and cached on the tensor
-    (~43 MB extra VRAM).  At runtime, the activation (a) is dequanted to fp16,
-    then einsum runs in fp16 for halved bandwidth vs the previous fp32 path.
+    (~43 MB extra VRAM). At runtime, the activation (a) is dequanted directly
+    to fp16, then einsum runs in fp16 for halved bandwidth vs the previous
+    fp32 path.
     Eliminates repeated weight dequant (~1.5x faster than re-dequant every call).
 
     Decorated with ``@torch._dynamo.disable`` so torch.compile / inductor
@@ -2890,12 +2886,11 @@ def _sm70_fp8_einsum_bmm(
     with copy_source_trace("o_einsum.weight_cache"):
         b_f16 = _sm70_ensure_predequant_weight(b, b_scale, groups, rank, hidden)
 
-    # Dequant a (activation) to fp16
-    a_blocks = a_scale.shape[-1]
-    with copy_source_trace("o_einsum.activation_fp32_dequant"):
-        a_deq = a.float() * a_scale.repeat_interleave(
-            hidden // a_blocks, dim=-1
-        )  # [T, G, D] fp32
+    # Dequant a (activation) directly to fp16. This matches
+    # `(a.float() * repeat_interleave(scale)).half()` but avoids materializing
+    # the fp32 activation tensor and expanded scale tensor.
+    with copy_source_trace("o_einsum.activation_fp8_to_fp16"):
+        a_fp16 = sm70_fp8_a_dequant_to_fp16(a, a_scale)
 
     # fp16 einsum — halved bandwidth, acceptable precision (rtol < 1e-3).
     # R5b: optionally route through the dedicated SM70 Triton BMM kernel
@@ -2906,11 +2901,10 @@ def _sm70_fp8_einsum_bmm(
     _r5b_on = _sm70_einsum_bmm_triton_enabled()
     if _r5b_on:
         with copy_source_trace("o_einsum.activation_fp16_contiguous"):
-            a_fp16 = a_deq.half().contiguous()
+            if not a_fp16.is_contiguous():
+                a_fp16 = a_fp16.contiguous()
         result = sm70_fp16_einsum_bhr_hdr_bhd(a_fp16, b_f16)
     else:
-        with copy_source_trace("o_einsum.activation_fp16_cast"):
-            a_fp16 = a_deq.half()
         result = torch.einsum("bhr,hdr->bhd", a_fp16, b_f16)
     with copy_source_trace("o_einsum.result_to_output"):
         out.copy_(result.to(out.dtype))
