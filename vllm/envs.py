@@ -112,7 +112,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB: bool = True
     VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS: int = 4
     VLLM_SM70_USE_TILELANG_SPARSE_PREFILL: bool = True
-    VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO: bool = False
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO: bool = True
     VLLM_SM70_TILELANG_SPARSE_PREFILL_BI: int = 16
     VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS: int = 128
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
@@ -981,11 +981,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_USE_TILELANG_SPARSE_PREFILL": lambda: bool(
         int(os.getenv("VLLM_SM70_USE_TILELANG_SPARSE_PREFILL", "1"))
     ),
-    # Experimental: when TileLang sparse prefill has a cached bf16-output
-    # kernel, pass model fp16 Q directly and keep only the bf16 output staging.
-    # Default-off until validated by e2e prefill A/B.
+    # When TileLang sparse prefill has a cached bf16-output kernel, pass
+    # model fp16 Q directly and keep only the bf16 output staging. Set to 0
+    # to restore the older fp16->bf16 input trampoline for debugging.
     "VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO": lambda: bool(
-        int(os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO", "0"))
+        int(os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO", "1"))
     ),
     # TileLang sparse MLA tile width (per-tile KV rows). Only BI=16 is
     # validated on V100; larger values OOM smem, smaller values violate

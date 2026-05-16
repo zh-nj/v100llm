@@ -648,7 +648,17 @@ def test_forward_prefill_fast_io_skips_q_bf16_trampoline_when_tilelang_cached(
     torch.testing.assert_close(output, torch.full_like(output, 9))
 
 
-def test_tilelang_sparse_prefill_fast_io_default_off(monkeypatch):
+def test_tilelang_sparse_prefill_fast_io_default_on(monkeypatch):
+    import vllm.envs as env_module
+
+    monkeypatch.delenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO", raising=False)
+
+    assert env_module.environment_variables[
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO"
+    ]()
+
+
+def test_tilelang_sparse_prefill_fast_io_can_be_disabled(monkeypatch):
     monkeypatch.setattr(
         d4a.envs, "VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO", False
     )
