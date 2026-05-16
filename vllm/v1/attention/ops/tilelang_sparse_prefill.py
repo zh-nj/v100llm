@@ -364,6 +364,8 @@ def is_tilelang_sparse_fwd_cached(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
     block_I: int = 16,
     num_stages: int = 1,
     threads: int = 128,
@@ -382,7 +384,14 @@ def is_tilelang_sparse_fwd_cached(
     if tail_dim not in (0, 64):
         return False
 
-    output_dtype_str = "bfloat16" if q.dtype == torch.bfloat16 else "float16"
+    requested_output_dtype = (
+        out.dtype if out is not None
+        else output_dtype if output_dtype is not None
+        else q.dtype
+    )
+    output_dtype_str = (
+        "bfloat16" if requested_output_dtype == torch.bfloat16 else "float16"
+    )
     has_sink = attn_sink is not None
     has_topk_length = topk_length is not None
 
@@ -421,11 +430,13 @@ def flash_mla_sparse_fwd_tilelang(
     assert tail_dim in (0, 64), f"unsupported tail_dim {tail_dim}"
 
     input_dtype = q.dtype
-    # Q/KV go in as fp16 (V100 MMA requirement). Output goes out as
-    # the input dtype directly when bf16 — fold the bf16 cast into
-    # the kernel's final store (saves ~330 ms torch copy kernel per
-    # prefill at the DSv4F production shape).
-    output_dtype_str = "bfloat16" if input_dtype == torch.bfloat16 else "float16"
+    output_dtype = out.dtype if out is not None else input_dtype
+    # Q/KV go in as fp16 (V100 MMA requirement). Output dtype follows an
+    # explicit `out` buffer when supplied; otherwise it follows q dtype. This
+    # lets DSv4F pass fp16 Q while reusing the prewarmed bf16 output kernel.
+    output_dtype_str = (
+        "bfloat16" if output_dtype == torch.bfloat16 else "float16"
+    )
     q_fp16 = q.to(torch.float16) if q.dtype != torch.float16 else q
     kv_fp16 = kv.to(torch.float16) if kv.dtype != torch.float16 else kv
 
@@ -463,9 +474,9 @@ def flash_mla_sparse_fwd_tilelang(
     lse = lse_tl.squeeze(0)
 
     # If output_dtype_str="bfloat16", output is already bf16 from the
-    # kernel; no cast needed. Only cast when we asked for fp16 output
-    # but caller wanted something else.
-    if output_dtype_str == "float16" and input_dtype != torch.float16:
+    # kernel; no cast needed. Only cast when no explicit out buffer was
+    # supplied and the historical return dtype should match q.
+    if out is None and output_dtype_str == "float16" and input_dtype != torch.float16:
         output = output.to(input_dtype)
 
     if out is not None:

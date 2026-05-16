@@ -2166,6 +2166,47 @@ def _copy_flashmla_output(
             output.copy_(flash_output.to(output.dtype))
 
 
+def _should_use_tilelang_sparse_prefill_fast_io(
+    *,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int,
+    attn_sink: torch.Tensor | None,
+    topk_length: torch.Tensor | None,
+    output: torch.Tensor,
+) -> bool:
+    if not envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO:
+        return False
+    if not envs.VLLM_SM70_USE_TILELANG_SPARSE_PREFILL:
+        return False
+    if q.dtype is not torch.float16 or output.dtype is not torch.float16:
+        return False
+    try:
+        from vllm.v1.attention.ops.tilelang_sparse_prefill import (
+            is_tilelang_available,
+            is_tilelang_sparse_fwd_cached,
+        )
+        ok, _reason = is_tilelang_available()
+        if not ok:
+            return False
+        return is_tilelang_sparse_fwd_cached(
+            q,
+            kv,
+            indices,
+            sm_scale,
+            d_v,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            output_dtype=torch.bfloat16,
+            block_I=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI,
+            threads=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS,
+        )
+    except Exception:
+        return False
+
+
 def _attention_boundary_output_dtype(
     hidden_states: torch.Tensor,
     qr: torch.Tensor,
@@ -3711,22 +3752,56 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         "combined_lens_max": combined_lens_max,
                     },
                 ):
-                    q_chunk, output_chunk = _flashmla_bf16_io(
-                        q[query_start:query_end],
-                        output_slice,
-                    )
-                    if trace_prefill:
-                        _trace_tensor_summary(f"{self.prefix}.prefill.q_chunk", q_chunk)
-                    flash_output, max_logits, lse = flash_mla_sparse_fwd(
-                        q=q_chunk,
-                        kv=kv.view(-1, 1, q.shape[-1]),
-                        indices=combined_indices.unsqueeze(1),
+                    q_slice = q[query_start:query_end]
+                    kv_flat = kv.view(-1, 1, q.shape[-1])
+                    indices_3d = combined_indices.unsqueeze(1)
+                    if _should_use_tilelang_sparse_prefill_fast_io(
+                        q=q_slice,
+                        kv=kv_flat,
+                        indices=indices_3d,
                         sm_scale=self.scale,
+                        d_v=self.head_dim,
                         attn_sink=self.attn_sink,
                         topk_length=combined_lens,
-                        out=output_chunk,
-                    )
-                    _copy_flashmla_output(flash_output, output_slice)
+                        output=output_slice,
+                    ):
+                        q_chunk = q_slice
+                        with copy_source_trace(
+                            "flashmla_fast_q_io.output_alloc_bf16"
+                        ):
+                            output_chunk = torch.empty_like(
+                                output_slice, dtype=torch.bfloat16)
+                        if trace_prefill:
+                            _trace_tensor_summary(
+                                f"{self.prefix}.prefill.q_chunk", q_chunk)
+                        flash_output, max_logits, lse = flash_mla_sparse_fwd(
+                            q=q_chunk,
+                            kv=kv_flat,
+                            indices=indices_3d,
+                            sm_scale=self.scale,
+                            attn_sink=self.attn_sink,
+                            topk_length=combined_lens,
+                            out=output_chunk,
+                        )
+                        _copy_flashmla_output(flash_output, output_slice)
+                    else:
+                        q_chunk, output_chunk = _flashmla_bf16_io(
+                            q_slice,
+                            output_slice,
+                        )
+                        if trace_prefill:
+                            _trace_tensor_summary(
+                                f"{self.prefix}.prefill.q_chunk", q_chunk)
+                        flash_output, max_logits, lse = flash_mla_sparse_fwd(
+                            q=q_chunk,
+                            kv=kv_flat,
+                            indices=indices_3d,
+                            sm_scale=self.scale,
+                            attn_sink=self.attn_sink,
+                            topk_length=combined_lens,
+                            out=output_chunk,
+                        )
+                        _copy_flashmla_output(flash_output, output_slice)
                 if trace_prefill:
                     _trace_tensor_summary(
                         f"{self.prefix}.prefill.flash_output", flash_output

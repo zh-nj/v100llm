@@ -236,6 +236,69 @@ def test_sparse_flashmla_prefill_warns_and_falls_back_on_tilelang_cache_miss(
     assert flashmla_calls["called"] is True
 
 
+def test_tilelang_prefill_cache_key_uses_out_dtype(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    captured = {}
+
+    def fake_is_cached(**kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(tilelang_prefill, "_is_kernel_cached", fake_is_cached)
+
+    q = torch.zeros((1, 64, 576), dtype=torch.float16)
+    kv = torch.zeros((1, 1, 576), dtype=torch.float16)
+    indices = torch.zeros((1, 1, 128), dtype=torch.int32)
+    out = torch.empty((1, 64, 512), dtype=torch.bfloat16)
+
+    assert tilelang_prefill.is_tilelang_sparse_fwd_cached(
+        q, kv, indices, 1.0, 512, out=out
+    )
+    assert captured["output_dtype_str"] == "bfloat16"
+
+
+def test_tilelang_prefill_writes_requested_out_dtype(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    captured = {}
+
+    def fake_get_kernel(**kwargs):
+        captured.update(kwargs)
+
+        def fake_kernel(Q_b, _KV_b, _Indices_b, _Sink, _TopkLen_b):
+            s_q, h_q, d_qk = Q_b.shape[1:]
+            assert d_qk == 576
+            out_dtype = (
+                torch.bfloat16
+                if kwargs["output_dtype_str"] == "bfloat16"
+                else torch.float16
+            )
+            return (
+                torch.full((1, s_q, h_q, 512), 3.0, dtype=out_dtype),
+                torch.zeros((1, s_q, h_q), dtype=torch.float32),
+                torch.zeros((1, s_q, h_q), dtype=torch.float32),
+            )
+
+        return fake_kernel
+
+    monkeypatch.setattr(tilelang_prefill, "_get_kernel", fake_get_kernel)
+
+    q = torch.zeros((1, 64, 576), dtype=torch.float16)
+    kv = torch.zeros((1, 1, 576), dtype=torch.float16)
+    indices = torch.zeros((1, 1, 128), dtype=torch.int32)
+    out = torch.empty((1, 64, 512), dtype=torch.bfloat16)
+
+    result, _max_logits, _lse = tilelang_prefill.flash_mla_sparse_fwd_tilelang(
+        q, kv, indices, 1.0, 512, out=out
+    )
+
+    assert captured["output_dtype_str"] == "bfloat16"
+    assert result.data_ptr() == out.data_ptr()
+    assert result.dtype == torch.bfloat16
+    torch.testing.assert_close(result, torch.full_like(out, 3.0))
+
+
 def test_sparse_flashmla_prefill_matches_torch_reference():
     import vllm.v1.attention.ops.flashmla as fm
 

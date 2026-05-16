@@ -245,7 +245,7 @@ def flash_mla_sparse_fwd(
                 if is_tilelang_sparse_fwd_cached(
                         q, kv, indices, sm_scale, d_v,
                         attn_sink=attn_sink, topk_length=topk_length,
-                        block_I=block_I, threads=threads):
+                        out=out, block_I=block_I, threads=threads):
                     return flash_mla_sparse_fwd_tilelang(
                         q, kv, indices, sm_scale, d_v,
                         attn_sink=attn_sink, topk_length=topk_length, out=out,
