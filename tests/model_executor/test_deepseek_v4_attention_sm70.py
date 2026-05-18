@@ -1030,6 +1030,13 @@ def test_sparse_prefill_v2_requires_supported_shape(monkeypatch):
         compress_ratio=128,
         has_attn_metadata=True,
     )
+    assert d4a._should_use_sparse_prefill_v2(
+        q=torch.empty(1, 64, 512, dtype=torch.float16),
+        output=out,
+        padded_heads=64,
+        compress_ratio=4,
+        has_attn_metadata=True,
+    )
     assert not d4a._should_use_sparse_prefill_v2(
         q=q.to(torch.bfloat16),
         output=out,

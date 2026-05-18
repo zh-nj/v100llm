@@ -2250,7 +2250,7 @@ def _should_use_sparse_prefill_v2(
         return False
     if q.dtype is not torch.float16 or output.dtype is not torch.float16:
         return False
-    if q.ndim < 1 or q.shape[-1] != 576:
+    if q.ndim < 1 or q.shape[-1] not in (512, 576):
         return False
     if padded_heads != 64:
         return False
@@ -3700,10 +3700,31 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             and self.prefix.endswith("layers.1.attn")
         )
 
-        workspace_manager = current_workspace_manager()
-        kv = workspace_manager.get_simultaneous(
-            ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-        )[0]
+        use_sparse_prefill_v2 = (
+            not swa_only
+            and num_prefills == 1
+            and q.shape[-1] == 512
+            and _should_use_sparse_prefill_v2(
+                q=q,
+                output=output,
+                padded_heads=self.padded_heads,
+                compress_ratio=self.compress_ratio,
+                has_attn_metadata=attn_metadata is not None,
+            )
+        )
+        block_table = None
+        if not swa_only:
+            assert attn_metadata is not None
+            block_table = attn_metadata.block_table[num_decodes:]
+        swa_block_table = swa_metadata.block_table[num_decodes:]
+
+        if use_sparse_prefill_v2:
+            kv = None
+        else:
+            workspace_manager = current_workspace_manager()
+            kv = workspace_manager.get_simultaneous(
+                ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            )[0]
         # Aux stream operations (KV-insert, compressor) launched via
         # maybe_execute_in_parallel in attention_impl have already completed
         # by the time we reach here — event synchronization in that helper
@@ -3714,10 +3735,63 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
             chunk_size = chunk_end - chunk_start
+            query_start = (
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            )
+            query_end = (
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            )
+            output_slice = output[query_start:query_end]
+            num_chunk_tokens = query_end - query_start
+
+            if use_sparse_prefill_v2:
+                assert block_table is not None
+                with _profile_or_null(
+                    "prefill.flashmla_sparse_v2",
+                    q,
+                    extra={
+                        "chunk_idx": chunk_idx,
+                        "num_chunk_tokens": int(num_chunk_tokens),
+                    },
+                ):
+                    from vllm.v1.attention.ops.tilelang_sparse_prefill_v2 import (
+                        flash_mla_sparse_prefill_v2,
+                    )
+
+                    flash_output, max_logits, lse = flash_mla_sparse_prefill_v2(
+                        q=q[query_start:query_end],
+                        compressed_k_cache=compressed_k_cache,
+                        swa_k_cache=swa_k_cache,
+                        compressed_block_table=block_table[chunk_start:chunk_end],
+                        swa_block_table=swa_block_table[chunk_start:chunk_end],
+                        topk_indices=topk_indices[query_start:query_end],
+                        query_start_loc=query_start_loc[
+                            num_decodes + chunk_start : num_decodes + chunk_end + 1
+                        ],
+                        seq_lens=seq_lens[chunk_start:chunk_end],
+                        gather_lens=gather_lens[chunk_start:chunk_end],
+                        window_size=self.window_size,
+                        compress_ratio=self.compress_ratio,
+                        top_k=top_k,
+                        sm_scale=self.scale,
+                        attn_sink=self.attn_sink,
+                        out=output_slice,
+                    )
+                    _copy_flashmla_output(flash_output, output_slice)
+                if trace_prefill:
+                    _trace_tensor_summary(
+                        f"{self.prefix}.prefill.flash_output", flash_output
+                    )
+                    _trace_tensor_summary(
+                        f"{self.prefix}.prefill.max_logits", max_logits
+                    )
+                    _trace_tensor_summary(f"{self.prefix}.prefill.lse", lse)
+                continue
+
+            assert kv is not None
             if not swa_only:
                 # Gather compressed KV
-                assert attn_metadata is not None
-                block_table = attn_metadata.block_table[num_decodes:]
+                assert block_table is not None
                 with _profile_or_null(
                     "prefill.compressed_gather",
                     q,
@@ -3737,7 +3811,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     )
 
             # Gather SWA KV
-            swa_block_table = swa_metadata.block_table[num_decodes:]
             with _profile_or_null(
                 "prefill.swa_gather",
                 q,
@@ -3769,13 +3842,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 )
 
             # Combine the topk indices and SWA indices for gathered KV cache
-            query_start = (
-                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
-            )
-            query_end = (
-                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
-            )
-
             with _profile_or_null(
                 "prefill.combine_indices",
                 q,
@@ -3804,9 +3870,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 _trace_tensor_summary(
                     f"{self.prefix}.prefill.combined_lens", combined_lens
                 )
-
-            output_slice = output[query_start:query_end]
-            num_chunk_tokens = query_end - query_start
 
             # Attempt prefill CUDA graph replay for the attention kernel.
             # KV gather and index combination above remain eager; only the
