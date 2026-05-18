@@ -262,6 +262,42 @@ def test_tilelang_prefill_cache_key_uses_out_dtype(monkeypatch):
     assert captured["output_dtype_str"] == "bfloat16"
 
 
+def test_tilelang_prefill_prewarm_accepts_num_stages(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    captured = {}
+
+    def fake_flash_mla_sparse_fwd_tilelang(*args, **kwargs):
+        captured.update(kwargs)
+        q = args[0]
+        out = torch.empty((1, q.shape[1], 512), dtype=q.dtype, device=q.device)
+        max_logits = torch.zeros((1, q.shape[1]), dtype=torch.float32,
+                                 device=q.device)
+        lse = torch.zeros_like(max_logits)
+        return out, max_logits, lse
+
+    monkeypatch.setattr(
+        tilelang_prefill,
+        "flash_mla_sparse_fwd_tilelang",
+        fake_flash_mla_sparse_fwd_tilelang,
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    tilelang_prefill.prewarm_tilelang_sparse_fwd(
+        heads=64,
+        d_qk=576,
+        d_v=512,
+        topk=128,
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        block_I=16,
+        num_stages=2,
+        threads=128,
+    )
+
+    assert captured["num_stages"] == 2
+
+
 def test_tilelang_prefill_writes_requested_out_dtype(monkeypatch):
     import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
 

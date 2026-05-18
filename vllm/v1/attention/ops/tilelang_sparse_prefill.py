@@ -558,6 +558,7 @@ def prewarm_tilelang_sparse_fwd(
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
     block_I: int = 16,
+    num_stages: int = 1,
     threads: int = 128,
     all_feature_variants: bool = False,
 ) -> None:
@@ -592,7 +593,7 @@ def prewarm_tilelang_sparse_fwd(
         flash_mla_sparse_fwd_tilelang(
             Q, KV, Indices, sm_scale, d_v,
             attn_sink=sink, topk_length=tl,
-            block_I=block_I, threads=threads,
+            block_I=block_I, num_stages=num_stages, threads=threads,
         )
     torch.cuda.synchronize()
     logger.info("TileLang sparse MLA: prewarm complete")
