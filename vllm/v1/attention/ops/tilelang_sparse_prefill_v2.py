@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops import tilelang_sparse_prefill
 from vllm.v1.attention.ops.deepseek_v4_ops import (
     combine_topk_swa_indices,
@@ -379,8 +380,9 @@ def _tilelang_gather_selected_fp8_ds_mla_cache(
         dtype=output_dtype,
         device=topk_indices.device,
     )
-    local_indices = torch.zeros(
+    local_indices = torch.full(
         (num_tokens, 1, total_topk),
+        fill_value=-1,
         dtype=torch.int32,
         device=topk_indices.device,
     )
@@ -395,7 +397,7 @@ def _tilelang_gather_selected_fp8_ds_mla_cache(
     local_indices[:, 0, :valid_span] = torch.where(
         valid,
         arange[:, :valid_span],
-        torch.zeros((), dtype=torch.int32, device=topk_indices.device),
+        torch.full((), -1, dtype=torch.int32, device=topk_indices.device),
     )
 
     compressed_mask = (
@@ -433,6 +435,273 @@ def _tilelang_gather_selected_fp8_ds_mla_cache(
     return selected_kv, local_indices, topk_length
 
 
+@triton.jit
+def _triton_gather_selected_fp8_ds_mla_kernel(
+    SelectedKV,
+    LocalIndices,
+    TopkLength,
+    CompressedCache,
+    SwaCache,
+    CompressedBlockTable,
+    SwaBlockTable,
+    TopkIndices,
+    SeqLens,
+    GatherLens,
+    selected_stride0,
+    selected_stride1,
+    compressed_block_stride: tl.constexpr,
+    swa_block_stride: tl.constexpr,
+    topk_stride0: tl.constexpr,
+    max_c_blocks: tl.constexpr,
+    max_swa_blocks: tl.constexpr,
+    num_tokens: tl.constexpr,
+    total_topk: tl.constexpr,
+    top_k: tl.constexpr,
+    window_size: tl.constexpr,
+    compress_ratio: tl.constexpr,
+    compressed_block_size: tl.constexpr,
+    swa_block_size: tl.constexpr,
+    dim: tl.constexpr,
+    fp8_dim: tl.constexpr,
+    bf16_dim: tl.constexpr,
+    token_data_size: tl.constexpr,
+    token_scale_dim: tl.constexpr,
+    quant_block_size: tl.constexpr,
+    block_elems: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    selected_idx = tl.program_id(1)
+    qblock_idx = tl.program_id(2)
+    offsets = tl.arange(0, block_elems)
+
+    seq_len_abs = tl.load(SeqLens)
+    token_pos = seq_len_abs - num_tokens + token_idx
+    topk_len = tl.minimum((token_pos + 1) // compress_ratio, top_k)
+    swa_len = tl.minimum(token_pos + 1, window_size)
+    combined_len = topk_len + swa_len
+    compressed_seq_len = seq_len_abs // compress_ratio
+
+    is_compressed = selected_idx < topk_len
+    topk_pos = tl.minimum(selected_idx, top_k - 1)
+    compressed_idx_raw = tl.load(
+        TopkIndices + token_idx * topk_stride0 + topk_pos,
+        mask=selected_idx < top_k,
+        other=0,
+    )
+    compressed_valid = (
+        is_compressed
+        & (compressed_idx_raw >= 0)
+        & (compressed_idx_raw < compressed_seq_len)
+    )
+    compressed_idx = tl.where(compressed_valid, compressed_idx_raw, 0)
+    c_block_in_seq = compressed_idx // compressed_block_size
+    c_pos_in_block = compressed_idx % compressed_block_size
+    c_phys = tl.load(
+        CompressedBlockTable + c_block_in_seq,
+        mask=c_block_in_seq < max_c_blocks,
+        other=0,
+    )
+
+    swa_offset = selected_idx - topk_len
+    swa_valid = (
+        (selected_idx >= topk_len)
+        & (swa_offset < swa_len)
+        & (selected_idx < combined_len)
+    )
+    swa_logical = tl.where(
+        swa_valid,
+        token_pos - swa_len + 1 + swa_offset,
+        0,
+    )
+    swa_block_in_seq = swa_logical // swa_block_size
+    swa_pos_in_block = swa_logical % swa_block_size
+    swa_phys = tl.load(
+        SwaBlockTable + swa_block_in_seq,
+        mask=swa_block_in_seq < max_swa_blocks,
+        other=0,
+    )
+    row_valid = compressed_valid | swa_valid
+
+    c_token_data_offset = c_pos_in_block * token_data_size
+    c_token_scale_offset = (
+        compressed_block_size * token_data_size
+        + c_pos_in_block * token_scale_dim
+    )
+    swa_token_data_offset = swa_pos_in_block * token_data_size
+    swa_token_scale_offset = (
+        swa_block_size * token_data_size
+        + swa_pos_in_block * token_scale_dim
+    )
+    c_block_base = c_phys.to(tl.int64) * compressed_block_stride
+    swa_block_base = swa_phys.to(tl.int64) * swa_block_stride
+
+    dim_offsets = qblock_idx * block_elems + offsets
+    is_rope = qblock_idx == (fp8_dim // block_elems)
+    nope_mask = (dim_offsets < fp8_dim) & (dim_offsets < dim)
+    rope_mask = offsets < bf16_dim
+    store_offsets = tl.where(is_rope, fp8_dim + offsets, dim_offsets)
+    store_mask = row_valid & (store_offsets < dim)
+    out_ptr = (
+        SelectedKV
+        + token_idx * selected_stride0
+        + selected_idx * selected_stride1
+        + store_offsets
+    )
+
+    x_uint8_c = tl.load(
+        CompressedCache + c_block_base + c_token_data_offset + dim_offsets,
+        mask=nope_mask,
+        other=0,
+    )
+    x_uint8_swa = tl.load(
+        SwaCache + swa_block_base + swa_token_data_offset + dim_offsets,
+        mask=nope_mask,
+        other=0,
+    )
+    x_uint8 = tl.where(is_compressed, x_uint8_c, x_uint8_swa)
+    sign = ((x_uint8 >> 7) & 1).to(tl.int32)
+    exp_bits = ((x_uint8 >> 3) & 0xF).to(tl.int32)
+    mant_bits = (x_uint8 & 0x7).to(tl.int32)
+    fp32_bits = (sign << 31) | ((exp_bits + 120) << 23) | (mant_bits << 20)
+    is_zero = (exp_bits == 0) & (mant_bits == 0)
+    fp32_bits = tl.where(is_zero, 0, fp32_bits)
+    is_subnorm = (exp_bits == 0) & (mant_bits != 0)
+    subnorm_val = mant_bits.to(tl.float32) * 1.953125e-3
+    subnorm_val = tl.where(sign == 1, -subnorm_val, subnorm_val)
+    x_float = tl.where(
+        is_subnorm,
+        subnorm_val,
+        fp32_bits.to(tl.float32, bitcast=True),
+    )
+    c_scale = tl.load(
+        CompressedCache + c_block_base + c_token_scale_offset + qblock_idx,
+        mask=qblock_idx < (fp8_dim // quant_block_size),
+        other=127,
+    )
+    swa_scale = tl.load(
+        SwaCache + swa_block_base + swa_token_scale_offset + qblock_idx,
+        mask=qblock_idx < (fp8_dim // quant_block_size),
+        other=127,
+    )
+    scale_byte = tl.where(is_compressed, c_scale, swa_scale)
+    dequant = x_float * tl.exp2(scale_byte.to(tl.float32) - 127.0)
+
+    rope_u16_c = tl.load(
+        (CompressedCache + c_block_base + c_token_data_offset + fp8_dim).to(
+            tl.pointer_type(tl.uint16)
+        )
+        + offsets,
+        mask=rope_mask,
+        other=0,
+    )
+    rope_u16_swa = tl.load(
+        (SwaCache + swa_block_base + swa_token_data_offset + fp8_dim).to(
+            tl.pointer_type(tl.uint16)
+        )
+        + offsets,
+        mask=rope_mask,
+        other=0,
+    )
+    rope_u16 = tl.where(is_compressed, rope_u16_c, rope_u16_swa)
+    rope_bits = rope_u16.to(tl.uint32) << 16
+    rope_val = rope_bits.to(tl.float32, bitcast=True)
+    value = tl.where(is_rope, rope_val, dequant)
+    tl.store(out_ptr, tl.where(row_valid, value, 0.0), mask=store_mask)
+
+    if qblock_idx == 0:
+        local_idx = tl.where(
+            row_valid,
+            token_idx * total_topk + selected_idx,
+            -1,
+        )
+        tl.store(LocalIndices + token_idx * total_topk + selected_idx, local_idx)
+        if selected_idx == 0:
+            tl.store(TopkLength + token_idx, combined_len)
+
+
+def _triton_gather_selected_fp8_ds_mla_cache(
+    *,
+    compressed_k_cache: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    compressed_block_table: torch.Tensor,
+    swa_block_table: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    top_k: int,
+    total_topk: int,
+    dim: int,
+    output_dtype: torch.dtype = torch.float16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del query_start_loc
+    if seq_lens.numel() != 1:
+        raise NotImplementedError(
+            "selected direct-cache gather currently supports one prefill "
+            "request per launch"
+        )
+    if dim != _TOKEN_FP8_DIM + _TOKEN_BF16_DIM:
+        raise ValueError("selected direct-cache gather currently supports dim=512")
+    if output_dtype is not torch.float16:
+        raise ValueError("Triton selected direct-cache gather emits fp16")
+    if topk_indices.ndim != 2 or topk_indices.shape[1] != top_k:
+        raise ValueError("topk_indices must have shape [tokens, top_k]")
+
+    num_tokens = topk_indices.shape[0]
+    selected_kv = torch.zeros(
+        (num_tokens, total_topk, dim),
+        dtype=output_dtype,
+        device=topk_indices.device,
+    )
+    local_indices = torch.empty(
+        (num_tokens, 1, total_topk),
+        dtype=torch.int32,
+        device=topk_indices.device,
+    )
+    topk_length = torch.empty(
+        num_tokens,
+        dtype=torch.int32,
+        device=topk_indices.device,
+    )
+    grid = (num_tokens, total_topk, 8)
+    _triton_gather_selected_fp8_ds_mla_kernel[grid](
+        selected_kv,
+        local_indices,
+        topk_length,
+        compressed_k_cache,
+        swa_k_cache,
+        compressed_block_table,
+        swa_block_table,
+        topk_indices,
+        seq_lens,
+        gather_lens,
+        selected_kv.stride(0),
+        selected_kv.stride(1),
+        compressed_block_stride=compressed_k_cache.stride(0),
+        swa_block_stride=swa_k_cache.stride(0),
+        topk_stride0=topk_indices.stride(0),
+        max_c_blocks=compressed_block_table.shape[-1],
+        max_swa_blocks=swa_block_table.shape[-1],
+        num_tokens=num_tokens,
+        total_topk=total_topk,
+        top_k=top_k,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+        compressed_block_size=compressed_k_cache.shape[1],
+        swa_block_size=swa_k_cache.shape[1],
+        dim=dim,
+        fp8_dim=_TOKEN_FP8_DIM,
+        bf16_dim=_TOKEN_BF16_DIM,
+        token_data_size=_TOKEN_DATA_SIZE,
+        token_scale_dim=_TOKEN_SCALE_DIM,
+        quant_block_size=_QUANT_BLOCK_SIZE,
+        block_elems=_QUANT_BLOCK_SIZE,
+    )
+    return selected_kv, local_indices, topk_length
+
+
 def _flash_mla_sparse_prefill_v2_direct_cache(
     *,
     q: torch.Tensor,
@@ -461,7 +730,7 @@ def _flash_mla_sparse_prefill_v2_direct_cache(
 
     total_topk = ((top_k + window_size + block_I - 1) // block_I) * block_I
     selected_kv, local_indices, topk_length = (
-        _tilelang_gather_selected_fp8_ds_mla_cache(
+        _triton_gather_selected_fp8_ds_mla_cache(
             compressed_k_cache=compressed_k_cache,
             swa_k_cache=swa_k_cache,
             compressed_block_table=compressed_block_table,
