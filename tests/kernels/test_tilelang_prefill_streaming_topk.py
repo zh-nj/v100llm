@@ -421,3 +421,45 @@ def test_streaming_topk_tilelang_candidate_merge_matches_torch_cuda():
     for row in range(best_scores.shape[0]):
         assert set(next_scores[row].tolist()) == set(expected_scores[row].tolist())
         assert set(next_indices[row].tolist()) == set(expected_indices[row].tolist())
+
+
+@pytest.mark.skipif(
+    not _has_sm70_cuda(),
+    reason="SM70 CUDA is required for TileLang final index copy",
+)
+@torch.inference_mode()
+def test_streaming_topk_tilelang_final_index_copy_masks_short_rows_cuda():
+    from vllm.v1.attention.ops.tilelang_prefill_topk import is_tilelang_available
+    from vllm.v1.attention.ops.tilelang_prefill_streaming_topk import (
+        _copy_final_indices_tilelang,
+    )
+
+    ok, reason = is_tilelang_available()
+    if not ok:
+        pytest.skip(reason)
+
+    device = torch.device("cuda")
+    best_indices = torch.tensor(
+        [[8, 3, 1, 7], [5, 6, 9, 10], [2, 4, 11, 12]],
+        dtype=torch.int32,
+        device=device,
+    )
+    row_starts = torch.tensor([0, 10, 20], dtype=torch.int32, device=device)
+    row_ends = torch.tensor([2, 14, 20], dtype=torch.int32, device=device)
+    out_indices = torch.empty_like(best_indices)
+
+    _copy_final_indices_tilelang(
+        best_indices=best_indices,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        out_indices=out_indices,
+        topk_tokens=4,
+        threads=256,
+    )
+
+    expected = torch.tensor(
+        [[8, 3, -1, -1], [5, 6, 9, 10], [-1, -1, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    torch.testing.assert_close(out_indices, expected)

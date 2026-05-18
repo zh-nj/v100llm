@@ -28,6 +28,8 @@ _CANDIDATE_BUFFER_FACTORY = None
 _CANDIDATE_BUFFER_CACHE: dict[tuple[int, int, int], object] = {}
 _CANDIDATE_GATHER_FACTORY = None
 _CANDIDATE_GATHER_CACHE: dict[tuple[int, int, int], object] = {}
+_FINAL_INDICES_FACTORY = None
+_FINAL_INDICES_CACHE: dict[tuple[int, int], object] = {}
 
 
 def _require_cuda_tensors(*tensors: torch.Tensor) -> None:
@@ -170,6 +172,41 @@ def _build_candidate_gather_kernel_factory():
     return build_candidate_gather_kernel
 
 
+def _build_final_indices_kernel_factory():
+    import tilelang
+    from tilelang import language as T
+
+    @tilelang.jit(
+        target="cuda -arch=sm_70",
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        },
+    )
+    def build_final_indices_kernel(topk: int, threads: int = 256):
+        rows = T.dynamic("rows")
+
+        @T.prim_func
+        def main(
+            BestIndices: T.Tensor((rows, topk), T.int32),
+            RowStarts: T.Tensor((rows,), T.int32),
+            RowEnds: T.Tensor((rows,), T.int32),
+            Output: T.Tensor((rows, topk), T.int32),
+        ):
+            with T.Kernel(rows, threads=threads) as row:
+                length = RowEnds[row] - RowStarts[row]
+                for col in T.Parallel(topk):
+                    Output[row, col] = T.if_then_else(
+                        col < length,
+                        BestIndices[row, col],
+                        -1,
+                    )
+
+        return main
+
+    return build_final_indices_kernel
+
+
 def _get_candidate_buffer_kernel(topk: int, tile_keep: int, threads: int):
     global _CANDIDATE_BUFFER_FACTORY
     if _CANDIDATE_BUFFER_FACTORY is None:
@@ -196,6 +233,19 @@ def _get_candidate_gather_kernel(topk: int, candidate_width: int, threads: int):
             threads=threads,
         )
     return _CANDIDATE_GATHER_CACHE[key]
+
+
+def _get_final_indices_kernel(topk: int, threads: int):
+    global _FINAL_INDICES_FACTORY
+    if _FINAL_INDICES_FACTORY is None:
+        _FINAL_INDICES_FACTORY = _build_final_indices_kernel_factory()
+    key = (topk, threads)
+    if key not in _FINAL_INDICES_CACHE:
+        _FINAL_INDICES_CACHE[key] = _FINAL_INDICES_FACTORY(
+            topk=topk,
+            threads=threads,
+        )
+    return _FINAL_INDICES_CACHE[key]
 
 
 def _compute_tile_logits(
@@ -420,6 +470,24 @@ def _update_best_candidates_tilelang(
     return next_scores, next_indices
 
 
+def _copy_final_indices_tilelang(
+    *,
+    best_indices: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    out_indices: torch.Tensor,
+    topk_tokens: int,
+    threads: int,
+) -> None:
+    kernel = _get_final_indices_kernel(topk_tokens, threads)
+    kernel(
+        best_indices,
+        row_starts.contiguous(),
+        row_ends.contiguous(),
+        out_indices,
+    )
+
+
 def _prefill_streaming_topk_chunked_tilelang(
     *,
     q: torch.Tensor,
@@ -480,20 +548,13 @@ def _prefill_streaming_topk_chunked_tilelang(
             threads=threads,
         )
 
-    out_indices.fill_(-1)
-    valid_counts = torch.clamp(
-        row_ends.to(torch.int64) - row_starts.to(torch.int64),
-        min=0,
-        max=topk_tokens,
-    )
-    cols = torch.arange(topk_tokens, device=q.device).view(1, -1)
-    valid_out = cols < valid_counts.view(-1, 1)
-    out_indices.copy_(
-        torch.where(
-            valid_out,
-            best_indices[:, :topk_tokens],
-            torch.full_like(out_indices, -1),
-        )
+    _copy_final_indices_tilelang(
+        best_indices=best_indices,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        out_indices=out_indices,
+        topk_tokens=topk_tokens,
+        threads=threads,
     )
 
 
