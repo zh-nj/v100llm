@@ -1004,6 +1004,20 @@ def test_tilelang_sparse_prefill_fast_io_can_jit_uncached_shape(monkeypatch):
     )
 
 
+def test_tilelang_sparse_prefill_stage_env_default_and_override(monkeypatch):
+    import vllm.envs as env_module
+
+    monkeypatch.delenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES", raising=False)
+    assert env_module.environment_variables[
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES"
+    ]() == 1
+
+    monkeypatch.setenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES", "2")
+    assert env_module.environment_variables[
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES"
+    ]() == 2
+
+
 def test_sparse_prefill_v2_default_off(monkeypatch):
     monkeypatch.setattr(d4a.envs, "VLLM_SM70_USE_SPARSE_PREFILL_V2", False)
     q = torch.empty(1, 64, 576, dtype=torch.float16)

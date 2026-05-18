@@ -2296,6 +2296,7 @@ def _should_use_tilelang_sparse_prefill_fast_io(
             topk_length=topk_length,
             output_dtype=torch.bfloat16,
             block_I=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI,
+            num_stages=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES,
             threads=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS,
         )
         if cached:
@@ -3319,6 +3320,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                                     device=attn_sink.device,
                                     dtype=torch.bfloat16,
                                     block_I=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI,
+                                    num_stages=(
+                                        envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES
+                                    ),
                                     threads=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS,
                                 )
                 except Exception as exc:  # pragma: no cover - best-effort
@@ -3850,6 +3854,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                                 block_I=(
                                     envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI
                                 ),
+                                num_stages=(
+                                    envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES
+                                ),
                                 threads=(
                                     envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS
                                 ),
@@ -4082,6 +4089,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                                 output_dtype=torch.bfloat16,
                                 block_I=(
                                     envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI
+                                ),
+                                num_stages=(
+                                    envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES
                                 ),
                                 threads=(
                                     envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS

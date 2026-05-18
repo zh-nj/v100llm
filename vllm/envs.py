@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS: bool = True
     VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT: int = 65536
     VLLM_SM70_TILELANG_SPARSE_PREFILL_BI: int = 16
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES: int = 1
     VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS: int = 128
     VLLM_SM70_TILELANG_SPARSE_PREFILL_OUTPUT_CHUNK_MB: int = 64
     VLLM_SM70_HC_HEAD_CHUNK_MB: int = 128
@@ -1015,6 +1016,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the SM70 MMA macro's N >= 16 constraint.
     "VLLM_SM70_TILELANG_SPARSE_PREFILL_BI": lambda: int(
         os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_BI", "16")
+    ),
+    # TileLang sparse MLA pipeline stages. Default remains the validated
+    # single-stage V100 path; set to 2 only for explicit micro sweeps.
+    "VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES": lambda: max(
+        1, int(os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES", "1"))
     ),
     # TileLang sparse MLA threads per block. 128 is the validated
     # setting on V100.
