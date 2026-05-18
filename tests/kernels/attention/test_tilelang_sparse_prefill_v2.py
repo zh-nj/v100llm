@@ -245,3 +245,60 @@ def test_sparse_prefill_v2_reference_load_fp8_ds_mla_token_matches_layout():
     )
     torch.testing.assert_close(token[:448], expected_nope.to(torch.float16))
     torch.testing.assert_close(token[448:], rope_tail.to(torch.float16))
+
+
+def test_sparse_prefill_v2_tilelang_load_fp8_ds_mla_token_matches_reference():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    import vllm.v1.attention.ops.tilelang_sparse_prefill_v2 as v2
+
+    ok, reason = v2.tilelang_sparse_prefill.is_tilelang_available()
+    if not ok:
+        pytest.skip(reason)
+
+    block_size = 4
+    physical_block = 1
+    block_offset = 2
+    cache = torch.zeros(2, block_size, 584, dtype=torch.uint8)
+    cache_2d = cache.reshape(cache.shape[0], -1)
+
+    fp8_values = torch.linspace(
+        -2.0, 2.0, 448, dtype=torch.float32
+    ).to(torch.float8_e4m3fn)
+    scales = torch.tensor([127, 128, 126, 127, 129, 125, 127], dtype=torch.uint8)
+    rope_tail = (
+        torch.arange(64, dtype=torch.float32).to(torch.bfloat16) + 100
+    )
+    token_data_offset = block_offset * 576
+    token_scale_offset = block_size * 576 + block_offset * 8
+    cache_2d[
+        physical_block, token_data_offset : token_data_offset + 448
+    ] = fp8_values.view(torch.uint8)
+    cache_2d[
+        physical_block, token_data_offset + 448 : token_data_offset + 576
+    ] = rope_tail.view(torch.uint8)
+    cache_2d[
+        physical_block, token_scale_offset : token_scale_offset + 7
+    ] = scales
+
+    expected = v2._reference_load_fp8_ds_mla_token(
+        cache,
+        physical_block=physical_block,
+        block_offset=block_offset,
+        block_size=block_size,
+        output_dtype=torch.float16,
+    )
+    actual = v2._tilelang_debug_load_fp8_ds_mla_tokens(
+        cache.cuda(),
+        physical_blocks=torch.tensor(
+            [physical_block], dtype=torch.int32, device="cuda"
+        ),
+        block_offsets=torch.tensor(
+            [block_offset], dtype=torch.int32, device="cuda"
+        ),
+        block_size=block_size,
+        output_dtype=torch.float16,
+    )
+
+    torch.testing.assert_close(actual.cpu()[0], expected, rtol=0, atol=0)

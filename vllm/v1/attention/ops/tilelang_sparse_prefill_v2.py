@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 import torch
@@ -184,6 +182,157 @@ def _reference_load_fp8_ds_mla_token(
     token[:_TOKEN_FP8_DIM] = (fp8_values * scales).to(output_dtype)
     token[_TOKEN_FP8_DIM:] = bf16_bytes.view(torch.bfloat16).to(output_dtype)
     return token
+
+
+_DEBUG_LOAD_KERNEL_CACHE: dict[tuple[int, str, int], object] = {}
+_DEBUG_LOAD_KERNEL_FACTORY = None
+
+
+def _build_debug_load_kernel_factory():
+    import tilelang
+    from tilelang import language as T
+
+    @tilelang.jit(
+        out_idx=[-1],
+        target="cuda -arch=sm_70",
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        },
+    )
+    def build_debug_load_kernel(
+        block_size: int,
+        output_dtype_str: str = "float16",
+        threads: int = 128,
+    ):
+        num_tokens = T.dynamic("num_tokens")
+        num_blocks = T.dynamic("num_blocks")
+        block_bytes = T.dynamic("block_bytes")
+
+        cache_shape = [num_blocks, block_bytes]
+        row_shape = [num_tokens]
+        out_shape = [num_tokens, _TOKEN_FP8_DIM + _TOKEN_BF16_DIM]
+        out_dtype = (
+            T.bfloat16 if output_dtype_str == "bfloat16" else T.float16
+        )
+        _shape_refs = (cache_shape, row_shape, out_shape)
+
+        @T.prim_func
+        def main(
+            KCache: T.Tensor(cache_shape, T.uint8),
+            PhysicalBlocks: T.Tensor(row_shape, T.int32),
+            BlockOffsets: T.Tensor(row_shape, T.int32),
+            Output: T.Tensor(out_shape, out_dtype),
+        ):
+            with T.Kernel(num_tokens, threads=threads) as bx:
+                physical_block = PhysicalBlocks[bx]
+                block_offset = BlockOffsets[bx]
+                token_data_offset = block_offset * _TOKEN_DATA_SIZE
+                token_scale_offset = (
+                    block_size * _TOKEN_DATA_SIZE
+                    + block_offset * _TOKEN_SCALE_DIM
+                )
+
+                for d_i in T.Parallel(_TOKEN_FP8_DIM + _TOKEN_BF16_DIM):
+                    x_uint8 = KCache[
+                        physical_block, token_data_offset + d_i
+                    ]
+                    val32 = T.Cast(T.int32, x_uint8)
+                    sign_bit = (val32 & 0x80) << 24
+                    low7 = val32 & 0x7F
+                    fp32_bits = sign_bit | ((low7 + (120 << 3)) << 20)
+                    fp32_bits = T.if_then_else(low7 == 0, 0, fp32_bits)
+                    normal_val = T.reinterpret(fp32_bits, "float32")
+                    is_subnorm = (low7 < 8) & (low7 != 0)
+                    subnorm_val = T.Cast(T.float32, low7) * 1.953125e-3
+                    sign_mask = (val32 >> 7) & 1
+                    subnorm_val = T.if_then_else(
+                        sign_mask == 1, -subnorm_val, subnorm_val
+                    )
+                    x_float = T.if_then_else(
+                        is_subnorm, subnorm_val, normal_val
+                    )
+
+                    scale_byte = KCache[
+                        physical_block,
+                        token_scale_offset + d_i // _QUANT_BLOCK_SIZE,
+                    ]
+                    scale = T.exp2(T.Cast(T.float32, scale_byte) - 127.0)
+                    Output[bx, d_i] = T.if_then_else(
+                        d_i < _TOKEN_FP8_DIM,
+                        T.Cast(out_dtype, x_float * scale),
+                        T.Cast(out_dtype, 0),
+                    )
+
+                for rope_i in T.Parallel(_TOKEN_BF16_DIM):
+                    byte_offset = (
+                        token_data_offset
+                        + _TOKEN_FP8_DIM
+                        + rope_i * 2
+                    )
+                    lo = T.Cast(
+                        T.int32, KCache[physical_block, byte_offset]
+                    )
+                    hi = T.Cast(
+                        T.int32, KCache[physical_block, byte_offset + 1]
+                    )
+                    bf16_u16 = lo | (hi << 8)
+                    fp32_bits = bf16_u16 << 16
+                    rope_val = T.reinterpret(fp32_bits, "float32")
+                    Output[bx, _TOKEN_FP8_DIM + rope_i] = T.Cast(
+                        out_dtype, rope_val
+                    )
+
+        return main
+
+    return build_debug_load_kernel
+
+
+def _get_debug_load_kernel(
+    *,
+    block_size: int,
+    output_dtype: torch.dtype,
+    threads: int = 128,
+):
+    global _DEBUG_LOAD_KERNEL_FACTORY
+    if _DEBUG_LOAD_KERNEL_FACTORY is None:
+        _DEBUG_LOAD_KERNEL_FACTORY = _build_debug_load_kernel_factory()
+    output_dtype_str = (
+        "bfloat16" if output_dtype is torch.bfloat16 else "float16"
+    )
+    key = (block_size, output_dtype_str, threads)
+    if key not in _DEBUG_LOAD_KERNEL_CACHE:
+        _DEBUG_LOAD_KERNEL_CACHE[key] = _DEBUG_LOAD_KERNEL_FACTORY(
+            block_size=block_size,
+            output_dtype_str=output_dtype_str,
+            threads=threads,
+        )
+    return _DEBUG_LOAD_KERNEL_CACHE[key]
+
+
+def _tilelang_debug_load_fp8_ds_mla_tokens(
+    k_cache: torch.Tensor,
+    *,
+    physical_blocks: torch.Tensor,
+    block_offsets: torch.Tensor,
+    block_size: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    if k_cache.dtype is not torch.uint8:
+        raise ValueError("fp8_ds_mla cache must be uint8")
+    if not k_cache.is_cuda:
+        raise ValueError("TileLang debug load requires CUDA cache")
+    k_cache_2d = k_cache.reshape(k_cache.shape[0], -1).contiguous()
+    kernel = _get_debug_load_kernel(
+        block_size=block_size,
+        output_dtype=output_dtype,
+    )
+    result = kernel(
+        k_cache_2d,
+        physical_blocks.to(torch.int32).contiguous(),
+        block_offsets.to(torch.int32).contiguous(),
+    )
+    return result[0] if isinstance(result, tuple) else result
 
 
 def _flash_mla_sparse_prefill_v2_oracle(
