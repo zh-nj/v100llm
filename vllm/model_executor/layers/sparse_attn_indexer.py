@@ -403,6 +403,30 @@ def _should_use_tilelang_topk_prefill(
         return False
 
 
+def _should_use_streaming_topk_prefill(
+    *,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_tokens: int,
+    use_fp4_cache: bool,
+    max_row_len: int | None,
+) -> bool:
+    del q, kv_cache
+    if not envs.VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK:
+        return False
+    if use_fp4_cache:
+        return False
+    if not current_platform.is_cuda():
+        return False
+    if not current_platform.is_device_capability_family(70):
+        return False
+    if topk_tokens not in (512, 1024, 2048):
+        return False
+    if max_row_len is None or max_row_len < 8192:
+        return False
+    return True
+
+
 def _prefill_topk_indices(
     logits: torch.Tensor,
     row_starts: torch.Tensor,

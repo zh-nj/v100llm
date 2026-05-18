@@ -123,6 +123,8 @@ if TYPE_CHECKING:
     VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS: bool = False
     VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE: bool = False
     VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB: int = 64
+    VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK: bool = False
+    VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -1049,6 +1051,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # direct-cache attention kernel replaces it.
     "VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB": lambda: int(
         os.getenv("VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB", "64")
+    ),
+    # Streaming prefill indexer top-k computes tile logits and merges
+    # candidates without materializing full [rows, kv_tokens] fp32 logits.
+    "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK": lambda: bool(
+        int(os.getenv("VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK", "0"))
+    ),
+    "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE": lambda: bool(
+        int(os.getenv(
+            "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE", "0"))
     ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (

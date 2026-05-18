@@ -118,9 +118,34 @@ def test_deepseek_v4_sm70_experimental_envs_are_registered() -> None:
         "VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS",
         "VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE",
         "VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB",
+        "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK",
+        "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE",
     }
 
     assert expected_envs.issubset(environment_variables)
+
+
+def test_sparse_indexer_streaming_topk_envs_default_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK", raising=False
+    )
+    monkeypatch.delenv(
+        "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE",
+        raising=False,
+    )
+
+    assert (
+        environment_variables["VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK"]()
+        is False
+    )
+    assert (
+        environment_variables[
+            "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE"
+        ]()
+        is False
+    )
 
 
 def test_deepseek_v4_sparse_prefill_v2_envs_default_off(
