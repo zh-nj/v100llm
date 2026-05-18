@@ -258,13 +258,9 @@ def _build_debug_load_kernel_factory():
                         token_scale_offset + d_i // _QUANT_BLOCK_SIZE,
                     ]
                     scale = T.exp2(T.Cast(T.float32, scale_byte) - 127.0)
-                    Output[bx, d_i] = T.if_then_else(
-                        d_i < _TOKEN_FP8_DIM,
-                        T.Cast(out_dtype, x_float * scale),
-                        T.Cast(out_dtype, 0),
+                    rope_i = T.if_then_else(
+                        d_i >= _TOKEN_FP8_DIM, d_i - _TOKEN_FP8_DIM, 0
                     )
-
-                for rope_i in T.Parallel(_TOKEN_BF16_DIM):
                     byte_offset = (
                         token_data_offset
                         + _TOKEN_FP8_DIM
@@ -279,8 +275,10 @@ def _build_debug_load_kernel_factory():
                     bf16_u16 = lo | (hi << 8)
                     fp32_bits = bf16_u16 << 16
                     rope_val = T.reinterpret(fp32_bits, "float32")
-                    Output[bx, _TOKEN_FP8_DIM + rope_i] = T.Cast(
-                        out_dtype, rope_val
+                    Output[bx, d_i] = T.if_then_else(
+                        d_i < _TOKEN_FP8_DIM,
+                        T.Cast(out_dtype, x_float * scale),
+                        T.Cast(out_dtype, rope_val),
                     )
 
         return main
@@ -333,6 +331,171 @@ def _tilelang_debug_load_fp8_ds_mla_tokens(
         block_offsets.to(torch.int32).contiguous(),
     )
     return result[0] if isinstance(result, tuple) else result
+
+
+def _tilelang_gather_selected_fp8_ds_mla_cache(
+    *,
+    compressed_k_cache: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    compressed_block_table: torch.Tensor,
+    swa_block_table: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    top_k: int,
+    total_topk: int,
+    dim: int,
+    output_dtype: torch.dtype = torch.float16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if seq_lens.numel() != 1:
+        raise NotImplementedError(
+            "selected direct-cache gather currently supports one prefill "
+            "request per launch"
+        )
+    if dim != _TOKEN_FP8_DIM + _TOKEN_BF16_DIM:
+        raise ValueError("selected direct-cache gather currently supports dim=512")
+    if topk_indices.ndim != 2 or topk_indices.shape[1] != top_k:
+        raise ValueError("topk_indices must have shape [tokens, top_k]")
+
+    row_map = _reference_direct_cache_row_map(
+        topk_indices=topk_indices,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        compressed_block_table=compressed_block_table,
+        swa_block_table=swa_block_table,
+        compressed_block_size=compressed_k_cache.shape[1],
+        swa_block_size=swa_k_cache.shape[1],
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+        top_k=top_k,
+    )
+    num_tokens = topk_indices.shape[0]
+    selected_kv = torch.zeros(
+        (num_tokens, total_topk, dim),
+        dtype=output_dtype,
+        device=topk_indices.device,
+    )
+    local_indices = torch.zeros(
+        (num_tokens, 1, total_topk),
+        dtype=torch.int32,
+        device=topk_indices.device,
+    )
+    arange = torch.arange(
+        num_tokens * total_topk,
+        dtype=torch.int32,
+        device=topk_indices.device,
+    ).view(num_tokens, total_topk)
+    row_capacity = row_map.source.shape[1]
+    valid_span = min(row_capacity, total_topk)
+    valid = row_map.source[:, :valid_span] != _DIRECT_CACHE_SOURCE_INVALID
+    local_indices[:, 0, :valid_span] = torch.where(
+        valid,
+        arange[:, :valid_span],
+        torch.zeros((), dtype=torch.int32, device=topk_indices.device),
+    )
+
+    compressed_mask = (
+        row_map.source[:, :valid_span] == _DIRECT_CACHE_SOURCE_COMPRESSED
+    )
+    selected_flat = selected_kv.view(num_tokens * total_topk, dim)
+    if bool(compressed_mask.any().item()):
+        token_idx, selected_idx = compressed_mask.nonzero(as_tuple=True)
+        loaded = _tilelang_debug_load_fp8_ds_mla_tokens(
+            compressed_k_cache,
+            physical_blocks=row_map.physical_block[:, :valid_span][
+                compressed_mask
+            ],
+            block_offsets=row_map.block_offset[:, :valid_span][compressed_mask],
+            block_size=compressed_k_cache.shape[1],
+            output_dtype=output_dtype,
+        )
+        flat_idx = (token_idx * total_topk + selected_idx).to(torch.int64)
+        selected_flat.index_copy_(0, flat_idx, loaded.contiguous())
+
+    swa_mask = row_map.source[:, :valid_span] == _DIRECT_CACHE_SOURCE_SWA
+    if bool(swa_mask.any().item()):
+        token_idx, selected_idx = swa_mask.nonzero(as_tuple=True)
+        loaded = _tilelang_debug_load_fp8_ds_mla_tokens(
+            swa_k_cache,
+            physical_blocks=row_map.physical_block[:, :valid_span][swa_mask],
+            block_offsets=row_map.block_offset[:, :valid_span][swa_mask],
+            block_size=swa_k_cache.shape[1],
+            output_dtype=output_dtype,
+        )
+        flat_idx = (token_idx * total_topk + selected_idx).to(torch.int64)
+        selected_flat.index_copy_(0, flat_idx, loaded.contiguous())
+
+    topk_length = row_map.length.to(torch.int32).contiguous()
+    return selected_kv, local_indices, topk_length
+
+
+def _flash_mla_sparse_prefill_v2_direct_cache(
+    *,
+    q: torch.Tensor,
+    compressed_k_cache: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    compressed_block_table: torch.Tensor,
+    swa_block_table: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    top_k: int,
+    sm_scale: float,
+    attn_sink: torch.Tensor,
+    out: torch.Tensor,
+    block_I: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if q.ndim != 3 or q.shape[1] != 64 or q.shape[-1] != 512:
+        raise ValueError("direct-cache v2 first kernel supports q [tokens, 64, 512]")
+    if out.shape != q.shape:
+        raise ValueError("out must match q shape for direct-cache v2 first kernel")
+    if topk_indices.shape != (q.shape[0], top_k):
+        raise ValueError("topk_indices must have shape [tokens, top_k]")
+
+    total_topk = ((top_k + window_size + block_I - 1) // block_I) * block_I
+    selected_kv, local_indices, topk_length = (
+        _tilelang_gather_selected_fp8_ds_mla_cache(
+            compressed_k_cache=compressed_k_cache,
+            swa_k_cache=swa_k_cache,
+            compressed_block_table=compressed_block_table,
+            swa_block_table=swa_block_table,
+            topk_indices=topk_indices,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+            top_k=top_k,
+            total_topk=total_topk,
+            dim=q.shape[-1],
+            output_dtype=torch.float16,
+        )
+    )
+    flash_output, max_logits, lse = (
+        tilelang_sparse_prefill.flash_mla_sparse_fwd_tilelang(
+            q=q,
+            kv=selected_kv.view(-1, 1, q.shape[-1]),
+            indices=local_indices,
+            sm_scale=sm_scale,
+            d_v=512,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            out=out,
+            output_dtype=torch.float16,
+            block_I=block_I,
+        )
+    )
+    if flash_output.data_ptr() != out.data_ptr() or flash_output.dtype != out.dtype:
+        out.copy_(flash_output)
+        flash_output = out
+    return flash_output, max_logits, lse
 
 
 def _flash_mla_sparse_prefill_v2_oracle(

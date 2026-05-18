@@ -302,3 +302,132 @@ def test_sparse_prefill_v2_tilelang_load_fp8_ds_mla_token_matches_reference():
     )
 
     torch.testing.assert_close(actual.cpu()[0], expected, rtol=0, atol=0)
+
+
+def test_sparse_prefill_v2_direct_cache_attention_matches_gather_path():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+    import vllm.v1.attention.ops.tilelang_sparse_prefill_v2 as v2
+    from vllm.v1.attention.ops.deepseek_v4_ops import (
+        combine_topk_swa_indices,
+        dequantize_and_gather_k_cache,
+    )
+    from vllm.v1.attention.ops.deepseek_v4_ops.cache_utils import (
+        _torch_quantize_and_insert_k_cache,
+    )
+
+    ok, reason = tilelang_prefill.is_tilelang_available()
+    if not ok:
+        pytest.skip(reason)
+
+    device = torch.device("cuda")
+    block_size = 4
+    compress_ratio = 2
+    top_k = 2
+    window_size = 2
+    seq_lens = torch.tensor([6], dtype=torch.int32, device=device)
+    gather_lens = torch.tensor([4], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    compressed_block_table = torch.tensor([[0]], dtype=torch.int32, device=device)
+    swa_block_table = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+    topk_indices = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32, device=device)
+
+    compressed_rows = torch.linspace(
+        -0.5, 0.5, 3 * 512, dtype=torch.float32
+    ).reshape(3, 512).to(torch.bfloat16)
+    swa_rows = torch.linspace(
+        0.25, -0.25, 6 * 512, dtype=torch.float32
+    ).reshape(6, 512).to(torch.bfloat16)
+    compressed_cache = torch.zeros(1, block_size, 584, dtype=torch.uint8)
+    swa_cache = torch.zeros(2, block_size, 584, dtype=torch.uint8)
+    _torch_quantize_and_insert_k_cache(
+        compressed_rows,
+        compressed_cache,
+        torch.arange(3, dtype=torch.int64),
+        block_size,
+    )
+    _torch_quantize_and_insert_k_cache(
+        swa_rows,
+        swa_cache,
+        torch.arange(6, dtype=torch.int64),
+        block_size,
+    )
+    compressed_cache = compressed_cache.to(device)
+    swa_cache = swa_cache.to(device)
+
+    q = torch.linspace(
+        -0.125, 0.125, 2 * 64 * 512, dtype=torch.float32, device=device
+    ).reshape(2, 64, 512).to(torch.float16)
+    out_direct = torch.empty(2, 64, 512, dtype=torch.float16, device=device)
+    attn_sink = torch.full((64,), -float("inf"), dtype=torch.float32, device=device)
+    sm_scale = 0.25
+
+    direct, _direct_max, _direct_lse = v2._flash_mla_sparse_prefill_v2_direct_cache(
+        q=q,
+        compressed_k_cache=compressed_cache,
+        swa_k_cache=swa_cache,
+        compressed_block_table=compressed_block_table,
+        swa_block_table=swa_block_table,
+        topk_indices=topk_indices,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+        top_k=top_k,
+        sm_scale=sm_scale,
+        attn_sink=attn_sink,
+        out=out_direct,
+        block_I=16,
+    )
+
+    N = int(seq_lens.max().item()) // compress_ratio
+    M = N + int(gather_lens.max().item())
+    kv = torch.zeros((1, M, 512), dtype=torch.bfloat16, device=device)
+    dequantize_and_gather_k_cache(
+        kv,
+        compressed_cache,
+        seq_lens=seq_lens // compress_ratio,
+        gather_lens=None,
+        block_table=compressed_block_table,
+        block_size=block_size,
+        offset=0,
+    )
+    dequantize_and_gather_k_cache(
+        kv,
+        swa_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=swa_block_table,
+        block_size=block_size,
+        offset=N,
+    )
+    combined_indices, combined_lens = combine_topk_swa_indices(
+        topk_indices,
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        window_size,
+        compress_ratio,
+        top_k,
+        M,
+        N,
+    )
+    expected, _expected_max, _expected_lse = (
+        tilelang_prefill.flash_mla_sparse_fwd_tilelang(
+            q=q,
+            kv=kv.view(-1, 1, 512),
+            indices=combined_indices.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=512,
+            attn_sink=attn_sink,
+            topk_length=combined_lens,
+            output_dtype=torch.float16,
+            block_I=16,
+        )
+    )
+
+    assert direct.data_ptr() == out_direct.data_ptr()
+    torch.testing.assert_close(direct, expected, atol=2e-2, rtol=2e-2)
