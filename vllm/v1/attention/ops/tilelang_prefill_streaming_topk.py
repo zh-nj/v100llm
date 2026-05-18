@@ -3,17 +3,85 @@
 """Streaming prefill top-k wrapper for the DSv4F sparse indexer.
 
 The public call boundary is intentionally shaped like the final implementation:
-query rows + gathered K cache + row ranges -> local top-k indices.  The first
-body uses torch tile chunks to establish the streaming candidate-merge
-semantics before the hot loop is lowered into TileLang/CUDA.
+query rows + gathered K cache + row ranges -> local top-k indices.  FP8 tile
+logits use the SM70 CUDA/Triton logits kernel; non-FP8 shapes retain the torch
+reference path.  Tile top-k and cross-tile candidate merge are still the next
+kernelization target.
 """
 
 import torch
+
+from vllm.model_executor.layers.sm70_mqa_logits import sm70_fp8_mqa_logits
+
+
+_FP8_DTYPES = tuple(
+    getattr(torch, name)
+    for name in ("float8_e4m3fn", "float8_e4m3fnuz")
+    if hasattr(torch, name)
+)
 
 
 def _require_cuda_tensors(*tensors: torch.Tensor) -> None:
     if not all(t.is_cuda for t in tensors):
         raise ValueError("streaming topk inputs must be CUDA tensors")
+
+
+def _is_supported_q_dtype(dtype: torch.dtype) -> bool:
+    return dtype in (torch.float16, torch.bfloat16, *_FP8_DTYPES)
+
+
+def _can_use_sm70_fp8_tile_logits(
+    q: torch.Tensor,
+    k_cache_values: torch.Tensor,
+) -> bool:
+    return (
+        q.is_cuda
+        and k_cache_values.is_cuda
+        and q.dtype in _FP8_DTYPES
+        and k_cache_values.dtype in _FP8_DTYPES
+        and q.ndim == 3
+        and q.shape[1] <= 8
+    )
+
+
+def _compute_tile_logits(
+    *,
+    q: torch.Tensor,
+    k_cache_values: torch.Tensor,
+    k_cache_scales: torch.Tensor,
+    weights: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    tile_start: int,
+    tile_end: int,
+) -> torch.Tensor:
+    k_tile = k_cache_values[tile_start:tile_end]
+    scale_tile = k_cache_scales.reshape(-1)[tile_start:tile_end]
+    if _can_use_sm70_fp8_tile_logits(q, k_cache_values):
+        tile_len = tile_end - tile_start
+        tile_row_starts = torch.clamp(row_starts - tile_start, 0, tile_len)
+        tile_row_ends = torch.clamp(row_ends - tile_start, 0, tile_len)
+        return sm70_fp8_mqa_logits(
+            q,
+            (k_tile, scale_tile),
+            weights,
+            tile_row_starts.to(torch.int32).contiguous(),
+            tile_row_ends.to(torch.int32).contiguous(),
+        )
+
+    q_f32 = q.float()
+    weights_t = weights.float().transpose(0, 1).unsqueeze(-1)
+    k_tile_f32 = k_tile.float() * scale_tile.float().view(-1, 1)
+    score = torch.einsum("mhd,nd->hmn", q_f32, k_tile_f32)
+    tile_logits = (score.relu() * weights_t).sum(dim=0)
+    positions = torch.arange(tile_start, tile_end, device=q.device)
+    row_starts_i64 = row_starts.to(torch.int64)
+    row_ends_i64 = row_ends.to(torch.int64)
+    valid = (
+        (positions.view(1, -1) >= row_starts_i64.view(-1, 1))
+        & (positions.view(1, -1) < row_ends_i64.view(-1, 1))
+    )
+    return tile_logits.masked_fill(~valid, -torch.inf)
 
 
 def _prefill_streaming_topk_chunked_torch(
@@ -28,9 +96,6 @@ def _prefill_streaming_topk_chunked_torch(
     topk_tokens: int,
     tile_k: int,
 ) -> None:
-    q_f32 = q.float()
-    weights_t = weights.float().transpose(0, 1).unsqueeze(-1)
-    scale_flat = k_cache_scales.reshape(-1).float()
     row_starts_i64 = row_starts.to(torch.int64)
     row_ends_i64 = row_ends.to(torch.int64)
     rows = q.shape[0]
@@ -41,18 +106,17 @@ def _prefill_streaming_topk_chunked_torch(
     best_indices = torch.empty((rows, 0), dtype=torch.int32, device=device)
     for tile_start in range(0, kv_tokens, tile_k):
         tile_end = min(tile_start + tile_k, kv_tokens)
-        k_tile = (
-            k_cache_values[tile_start:tile_end].float()
-            * scale_flat[tile_start:tile_end].view(-1, 1)
+        tile_logits = _compute_tile_logits(
+            q=q,
+            k_cache_values=k_cache_values,
+            k_cache_scales=k_cache_scales,
+            weights=weights,
+            row_starts=row_starts,
+            row_ends=row_ends,
+            tile_start=tile_start,
+            tile_end=tile_end,
         )
-        score = torch.einsum("mhd,nd->hmn", q_f32, k_tile)
-        tile_logits = (score.relu() * weights_t).sum(dim=0)
         positions = torch.arange(tile_start, tile_end, device=device)
-        valid = (
-            (positions.view(1, -1) >= row_starts_i64.view(-1, 1))
-            & (positions.view(1, -1) < row_ends_i64.view(-1, 1))
-        )
-        tile_logits = tile_logits.masked_fill(~valid, -torch.inf)
         tile_topk = min(topk_tokens, tile_end - tile_start)
         tile_scores, tile_offsets = tile_logits.topk(tile_topk, dim=1)
         tile_indices = (
@@ -123,8 +187,8 @@ def prefill_streaming_topk_tilelang(
     tile_k: int = 1024,
     threads: int = 256,
 ) -> None:
-    if q.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("q must be fp16 or bf16")
+    if not _is_supported_q_dtype(q.dtype):
+        raise ValueError("q must be fp16, bf16, or fp8")
     if q.ndim != 3:
         raise ValueError("q must be a 3D [rows, heads, dim] tensor")
     if k_cache_values.ndim != 2 or k_cache_values.shape[1] != q.shape[-1]:

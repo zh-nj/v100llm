@@ -453,11 +453,8 @@ def _try_prefill_streaming_topk_indices(
         prefill_streaming_topk_tilelang,
     )
 
-    q_for_streaming = (
-        q if q.dtype in (torch.float16, torch.bfloat16) else q.to(torch.float16)
-    )
     prefill_streaming_topk_tilelang(
-        q=q_for_streaming,
+        q=q,
         k_cache_values=k_cache_values,
         k_cache_scales=k_cache_scales,
         weights=weights,

@@ -317,7 +317,7 @@ def test_try_streaming_topk_prefill_calls_streaming_wrapper(monkeypatch):
         fake_streaming_topk,
     )
 
-    q = torch.empty((2, 4, 16), dtype=torch.float32)
+    q = torch.empty((2, 4, 16), dtype=torch.float16)
     k_cache_values = torch.empty((128, 16), dtype=torch.float16)
     k_cache_scales = torch.ones((128,), dtype=torch.float32)
     weights = torch.ones((2, 4), dtype=torch.float32)
@@ -339,7 +339,7 @@ def test_try_streaming_topk_prefill_calls_streaming_wrapper(monkeypatch):
     )
 
     assert handled
-    assert captured["q"].dtype == torch.float16
+    assert captured["q"] is q
     assert captured["k_cache_values"] is k_cache_values
     assert captured["k_cache_scales"] is k_cache_scales
     assert captured["weights"] is weights
