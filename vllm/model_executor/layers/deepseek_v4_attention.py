@@ -2238,6 +2238,29 @@ def _copy_flashmla_output(
             output.copy_(flash_output)
 
 
+def _should_use_sparse_prefill_v2(
+    *,
+    q: torch.Tensor,
+    output: torch.Tensor,
+    padded_heads: int,
+    compress_ratio: int,
+    has_attn_metadata: bool,
+) -> bool:
+    if not envs.VLLM_SM70_USE_SPARSE_PREFILL_V2:
+        return False
+    if q.dtype is not torch.float16 or output.dtype is not torch.float16:
+        return False
+    if q.ndim < 1 or q.shape[-1] != 576:
+        return False
+    if padded_heads != 64:
+        return False
+    if compress_ratio not in (4, 128):
+        return False
+    if not has_attn_metadata:
+        return False
+    return True
+
+
 def _should_use_tilelang_sparse_prefill_fast_io(
     *,
     q: torch.Tensor,

@@ -1004,6 +1004,62 @@ def test_tilelang_sparse_prefill_fast_io_can_jit_uncached_shape(monkeypatch):
     )
 
 
+def test_sparse_prefill_v2_default_off(monkeypatch):
+    monkeypatch.setattr(d4a.envs, "VLLM_SM70_USE_SPARSE_PREFILL_V2", False)
+    q = torch.empty(1, 64, 576, dtype=torch.float16)
+    out = torch.empty(1, 64, 512, dtype=torch.float16)
+
+    assert not d4a._should_use_sparse_prefill_v2(
+        q=q,
+        output=out,
+        padded_heads=64,
+        compress_ratio=128,
+        has_attn_metadata=True,
+    )
+
+
+def test_sparse_prefill_v2_requires_supported_shape(monkeypatch):
+    monkeypatch.setattr(d4a.envs, "VLLM_SM70_USE_SPARSE_PREFILL_V2", True)
+    q = torch.empty(1, 64, 576, dtype=torch.float16)
+    out = torch.empty(1, 64, 512, dtype=torch.float16)
+
+    assert d4a._should_use_sparse_prefill_v2(
+        q=q,
+        output=out,
+        padded_heads=64,
+        compress_ratio=128,
+        has_attn_metadata=True,
+    )
+    assert not d4a._should_use_sparse_prefill_v2(
+        q=q.to(torch.bfloat16),
+        output=out,
+        padded_heads=64,
+        compress_ratio=128,
+        has_attn_metadata=True,
+    )
+    assert not d4a._should_use_sparse_prefill_v2(
+        q=q,
+        output=out,
+        padded_heads=128,
+        compress_ratio=128,
+        has_attn_metadata=True,
+    )
+    assert not d4a._should_use_sparse_prefill_v2(
+        q=q,
+        output=out,
+        padded_heads=64,
+        compress_ratio=1,
+        has_attn_metadata=True,
+    )
+    assert not d4a._should_use_sparse_prefill_v2(
+        q=q,
+        output=out,
+        padded_heads=64,
+        compress_ratio=128,
+        has_attn_metadata=False,
+    )
+
+
 def test_prefill_graph_dispatcher_cache_reuses_shape_and_device(monkeypatch):
     d4a._PREFILL_GRAPH_DISPATCHER_CACHE.clear()
     created = []

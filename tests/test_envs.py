@@ -113,9 +113,30 @@ def test_deepseek_v4_sm70_experimental_envs_are_registered() -> None:
         "VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE",
         "VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS",
         "VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT",
+        "VLLM_SM70_USE_SPARSE_PREFILL_V2",
+        "VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS",
+        "VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE",
     }
 
     assert expected_envs.issubset(environment_variables)
+
+
+def test_deepseek_v4_sparse_prefill_v2_envs_default_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_SM70_USE_SPARSE_PREFILL_V2", raising=False)
+    monkeypatch.delenv("VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS", raising=False)
+    monkeypatch.delenv("VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE", raising=False)
+
+    assert environment_variables["VLLM_SM70_USE_SPARSE_PREFILL_V2"]() is False
+    assert (
+        environment_variables["VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS"]()
+        is False
+    )
+    assert (
+        environment_variables["VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE"]()
+        is False
+    )
 
 
 def test_deepseek_v4_prefill_chunk_size_env(
