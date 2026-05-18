@@ -9,6 +9,13 @@ import torch
 _HAS_FP8 = hasattr(torch, "float8_e4m3fn")
 
 
+def _has_sm70_cuda() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability(0) == (7, 0)
+    )
+
+
 def _make_inputs():
     rows = 2
     heads = 4
@@ -272,6 +279,66 @@ def test_streaming_topk_fp8_hot_path_matches_full_logits_score_sets_cuda():
         out_indices=out_indices,
         topk_tokens=topk_tokens,
         tile_k=128,
+    )
+
+    k_f32 = k_cache_values.float() * k_cache_scales.view(-1, 1)
+    score = torch.einsum("mhd,nd->hmn", q.float(), k_f32)
+    logits = (
+        score.relu() * weights.float().transpose(0, 1).unsqueeze(-1)
+    ).sum(dim=0)
+
+    for row in range(rows):
+        start = int(row_starts[row].item())
+        end = int(row_ends[row].item())
+        expected = logits[row, start:end].topk(topk_tokens).indices.to(torch.int32)
+        assert set(out_indices[row].tolist()) == set(expected.tolist())
+
+
+@pytest.mark.skipif(
+    not _has_sm70_cuda(),
+    reason="SM70 CUDA is required for TileLang candidate top-k",
+)
+@torch.inference_mode()
+def test_streaming_topk_tilelang_candidate_loop_matches_full_logits_cuda():
+    from vllm.v1.attention.ops.tilelang_prefill_topk import is_tilelang_available
+    from vllm.v1.attention.ops.tilelang_prefill_streaming_topk import (
+        _prefill_streaming_topk_chunked_tilelang,
+    )
+
+    ok, reason = is_tilelang_available()
+    if not ok:
+        pytest.skip(reason)
+
+    torch.manual_seed(20260520)
+    device = torch.device("cuda")
+    rows = 3
+    heads = 3
+    dim = 16
+    kv_tokens = 256
+    topk_tokens = 16
+    q = torch.randn((rows, heads, dim), dtype=torch.float16, device=device)
+    k_cache_values = torch.randn(
+        (kv_tokens, dim), dtype=torch.float16, device=device
+    )
+    k_cache_scales = torch.linspace(
+        0.75, 1.25, kv_tokens, dtype=torch.float32, device=device
+    )
+    weights = torch.randn((rows, heads), dtype=torch.float32, device=device)
+    row_starts = torch.tensor([0, 11, 93], dtype=torch.int32, device=device)
+    row_ends = torch.tensor([129, 256, 127], dtype=torch.int32, device=device)
+    out_indices = torch.empty((rows, topk_tokens), dtype=torch.int32, device=device)
+
+    _prefill_streaming_topk_chunked_tilelang(
+        q=q,
+        k_cache_values=k_cache_values,
+        k_cache_scales=k_cache_scales,
+        weights=weights,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        out_indices=out_indices,
+        topk_tokens=topk_tokens,
+        tile_k=128,
+        threads=256,
     )
 
     k_f32 = k_cache_values.float() * k_cache_scales.view(-1, 1)
