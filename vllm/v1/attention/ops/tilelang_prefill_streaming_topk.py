@@ -30,6 +30,10 @@ _CANDIDATE_GATHER_FACTORY = None
 _CANDIDATE_GATHER_CACHE: dict[tuple[int, int, int], object] = {}
 _FINAL_INDICES_FACTORY = None
 _FINAL_INDICES_CACHE: dict[tuple[int, int], object] = {}
+# Current TileLang candidate maintenance is useful for small correctness tests,
+# but topk=512 production shapes benchmark slower than the chunked torch
+# candidate loop until the tile loop and merge are fused into fewer launches.
+_MAX_BENCHED_TILELANG_CANDIDATE_TOPK = 128
 
 
 def _require_cuda_tensors(*tensors: torch.Tensor) -> None:
@@ -572,7 +576,11 @@ def _prefill_streaming_topk_oracle(
     threads: int,
 ) -> None:
     ok, _ = is_tilelang_available()
-    if ok and _is_sm70_tensor_device(q):
+    if (
+        ok
+        and _is_sm70_tensor_device(q)
+        and topk_tokens <= _MAX_BENCHED_TILELANG_CANDIDATE_TOPK
+    ):
         _prefill_streaming_topk_chunked_tilelang(
             q=q,
             k_cache_values=k_cache_values,

@@ -202,6 +202,39 @@ def test_streaming_topk_tile_logits_uses_sm70_fp8_hot_kernel(monkeypatch):
     )
 
 
+def test_streaming_topk_oracle_keeps_production_topk_on_chunked_torch(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_prefill_streaming_topk as streaming_topk
+
+    monkeypatch.setattr(streaming_topk, "is_tilelang_available", lambda: (True, None))
+    monkeypatch.setattr(streaming_topk, "_is_sm70_tensor_device", lambda q: True)
+    calls = []
+
+    def fake_torch(**kwargs):
+        calls.append("torch")
+
+    def fake_tilelang(**kwargs):
+        calls.append("tilelang")
+
+    monkeypatch.setattr(
+        streaming_topk,
+        "_prefill_streaming_topk_chunked_torch",
+        fake_torch,
+    )
+    monkeypatch.setattr(
+        streaming_topk,
+        "_prefill_streaming_topk_chunked_tilelang",
+        fake_tilelang,
+    )
+
+    kwargs = _make_inputs()
+    kwargs["topk_tokens"] = 512
+    kwargs["tile_k"] = 1024
+    kwargs["threads"] = 256
+    streaming_topk._prefill_streaming_topk_oracle(**kwargs)
+
+    assert calls == ["torch"]
+
+
 def test_streaming_topk_chunked_torch_fills_short_rows_with_minus_one():
     from vllm.v1.attention.ops.tilelang_prefill_streaming_topk import (
         _prefill_streaming_topk_chunked_torch,
