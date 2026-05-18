@@ -83,8 +83,9 @@ def _sm70_fp8_paged_mqa_logits_kernel(
     processing all heads per chunk to keep K loaded and reduce register
     pressure from full-vector Q reloads.
     """
-    pid_row = tl.program_id(0)
-    k_pos = tl.program_id(1)
+    pid = tl.program_id(0)
+    pid_row = pid // max_model_len
+    k_pos = pid - pid_row * max_model_len
 
     batch_idx = pid_row // next_n
     next_idx = pid_row % next_n
@@ -259,7 +260,7 @@ def sm70_fp8_paged_mqa_logits(
     # contract tests valid by choosing a divisor of head_dim.
     BLOCK_D = _sm70_mqa_block_d(head_dim)
 
-    grid = (num_rows, max_model_len)
+    grid = _sm70_paged_mqa_logits_grid(num_rows, max_model_len)
     _sm70_fp8_paged_mqa_logits_kernel[grid](
         q_u8,
         q_u8.stride(0),
@@ -285,6 +286,10 @@ def sm70_fp8_paged_mqa_logits(
         BLOCK_D=BLOCK_D,
     )
     return logits
+
+
+def _sm70_paged_mqa_logits_grid(num_rows: int, max_model_len: int) -> tuple[int]:
+    return (num_rows * max_model_len,)
 
 
 @triton.jit
@@ -461,3 +466,43 @@ def sm70_fp8_mqa_logits(
         BLOCK_D=BLOCK_D,
     )
     return logits
+
+
+def sm70_fp8_mqa_logits_gemm(
+    q: torch.Tensor,  # [M, H, D] float8_e4m3fn
+    kv: tuple[torch.Tensor, torch.Tensor],  # (k [N, D] fp8, k_scale [N] fp32)
+    weights: torch.Tensor,  # [M, H] float32
+    cu_seqlen_ks: torch.Tensor,  # [M] int32
+    cu_seqlen_ke: torch.Tensor,  # [M] int32
+) -> torch.Tensor:
+    """Headwise GEMM MQA logits for SM70 prefill.
+
+    The eager reference builds a full fp32 score tensor [H, M, N].  That is
+    fast for small prompts but becomes the memory cliff for long-context
+    prefill.  This path keeps the final [M, N] fp32 logits only, computes one
+    head at a time through cuBLAS half GEMM, and accumulates the weighted
+    ReLU scores into the final logits.
+    """
+    k_fp8, k_scale = kv
+    M, num_heads, _ = q.shape
+    N = k_fp8.shape[0]
+
+    compute_dtype = torch.float16
+    q_heads = q.to(compute_dtype).permute(1, 0, 2).contiguous()
+    k_half = k_fp8.to(compute_dtype)
+    k_half = k_half * k_scale.reshape(-1, 1).to(compute_dtype)
+    k_t = k_half.transpose(0, 1)
+    weights_half = weights.to(compute_dtype)
+
+    logits = torch.zeros((M, N), device=q.device, dtype=torch.float32)
+    for head_idx in range(num_heads):
+        scores = torch.mm(q_heads[head_idx], k_t)
+        scores.relu_()
+        scores.mul_(weights_half[:, head_idx].unsqueeze(1))
+        logits.add_(scores)
+
+    positions = torch.arange(0, N, device=q.device)
+    mask = (positions[None, :] >= cu_seqlen_ks[:, None]) & (
+        positions[None, :] < cu_seqlen_ke[:, None]
+    )
+    return logits.masked_fill_(~mask, float("-inf"))

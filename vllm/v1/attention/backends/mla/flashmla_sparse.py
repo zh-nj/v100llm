@@ -64,6 +64,62 @@ logger = init_logger(__name__)
 # batch mode (#2).
 MIN_HEADS_FOR_BF16_PREFILL = 32
 
+# FlashMLA sparse prefill asserts topk alignment (128 covers h_q=64 and
+# h_q=128 kernels). Keep C128A prefill rows aligned without forcing every
+# request to use the full max-model-len compressed width.
+_C128A_TOPK_ALIGNMENT = 128
+
+
+def c128a_prefill_compressed_topk_buckets(
+    max_compressed_tokens: int,
+) -> list[int]:
+    """Return deterministic C128A prefill compressed-width buckets.
+
+    C128A prefill width grows with the absolute request position, while the
+    TileLang sparse-prefill kernel compiles `topk` as a static dimension. Use
+    exact 128-token buckets through 1024 compressed entries, then coarser
+    512-token buckets. This avoids length-dependent cache misses without
+    making short prompts pay for the full max-model-len width.
+    """
+    max_aligned = (
+        cdiv(max(max_compressed_tokens, 1), _C128A_TOPK_ALIGNMENT)
+        * _C128A_TOPK_ALIGNMENT
+    )
+    buckets: list[int] = []
+    value = _C128A_TOPK_ALIGNMENT
+    exact_limit = min(max_aligned, 1024)
+    while value <= exact_limit:
+        buckets.append(value)
+        value += _C128A_TOPK_ALIGNMENT
+
+    value = 1536
+    while value < max_aligned:
+        buckets.append(value)
+        value += 512
+    if max_aligned > exact_limit:
+        buckets.append(max_aligned)
+
+    return sorted(set(buckets))
+
+
+def _bucket_c128a_prefill_compressed_tokens(
+    compressed_tokens: int,
+    max_compressed_tokens: int,
+) -> int:
+    aligned = (
+        cdiv(max(compressed_tokens, 1), _C128A_TOPK_ALIGNMENT)
+        * _C128A_TOPK_ALIGNMENT
+    )
+    max_aligned = (
+        cdiv(max(max_compressed_tokens, 1), _C128A_TOPK_ALIGNMENT)
+        * _C128A_TOPK_ALIGNMENT
+    )
+    aligned = min(aligned, max_aligned)
+    for bucket in c128a_prefill_compressed_topk_buckets(max_aligned):
+        if aligned <= bucket:
+            return bucket
+    return max_aligned
+
 """
 NOTE: FlashMLA Sparse uses an fp8 cache with the following format
 
@@ -389,13 +445,10 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                 max_num_batched_tokens = (
                     vllm_config.scheduler_config.max_num_batched_tokens
                 )
-                # Pad to B_TOPK alignment (128 covers both h_q=64 B_TOPK=64 and
-                # h_q=128 B_TOPK=128). FlashMLA decode asserts extra_topk % B_TOPK
-                # == 0; unaligned widths (e.g. 17 = ceil(2136/128)) crash the
-                # sm100 head64 kernel. Padded slots stay -1 and decode_lens caps
-                # them via topk_length, so the pad is a no-op at kernel level.
-                # Mirrors _SPARSE_PREFILL_TOPK_ALIGNMENT in cache_utils.py.
-                _C128A_TOPK_ALIGNMENT = 128
+                # Pad to B_TOPK alignment. FlashMLA decode asserts extra_topk
+                # % B_TOPK == 0; unaligned widths crash the sm100 head64
+                # kernel. Padded slots stay -1 and decode_lens caps them via
+                # topk_length, so the pad is a no-op at kernel level.
                 c128a_max_compressed = cdiv(
                     self.model_config.max_model_len, self.compress_ratio
                 )
@@ -696,6 +749,12 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             "positions is required for C128A metadata build"
         )
         block_size = self.kv_cache_spec.block_size // self.compress_ratio
+        prefill_max_compressed = _c128a_prefill_max_compressed_tokens(
+            cm.positions[:num_total],
+            self.compress_ratio,
+            num_decode_tokens,
+            self.c128a_max_compressed,
+        )
         global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
             cm.positions[:num_total],
             self.compress_ratio,
@@ -708,6 +767,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             self.c128a_decode_lens_buffer,
             self.c128a_prefill_buffer,
             max_compressed_tokens=self.c128a_max_compressed,
+            prefill_max_compressed_tokens=prefill_max_compressed,
         )
 
         result: dict[str, torch.Tensor | None] = {}
@@ -1076,6 +1136,7 @@ def build_c128a_topk_metadata(
     decode_lens_buffer: torch.Tensor,
     prefill_buffer: torch.Tensor,
     max_compressed_tokens: int = 8192,
+    prefill_max_compressed_tokens: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single kernel for all C128A tokens (decode + prefill).
 
@@ -1087,10 +1148,19 @@ def build_c128a_topk_metadata(
     """
     num_tokens = positions.shape[0]
     num_prefill_tokens = num_tokens - num_decode_tokens
+    if prefill_max_compressed_tokens is None:
+        prefill_max_compressed_tokens = _c128a_prefill_max_compressed_tokens(
+            positions,
+            compress_ratio,
+            num_decode_tokens,
+            max_compressed_tokens,
+        )
 
     global_decode = global_decode_buffer[:num_decode_tokens]
     decode_lens = decode_lens_buffer[:num_decode_tokens]
-    prefill_local = prefill_buffer[:num_prefill_tokens]
+    prefill_local = prefill_buffer[
+        :num_prefill_tokens, :prefill_max_compressed_tokens
+    ]
 
     if num_tokens == 0:
         return global_decode, decode_lens, prefill_local
@@ -1110,9 +1180,29 @@ def build_c128a_topk_metadata(
         block_table.stride(0),
         block_size,
         slot_mapping,
+        prefill_max_compressed_tokens,
         BLOCK_SIZE=1024,
     )
     return global_decode, decode_lens, prefill_local
+
+
+def _c128a_prefill_max_compressed_tokens(
+    positions: torch.Tensor,
+    compress_ratio: int,
+    num_decode_tokens: int,
+    max_compressed_tokens: int,
+) -> int:
+    num_prefill_tokens = positions.shape[0] - num_decode_tokens
+    if num_prefill_tokens <= 0:
+        return max_compressed_tokens
+
+    prefill_positions = positions[num_decode_tokens:]
+    max_position = int(prefill_positions.max().item())
+    actual = min((max_position + 1) // compress_ratio, max_compressed_tokens)
+    return _bucket_c128a_prefill_compressed_tokens(
+        actual,
+        max_compressed_tokens,
+    )
 
 
 @triton.jit
@@ -1134,6 +1224,7 @@ def _build_c128a_topk_metadata_kernel(
     block_table_stride,
     block_size,
     slot_mapping_ptr,
+    prefill_max_compressed_tokens,
     BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
@@ -1174,9 +1265,9 @@ def _build_c128a_topk_metadata_kernel(
     else:
         # --- Prefill: write local indices ---
         pfx_idx = token_idx - num_decode_tokens
-        for i in range(0, max_compressed_tokens, BLOCK_SIZE):
+        for i in range(0, prefill_max_compressed_tokens, BLOCK_SIZE):
             offset = i + tl.arange(0, BLOCK_SIZE)
-            mask = offset < max_compressed_tokens
+            mask = offset < prefill_max_compressed_tokens
             tl.store(
                 prefill_local_ptr + pfx_idx * prefill_local_stride + offset,
                 tl.where(offset < num_compressed, offset, -1),

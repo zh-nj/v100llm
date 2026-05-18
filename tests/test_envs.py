@@ -111,6 +111,8 @@ def test_deepseek_v4_sm70_experimental_envs_are_registered() -> None:
         "VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB",
         "VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS",
         "VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE",
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS",
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT",
     }
 
     assert expected_envs.issubset(environment_variables)

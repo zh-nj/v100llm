@@ -14,6 +14,24 @@ from vllm.model_executor.layers.deepseek_v4_attention import (
 )
 
 
+def test_copy_flashmla_output_avoids_full_dtype_conversion_temp(monkeypatch):
+    flash_output = torch.tensor([[1.5, -2.25]], dtype=torch.bfloat16)
+    output = torch.empty_like(flash_output, dtype=torch.float16)
+    original_to = torch.Tensor.to
+
+    def fail_flash_output_to(self, *args, **kwargs):
+        if self is flash_output:
+            raise AssertionError("flash_output.to() would allocate a full temp")
+        return original_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", fail_flash_output_to, raising=False)
+
+    d4a._copy_flashmla_output(flash_output, output)
+
+    expected = torch.tensor([[1.5, -2.25]], dtype=torch.float16)
+    torch.testing.assert_close(output, expected)
+
+
 def test_forward_decode_uses_bf16_flashmla_io_for_fp16_model(monkeypatch):
     attn = object.__new__(DeepseekV4MLAAttention)
     attn.compress_ratio = 1
@@ -133,6 +151,22 @@ def test_sm70_decode_uses_direct_flashmla_by_default_with_opt_out(
 
     assert d4a._should_use_sm70_decode_prefill_fallback(q, swa_only=False)
     assert d4a._should_use_sm70_decode_prefill_fallback(q, swa_only=True)
+
+
+def test_sm70_decode_uses_prefill_fallback_when_direct_topk_exceeds_limit(
+    monkeypatch,
+):
+    q = SimpleNamespace(is_cuda=True, device=torch.device("cuda", 0))
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda _device=None: (7, 0)
+    )
+
+    assert not d4a._should_use_sm70_decode_prefill_fallback_for_total_topk(
+        q, direct_total_topk=8192
+    )
+    assert d4a._should_use_sm70_decode_prefill_fallback_for_total_topk(
+        q, direct_total_topk=8320
+    )
 
 
 def test_sm70_decode_prefill_fallback_builds_local_indices():
@@ -408,6 +442,88 @@ def test_forward_decode_uses_sparse_prefill_fallback_for_sm70_compressed(
     torch.testing.assert_close(output, torch.full_like(output, 3))
 
 
+def test_forward_decode_uses_sparse_prefill_fallback_for_large_c128a_topk(
+    monkeypatch,
+):
+    attn = object.__new__(DeepseekV4MLAAttention)
+    attn.compress_ratio = 128
+    attn.scale = 1.0
+    attn.attn_sink = torch.zeros(64, dtype=torch.float32)
+    attn.swa_cache_layer = SimpleNamespace(
+        kv_cache=torch.zeros(2, 64, 584, dtype=torch.uint8)
+    )
+
+    q = torch.randn(1, 64, 512, dtype=torch.float16)
+    output = torch.empty_like(q)
+    swa_metadata = SimpleNamespace(
+        num_decodes=1,
+        num_decode_tokens=1,
+        decode_swa_indices=torch.full((1, 1, 128), -1, dtype=torch.int32),
+        decode_swa_lens=torch.tensor([0], dtype=torch.int32),
+        block_size=64,
+        is_valid_token=torch.ones(1, dtype=torch.bool),
+        tile_sched_c128a=torch.zeros(1, dtype=torch.int32),
+    )
+    attn_metadata = SimpleNamespace(
+        block_size=256,
+        c128a_global_decode_topk_indices=torch.full(
+            (1, 1, 8192), -1, dtype=torch.int32
+        ),
+        c128a_decode_topk_lens=torch.tensor([0], dtype=torch.int32),
+    )
+    kv_cache = torch.zeros(2, 2, 584, dtype=torch.uint8)
+    captured = {}
+
+    monkeypatch.setattr(
+        d4a, "_should_use_sm70_decode_prefill_fallback", lambda q, swa_only: False
+    )
+
+    def fake_total_topk_guard(_q, direct_total_topk):
+        captured["direct_total_topk"] = direct_total_topk
+        return True
+
+    def fail_direct_decode(**_kwargs):
+        raise AssertionError("direct FlashMLA decode should not be called")
+
+    def fake_gather_with_indices(out, _k_cache, global_indices, global_lens, _block_size, *, row_stride=None, offset=0):
+        from vllm.model_executor.layers.deepseek_v4_attention import (
+            _build_decode_prefill_fallback_indices,
+        )
+        local_indices, local_lens = _build_decode_prefill_fallback_indices(
+            global_indices, global_lens, row_stride=row_stride, offset=offset,
+        )
+        return out.zero_(), local_indices, local_lens
+
+    def fake_sparse_prefill(**kwargs):
+        captured["kv_shape"] = kwargs["kv"].shape
+        captured["indices_shape"] = kwargs["indices"].shape
+        kwargs["out"].fill_(5)
+        return kwargs["out"], None, None
+
+    monkeypatch.setattr(
+        d4a,
+        "_should_use_sm70_decode_prefill_fallback_for_total_topk",
+        fake_total_topk_guard,
+    )
+    monkeypatch.setattr(d4a, "flash_mla_with_kvcache", fail_direct_decode)
+    monkeypatch.setattr(d4a, "_gather_decode_prefill_fallback_kv_with_indices_", fake_gather_with_indices)
+    monkeypatch.setattr(d4a, "flash_mla_sparse_fwd", fake_sparse_prefill)
+
+    attn._forward_decode(
+        q=q,
+        kv_cache=kv_cache,
+        swa_metadata=swa_metadata,
+        attn_metadata=attn_metadata,
+        swa_only=False,
+        output=output,
+    )
+
+    assert captured["direct_total_topk"] == 8320
+    assert captured["kv_shape"] == (8320, 1, 512)
+    assert captured["indices_shape"] == (1, 1, 8320)
+    torch.testing.assert_close(output, torch.full_like(output, 5))
+
+
 def test_prefill_cudagraph_default_capture_sizes_cover_token_counts():
     sizes = d4a._default_prefill_cudagraph_capture_sizes(
         max_num_batched_tokens=4096,
@@ -419,6 +535,43 @@ def test_prefill_cudagraph_default_capture_sizes_cover_token_counts():
     assert (1024, 8192) in sizes
     assert (4096, 8192) in sizes
     assert sizes[-1] == (4096, 8192)
+
+
+def test_tilelang_sparse_prefill_prewarm_topks_include_long_c128a_buckets():
+    topks = d4a._tilelang_sparse_prefill_prewarm_topks(
+        hf_index_topk=512,
+        window_size=128,
+        max_model_len=524288,
+    )
+
+    assert topks == [
+        128,
+        256,
+        384,
+        512,
+        640,
+        768,
+        896,
+        1024,
+        1152,
+        1664,
+        2176,
+        2688,
+        3200,
+        3712,
+        4224,
+    ]
+
+
+def test_tilelang_sparse_prefill_default_prewarm_context_caps_startup_buckets():
+    topks = d4a._tilelang_sparse_prefill_prewarm_topks(
+        hf_index_topk=512,
+        window_size=128,
+        max_model_len=524288,
+        prewarm_max_context_len=65536,
+    )
+
+    assert topks == [128, 256, 384, 512, 640]
 
 
 def test_prefill_graph_dispatcher_allocates_private_storage(monkeypatch):
@@ -594,14 +747,18 @@ def test_forward_prefill_fast_io_skips_q_bf16_trampoline_when_tilelang_cached(
             torch.tensor([2, 1], dtype=torch.int32),
         )
 
-    def fake_sparse_prefill(**kwargs):
+    from vllm.v1.attention.ops import tilelang_sparse_prefill
+
+    def fake_tilelang_prefill(**kwargs):
         captured["q_dtype"] = kwargs["q"].dtype
+        captured["output_dtype"] = kwargs["output_dtype"]
+        captured["has_out"] = "out" in kwargs
         captured["out_dtype"] = kwargs["out"].dtype
-        captured["out_is_model_output"] = (
-            kwargs["out"].data_ptr() == output.data_ptr()
+        return (
+            torch.full(output.shape, 9, dtype=torch.bfloat16),
+            None,
+            None,
         )
-        kwargs["out"].fill_(9)
-        return kwargs["out"], None, None
 
     def fake_copy_flashmla_output(flash_output, output_slice):
         captured["copy_from_dtype"] = flash_output.dtype
@@ -613,7 +770,18 @@ def test_forward_prefill_fast_io_skips_q_bf16_trampoline_when_tilelang_cached(
     )
     monkeypatch.setattr(d4a, "dequantize_and_gather_k_cache", fake_gather)
     monkeypatch.setattr(d4a, "combine_topk_swa_indices", fake_combine)
-    monkeypatch.setattr(d4a, "flash_mla_sparse_fwd", fake_sparse_prefill)
+    monkeypatch.setattr(
+        tilelang_sparse_prefill,
+        "flash_mla_sparse_fwd_tilelang",
+        fake_tilelang_prefill,
+    )
+    monkeypatch.setattr(
+        d4a,
+        "flash_mla_sparse_fwd",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("generic FlashMLA path should be skipped")
+        ),
+    )
     monkeypatch.setattr(
         d4a,
         "_should_use_tilelang_sparse_prefill_fast_io",
@@ -640,12 +808,100 @@ def test_forward_prefill_fast_io_skips_q_bf16_trampoline_when_tilelang_cached(
 
     assert captured == {
         "q_dtype": torch.float16,
-        "out_dtype": torch.bfloat16,
-        "out_is_model_output": False,
+        "output_dtype": torch.bfloat16,
+        "has_out": True,
+        "out_dtype": torch.float16,
         "copy_from_dtype": torch.bfloat16,
         "copy_to_dtype": torch.float16,
     }
     torch.testing.assert_close(output, torch.full_like(output, 9))
+
+
+def test_forward_prefill_sizes_compressed_workspace_from_runtime_seq_len(
+    monkeypatch,
+):
+    attn = object.__new__(DeepseekV4MLAAttention)
+    attn.compress_ratio = 4
+    attn.scale = 1.0
+    attn.attn_sink = torch.zeros(1, dtype=torch.float32)
+    attn.window_size = 8
+    attn.max_num_batched_tokens = 32
+    attn.max_model_len = 1024
+    attn.head_dim = 2
+    attn.topk_indices_buffer = torch.zeros(2, 1, dtype=torch.int32)
+    attn._prefill_graph_dispatcher = None
+    attn.prefix = "layers.0.attn"
+
+    q = torch.randn(2, 1, 2, dtype=torch.float16)
+    output = torch.empty_like(q)
+    swa_metadata = SimpleNamespace(
+        num_prefills=1,
+        num_prefill_tokens=2,
+        num_decodes=0,
+        num_decode_tokens=0,
+        prefill_seq_lens=torch.tensor([16], dtype=torch.int32),
+        prefill_gather_lens=torch.tensor([8], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        block_size=8,
+    )
+    attn_metadata = SimpleNamespace(
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        block_size=16,
+    )
+    captured = {}
+
+    class FakeWorkspaceManager:
+        def get_simultaneous(self, spec):
+            shape, dtype = spec
+            captured["workspace_shape"] = shape
+            return [torch.empty(shape, dtype=dtype)]
+
+    def fake_gather(out, *_args, **_kwargs):
+        out.fill_(2)
+
+    def fake_combine(*_args):
+        captured["combine_M"] = _args[-2]
+        captured["combine_N"] = _args[-1]
+        return (
+            torch.zeros(2, 128, dtype=torch.int32),
+            torch.full((2,), 4, dtype=torch.int32),
+        )
+
+    def fake_flash_mla_sparse_fwd(**kwargs):
+        kwargs["out"].fill_(7)
+        return kwargs["out"], None, None
+
+    monkeypatch.setattr(
+        d4a, "current_workspace_manager", lambda: FakeWorkspaceManager()
+    )
+    monkeypatch.setattr(d4a, "dequantize_and_gather_k_cache", fake_gather)
+    monkeypatch.setattr(d4a, "combine_topk_swa_indices", fake_combine)
+    monkeypatch.setattr(
+        d4a, "_should_use_tilelang_sparse_prefill_fast_io", lambda **_kwargs: False
+    )
+    monkeypatch.setattr(d4a, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
+
+    attn._forward_prefill(
+        q=q,
+        positions=torch.arange(2, dtype=torch.int64),
+        compressed_k_cache=torch.zeros(1, 4, 584, dtype=torch.uint8),
+        swa_k_cache=torch.zeros(1, 8, 584, dtype=torch.uint8),
+        output=output,
+        attn_metadata=attn_metadata,
+        swa_metadata=swa_metadata,
+    )
+
+    expected_n = 16 // attn.compress_ratio
+    expected_m = expected_n + attn.window_size + attn.max_num_batched_tokens
+    assert captured["workspace_shape"] == (
+        d4a.PREFILL_CHUNK_SIZE,
+        expected_m,
+        q.shape[-1],
+    )
+    assert captured["combine_N"] == expected_n
+    assert captured["combine_M"] == expected_m
 
 
 def test_tilelang_sparse_prefill_fast_io_default_on(monkeypatch):
@@ -684,6 +940,9 @@ def test_tilelang_sparse_prefill_fast_io_requires_cached_shape(monkeypatch):
     monkeypatch.setattr(
         d4a.envs, "VLLM_SM70_USE_TILELANG_SPARSE_PREFILL", True
     )
+    monkeypatch.setattr(
+        d4a.envs, "VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS", False
+    )
 
     import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
 
@@ -697,6 +956,43 @@ def test_tilelang_sparse_prefill_fast_io_requires_cached_shape(monkeypatch):
     q = torch.zeros(1, 1, 2, dtype=torch.float16)
 
     assert not d4a._should_use_tilelang_sparse_prefill_fast_io(
+        q=q,
+        kv=torch.zeros(1, 1, 2, dtype=torch.bfloat16),
+        indices=torch.zeros(1, 1, 2, dtype=torch.int32),
+        sm_scale=1.0,
+        d_v=2,
+        attn_sink=None,
+        topk_length=None,
+        output=torch.empty_like(q),
+    )
+
+
+def test_tilelang_sparse_prefill_fast_io_can_jit_uncached_shape(monkeypatch):
+    monkeypatch.setattr(
+        d4a.envs, "VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO", True
+    )
+    monkeypatch.setattr(
+        d4a.envs, "VLLM_SM70_USE_TILELANG_SPARSE_PREFILL", True
+    )
+    monkeypatch.setattr(
+        d4a.envs, "VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS", True
+    )
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: False
+    )
+
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    monkeypatch.setattr(
+        tilelang_prefill, "is_tilelang_available", lambda: (True, None)
+    )
+    monkeypatch.setattr(
+        tilelang_prefill, "is_tilelang_sparse_fwd_cached", lambda *a, **k: False
+    )
+
+    q = torch.zeros(1, 1, 2, dtype=torch.float16)
+
+    assert d4a._should_use_tilelang_sparse_prefill_fast_io(
         q=q,
         kv=torch.zeros(1, 1, 2, dtype=torch.bfloat16),
         indices=torch.zeros(1, 1, 2, dtype=torch.int32),

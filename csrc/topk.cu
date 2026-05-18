@@ -187,7 +187,6 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
 
 namespace vllm {
 
-constexpr int TopK = 2048;              // DeepSeek V3 sparse attention top-k
 constexpr int kThreadsPerBlock = 1024;  // Threads per block
 
 // Shared memory budget
@@ -222,6 +221,7 @@ __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
   return static_cast<uint8_t>(key >> 8);
 }
 
+template <int TopK>
 __device__ void naive_topk_cuda(const float* __restrict__ logits,
                                 int32_t* __restrict__ output_indices,
                                 int32_t seq_len) {
@@ -236,6 +236,7 @@ __device__ void naive_topk_cuda(const float* __restrict__ logits,
 // by: DarkSharpness
 // which at the same time is an optimized topk kernel copied from tilelang
 // kernel
+template <int TopK>
 __device__ void fast_topk_cuda_tl(
     const float* __restrict__ logits,  // Input logits [seq_len]
     int* __restrict__ output_indices,  // Output top-k indices [TopK]
@@ -442,6 +443,7 @@ __device__ void fast_topk_cuda_tl(
   }
 }
 
+template <int TopK>
 __global__ __launch_bounds__(kThreadsPerBlock) void topk_kernel(
     const FastTopKParams params) {
   const auto& [input, row_starts, indices, lengths, input_stride] = params;
@@ -453,16 +455,18 @@ __global__ __launch_bounds__(kThreadsPerBlock) void topk_kernel(
 
   if (seq_len <= TopK) {
     // Shortcut: All elements are in top-k
-    return naive_topk_cuda(logits, output_indices, seq_len);
+    return naive_topk_cuda<TopK>(logits, output_indices, seq_len);
   } else {
-    return fast_topk_cuda_tl(logits, output_indices, logits_offset, seq_len);
+    return fast_topk_cuda_tl<TopK>(
+        logits, output_indices, logits_offset, seq_len);
   }
 }
 
 FastTopKParams get_params(
     const at::Tensor& score, const at::Tensor& lengths,
     std::optional<at::Tensor> row_starts_opt = std::nullopt,
-    std::optional<at::Tensor> indices_opt = std::nullopt) {
+    std::optional<at::Tensor> indices_opt = std::nullopt,
+    int64_t top_k = 2048) {
   const int64_t batch_size = score.size(0);
 
   TORCH_CHECK(score.dim() == 2 && score.stride(1) == 1,
@@ -483,7 +487,7 @@ FastTopKParams get_params(
   if (indices_opt.has_value()) {
     const auto& indices = *indices_opt;
     TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous() &&
-                    indices.size(0) == batch_size && indices.size(1) == TopK,
+                    indices.size(0) == batch_size && indices.size(1) == top_k,
                 "indices must be 2D contiguous [batch, TopK]");
     indices_ptr = indices.data_ptr<int32_t>();
   }
@@ -514,6 +518,16 @@ void setup_kernel_smem_once() {
       "Failed to set kernel shared memory limit: ", cudaGetErrorString(result));
 }
 
+template <int TopK>
+void launch_topk_kernel(const FastTopKParams& params, int64_t batch_size,
+                        cudaStream_t stream) {
+  const dim3 grid(static_cast<uint32_t>(batch_size));
+  const dim3 block(kThreadsPerBlock);
+
+  setup_kernel_smem_once<topk_kernel<TopK>, kSmem>();
+  topk_kernel<TopK><<<grid, block, kSmem, stream>>>(params);
+}
+
 }  // namespace vllm
 
 void large_context_topk(
@@ -527,15 +541,23 @@ void large_context_topk(
     TORCH_CHECK(row_starts->is_cuda(), "row_starts must be a CUDA tensor");
   }
 
-  const auto params = vllm::get_params(logits, seq_lens, row_starts, indices);
+  const int64_t top_k = indices.size(1);
+  TORCH_CHECK(top_k == 512 || top_k == 1024 || top_k == 2048,
+              "large_context_topk supports k=512, k=1024, or k=2048, got k=",
+              top_k);
+
+  const auto params =
+      vllm::get_params(logits, seq_lens, row_starts, indices, top_k);
   const int64_t batch_size = logits.size(0);
-
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const dim3 grid(static_cast<uint32_t>(batch_size));
-  const dim3 block(vllm::kThreadsPerBlock);
 
-  vllm::setup_kernel_smem_once<vllm::topk_kernel, vllm::kSmem>();
-  vllm::topk_kernel<<<grid, block, vllm::kSmem, stream>>>(params);
+  if (top_k == 512) {
+    vllm::launch_topk_kernel<512>(params, batch_size, stream);
+  } else if (top_k == 1024) {
+    vllm::launch_topk_kernel<1024>(params, batch_size, stream);
+  } else {
+    vllm::launch_topk_kernel<2048>(params, batch_size, stream);
+  }
 
   const cudaError_t result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess,

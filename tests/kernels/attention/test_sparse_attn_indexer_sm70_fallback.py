@@ -30,6 +30,16 @@ def _pack_fp8_cache(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return cache
 
 
+def test_sm70_paged_logits_uses_1d_grid_for_1m_context() -> None:
+    from vllm.model_executor.layers.sm70_mqa_logits import (
+        _sm70_paged_mqa_logits_grid,
+    )
+
+    grid = _sm70_paged_mqa_logits_grid(num_rows=1, max_model_len=1048576)
+
+    assert grid == (1048576,)
+
+
 def test_sm70_fallback_prefill_logits_matches_reference() -> None:
     _require_cuda()
     torch.manual_seed(0)
@@ -59,7 +69,48 @@ def test_sm70_fallback_prefill_logits_matches_reference() -> None:
     ).sum(dim=0)
     expected = expected.masked_fill(~mask, float("-inf"))
 
-    torch.testing.assert_close(logits, expected)
+    # The default SM70 prefill path uses half GEMM per head and accumulates
+    # into fp32 logits, so it can differ from the fp32 eager reference by the
+    # final half output rounding of each GEMM.
+    torch.testing.assert_close(logits, expected, rtol=2e-2, atol=1e-2)
+
+
+def test_sm70_gemm_prefill_logits_matches_reference() -> None:
+    _require_cuda()
+    torch.manual_seed(5)
+    from vllm.model_executor.layers.sm70_mqa_logits import sm70_fp8_mqa_logits_gemm
+
+    fp8_dtype = torch.float8_e4m3fn
+    seq_len, seq_len_kv, heads, head_dim = 13, 17, 8, 64
+    q = (torch.randn(seq_len, heads, head_dim, device="cuda") * 0.1).to(fp8_dtype)
+    k = (torch.randn(seq_len_kv, head_dim, device="cuda") * 0.1).to(fp8_dtype)
+    weights = torch.randn(seq_len, heads, device="cuda", dtype=torch.float32) * 0.5
+    k_scale = torch.rand(seq_len_kv, device="cuda", dtype=torch.float32) * 0.2 + 0.01
+    cu_ks = torch.tensor(
+        [0, 0, 1, 1, 3, 4, 4, 5, 6, 8, 8, 9, 10],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cu_ke = torch.tensor(
+        [4, 6, 7, 9, 10, 11, 13, 14, 15, 16, 17, 17, 17],
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    logits = sm70_fp8_mqa_logits_gemm(q, (k, k_scale), weights, cu_ks, cu_ke)
+
+    k_dequant = k.float() * k_scale.view(-1, 1)
+    positions = torch.arange(seq_len_kv, device="cuda")
+    mask = (positions[None, :] >= cu_ks[:, None]) & (
+        positions[None, :] < cu_ke[:, None]
+    )
+    score = torch.einsum("mhd,nd->hmn", q.float(), k_dequant)
+    expected = (
+        score.relu() * weights.float().transpose(0, 1).unsqueeze(-1)
+    ).sum(dim=0)
+    expected = expected.masked_fill(~mask, float("-inf"))
+
+    torch.testing.assert_close(logits, expected, rtol=2e-2, atol=1e-2)
 
 
 def test_sm70_fallback_paged_logits_accepts_2d_context_lens() -> None:
@@ -214,3 +265,43 @@ def test_sm70_fallback_paged_logits_is_cudagraph_capture_safe() -> None:
     torch.cuda.synchronize()
 
     assert logits.shape == (batch_size * next_n, max_model_len)
+
+
+def test_sm70_paged_logits_supports_large_max_model_len_grid() -> None:
+    _require_cuda()
+    if torch.cuda.get_device_capability()[0] != 7:
+        pytest.skip("SM70 paged logits kernel is only validated on compute capability 7.x")
+
+    from vllm.model_executor.layers.sm70_mqa_logits import sm70_fp8_paged_mqa_logits
+
+    torch.manual_seed(4)
+    fp8_dtype = torch.float8_e4m3fn
+    batch_size, next_n, heads, head_dim = 1, 1, 2, 16
+    max_model_len, block_size, num_blocks = 65536, 4, 1
+    q = torch.randn(
+        batch_size, next_n, heads, head_dim, device="cuda", dtype=torch.float16
+    ).to(fp8_dtype)
+    k = torch.randn(
+        num_blocks, block_size, 1, head_dim, device="cuda", dtype=torch.float16
+    ).to(fp8_dtype)
+    scales = torch.rand(num_blocks, block_size, 1, 1, device="cuda") + 0.5
+    kv_cache = _pack_fp8_cache(k, scales)
+    weights = torch.randn(
+        batch_size * next_n, heads, device="cuda", dtype=torch.float32
+    )
+    context_lens = torch.tensor([[2]], device="cuda", dtype=torch.int32)
+    block_tables = torch.tensor([[0]], device="cuda", dtype=torch.int32)
+
+    logits = sm70_fp8_paged_mqa_logits(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+    )
+    torch.cuda.synchronize()
+
+    assert logits.shape == (batch_size * next_n, max_model_len)
+    assert torch.isfinite(logits[:, :2]).all()
+    assert torch.isneginf(logits[:, 2:]).all()

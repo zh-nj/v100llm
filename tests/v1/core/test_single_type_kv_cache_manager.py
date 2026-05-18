@@ -14,9 +14,14 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
+    RingSlidingWindowMLAManager,
     SlidingWindowManager,
 )
-from vllm.v1.kv_cache_interface import ChunkedLocalAttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
+    SlidingWindowMLASpec,
+    SlidingWindowSpec,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -42,6 +47,62 @@ def get_chunked_local_attention_manager(
         kv_cache_group_id=0,
         max_admission_blocks_per_request=10**9,
     )
+
+
+def test_deepseek_v4_ring_swa_manager_uses_virtual_blocks():
+    block_size = 2
+    spec = SlidingWindowMLASpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        sliding_window=4,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+        model_version="deepseek_v4",
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=8,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    manager = RingSlidingWindowMLAManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        max_admission_blocks_per_request=10**9,
+    )
+
+    free_before = block_pool.get_num_free_blocks()
+    assert (
+        manager.get_num_blocks_to_allocate(
+            request_id="req",
+            num_tokens=7,
+            new_computed_blocks=[],
+            total_computed_tokens=0,
+            num_tokens_main_model=7,
+        )
+        == 0
+    )
+
+    new_blocks = manager.allocate_new_blocks(
+        "req", num_tokens=7, num_tokens_main_model=7
+    )
+    assert len(new_blocks) == 4
+    assert all(block is block_pool.null_block for block in new_blocks)
+    assert block_pool.get_num_free_blocks() == free_before
+
+    hits = manager.find_longest_cache_hit(
+        block_hashes=[BlockHash(b"0"), BlockHash(b"1")],
+        max_length=4,
+        kv_cache_group_ids=[0],
+        block_pool=block_pool,
+        kv_cache_spec=spec,
+        use_eagle=False,
+        alignment_tokens=block_size,
+    )
+    assert hits == ([],)
 
 
 def test_chunked_local_attention_possible_cached_prefix():

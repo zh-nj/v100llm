@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -11,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.sm70_mqa_logits import (
     sm70_fp8_mqa_logits,
+    sm70_fp8_mqa_logits_gemm,
     sm70_fp8_paged_mqa_logits,
 )
 from vllm.platforms import current_platform
@@ -35,6 +38,16 @@ elif current_platform.is_xpu():
 logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+TILELANG_TOPK_THREADS = int(
+    os.environ.get("VLLM_SPARSE_INDEXER_PREFILL_TILELANG_TOPK_THREADS", "256")
+)
+TILELANG_TOPK_MIN_ROW_LEN = int(
+    os.environ.get("VLLM_SPARSE_INDEXER_PREFILL_TILELANG_TOPK_MIN_ROW_LEN", "16384")
+)
+DEFAULT_PREFILL_LOGITS_CHUNK_MB = 64
+_LARGE_CONTEXT_TOPK_TOKENS = 2048
+_LARGE_CONTEXT_TOPK_MIN_ROW_LEN = 8192
+_PERSISTENT_TOPK_PREFILL_TOKENS = (512, 1024, 2048)
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -69,6 +82,55 @@ def _can_use_sm70_torch_indexer_fallback(use_fp4_cache: bool) -> bool:
     )
 
 
+def _sm70_mqa_logits_impl() -> str:
+    """Return the SM70 prefill logits implementation.
+
+    New deployments default to the headwise GEMM path.  The legacy
+    VLLM_SM70_MQA_LOGITS_TRITON switch is still honored when the new selector
+    is absent so old A/B scripts keep their meaning.
+    """
+    impl = os.environ.get("VLLM_SM70_MQA_LOGITS_IMPL")
+    if impl is None:
+        legacy_triton = os.environ.get("VLLM_SM70_MQA_LOGITS_TRITON")
+        if legacy_triton is None:
+            impl = "gemm"
+        else:
+            impl = "triton" if legacy_triton == "1" else "torch"
+    impl = impl.strip().lower()
+    if impl not in {"gemm", "triton", "torch"}:
+        raise ValueError(
+            "VLLM_SM70_MQA_LOGITS_IMPL must be one of: gemm, triton, torch"
+        )
+    return impl
+
+
+def _prefill_logits_chunk_mb() -> int:
+    value = int(
+        os.environ.get(
+            "VLLM_SPARSE_INDEXER_PREFILL_LOGITS_CHUNK_MB",
+            str(DEFAULT_PREFILL_LOGITS_CHUNK_MB),
+        )
+    )
+    return max(value, 1)
+
+
+def _iter_prefill_logits_row_chunks(num_rows: int, num_kv_tokens: int):
+    """Yield row slices that cap the temporary fp32 [rows, kv] logits tensor."""
+    if num_rows <= 0:
+        return
+    if num_kv_tokens <= 0:
+        yield 0, num_rows
+        return
+    max_logits_bytes = _prefill_logits_chunk_mb() * 1024 * 1024
+    bytes_per_row = num_kv_tokens * torch.float32.itemsize
+    rows_per_chunk = max(1, max_logits_bytes // bytes_per_row)
+    if rows_per_chunk >= num_rows:
+        yield 0, num_rows
+        return
+    for row_start in range(0, num_rows, rows_per_chunk):
+        yield row_start, min(row_start + rows_per_chunk, num_rows)
+
+
 def _fp8_mqa_logits_torch_fallback(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -76,25 +138,14 @@ def _fp8_mqa_logits_torch_fallback(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
 ) -> torch.Tensor:
-    # R5a (opt-in, default OFF): Route to the SM70 Triton kernel that
-    # uses a 1-program-per-(m, n) layout with manual FP8 E4M3 bit decode.
-    #
-    # Measurement on V100 TP=8 prompt_3k prefill showed this path
-    # regresses -18% vs the torch/cuBLAS eager fallback. The 1-program
-    # grid amortizes poorly when M and N both grow with sequence length
-    # (grid ≈ M*N ≈ 3.2M programs for M=N=1792) because each program
-    # does a single 8-head × 64-D scalar dot product.
-    #
-    # For prefill, the torch fallback path (fp32 cuBLAS einsum) is
-    # faster for this indexer phase; keep the Triton path reachable via
-    # VLLM_SM70_MQA_LOGITS_TRITON=1 for decode-like small-M shapes
-    # where torch.einsum is known to be slower.
-    import os
-    if (
-        os.environ.get("VLLM_SM70_MQA_LOGITS_TRITON", "0") == "1"
-        and _can_use_sm70_torch_indexer_fallback(use_fp4_cache=False)
-    ):
-        return sm70_fp8_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+    if _can_use_sm70_torch_indexer_fallback(use_fp4_cache=False):
+        impl = _sm70_mqa_logits_impl()
+        if impl == "gemm":
+            return sm70_fp8_mqa_logits_gemm(
+                q, kv, weights, cu_seqlen_ks, cu_seqlen_ke
+            )
+        if impl == "triton":
+            return sm70_fp8_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
     k_fp8, k_scale = kv
     seq_len_kv = k_fp8.shape[0]
@@ -257,6 +308,194 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+def _should_use_large_context_topk_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    topk_tokens: int,
+    *,
+    max_row_len: int | None = None,
+) -> bool:
+    """Return whether prefill top-k can use the filtered large-context kernel."""
+    if os.environ.get("VLLM_SPARSE_INDEXER_PREFILL_FILTERED_TOPK", "0") != "1":
+        return False
+    if not current_platform.is_cuda() or current_platform.is_xpu():
+        return False
+    if topk_tokens != _LARGE_CONTEXT_TOPK_TOKENS:
+        return False
+    if logits.dtype != torch.float32 or logits.ndim != 2 or logits.stride(1) != 1:
+        return False
+    if row_starts.ndim != 1 or row_ends.ndim != 1:
+        return False
+    if row_starts.shape[0] != logits.shape[0] or row_ends.shape[0] != logits.shape[0]:
+        return False
+
+    if max_row_len is None:
+        # Tests and rare direct callers may not have CPU-side metadata. The hot
+        # inference path passes max_row_len to avoid introducing a GPU sync here.
+        max_row_len = int((row_ends - row_starts).max().item())
+    return max_row_len >= _LARGE_CONTEXT_TOPK_MIN_ROW_LEN
+
+
+def _should_use_persistent_topk_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    topk_tokens: int,
+    *,
+    max_row_len: int | None = None,
+    all_row_starts_zero: bool = False,
+) -> bool:
+    if os.environ.get("VLLM_SPARSE_INDEXER_PREFILL_FILTERED_TOPK", "0") != "1":
+        return False
+    if not current_platform.is_cuda() or current_platform.is_xpu():
+        return False
+    if topk_tokens not in _PERSISTENT_TOPK_PREFILL_TOKENS:
+        return False
+    if not all_row_starts_zero:
+        return False
+    if logits.dtype != torch.float32 or logits.ndim != 2 or logits.stride(1) != 1:
+        return False
+    if row_starts.ndim != 1 or row_ends.ndim != 1:
+        return False
+    if row_starts.shape[0] != logits.shape[0] or row_ends.shape[0] != logits.shape[0]:
+        return False
+    if max_row_len is None:
+        max_row_len = int((row_ends - row_starts).max().item())
+    return max_row_len > topk_tokens
+
+
+def _should_use_tilelang_topk_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    topk_tokens: int,
+    *,
+    max_row_len: int | None = None,
+    all_row_starts_zero: bool = False,
+) -> bool:
+    if os.environ.get("VLLM_SPARSE_INDEXER_PREFILL_TILELANG_TOPK", "0") != "1":
+        return False
+    if not current_platform.is_cuda() or current_platform.is_xpu():
+        return False
+    if topk_tokens != 512:
+        return False
+    if logits.dtype != torch.float32 or logits.ndim != 2 or logits.stride(1) != 1:
+        return False
+    if row_starts.ndim != 1 or row_ends.ndim != 1:
+        return False
+    if row_starts.shape[0] != logits.shape[0] or row_ends.shape[0] != logits.shape[0]:
+        return False
+    if not all_row_starts_zero:
+        return False
+    if max_row_len is None:
+        max_row_len = int((row_ends - row_starts).max().item())
+    if max_row_len < TILELANG_TOPK_MIN_ROW_LEN:
+        return False
+    try:
+        from vllm.v1.attention.ops.tilelang_prefill_topk import (
+            is_tilelang_available,
+        )
+
+        ok, _reason = is_tilelang_available()
+        return ok
+    except Exception:
+        return False
+
+
+def _prefill_topk_indices(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+    *,
+    max_row_len: int | None = None,
+    all_row_starts_zero: bool = False,
+    topk_workspace: torch.Tensor | None = None,
+    causal_row_offset: int | None = None,
+) -> None:
+    lengths = row_ends - row_starts
+    if _should_use_tilelang_topk_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        topk_tokens,
+        max_row_len=max_row_len,
+        all_row_starts_zero=all_row_starts_zero,
+    ):
+        from vllm.v1.attention.ops.tilelang_prefill_topk import (
+            prefill_topk_tilelang,
+        )
+
+        prefill_topk_tilelang(
+            logits,
+            topk_indices,
+            lengths,
+            row_starts,
+            topk_tokens=topk_tokens,
+            threads=TILELANG_TOPK_THREADS,
+            causal_row_offset=causal_row_offset,
+        )
+        return
+
+    if _should_use_persistent_topk_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        topk_tokens,
+        max_row_len=max_row_len,
+        all_row_starts_zero=all_row_starts_zero,
+    ):
+        if topk_workspace is None:
+            (topk_workspace,) = current_workspace_manager().get_simultaneous(
+                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            )
+        torch.ops._C.persistent_topk(
+            logits,
+            lengths,
+            topk_indices,
+            topk_workspace,
+            topk_tokens,
+            max_row_len if max_row_len is not None else int(lengths.max().item()),
+        )
+        return
+
+    if _should_use_large_context_topk_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        topk_tokens,
+        max_row_len=max_row_len,
+    ):
+        torch.ops._C.large_context_topk(logits, topk_indices, lengths, row_starts)
+        return
+
+    num_rows = logits.shape[0]
+    if current_platform.is_xpu():
+        xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
+            logits,
+            row_starts,
+            row_ends,
+            topk_indices,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            topk_tokens,
+        )
+    else:
+        torch.ops._C.top_k_per_row_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            topk_indices,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            topk_tokens,
+        )
+
+
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -362,10 +601,20 @@ def sparse_attn_indexer(
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
         )
-        k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
-            values_spec,
-            scales_spec,
-        )
+        topk_workspace = None
+        if os.environ.get("VLLM_SPARSE_INDEXER_PREFILL_FILTERED_TOPK", "0") == "1":
+            k_quant_full, k_scale_full, topk_workspace = (
+                workspace_manager.get_simultaneous(
+                    values_spec,
+                    scales_spec,
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+            )
+        else:
+            k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
+                values_spec,
+                scales_spec,
+            )
         for chunk in prefill_metadata.chunks:
             k_quant = k_quant_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
@@ -395,42 +644,45 @@ def sparse_attn_indexer(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-            logits = _fp8_fp4_mqa_logits_with_fallback(
-                (q_slice_cast, q_scale_slice),
-                (k_quant_cast, k_scale_cast),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                clean_logits=False,
-                use_fp4_cache=use_fp4_cache,
-            )
-            num_rows = logits.shape[0]
 
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
 
-            if current_platform.is_xpu():
-                xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
-                    logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
+            num_q_rows = q_slice_cast.shape[0]
+            num_kv_tokens = k_quant_cast.shape[0]
+            for row_start, row_end in _iter_prefill_logits_row_chunks(
+                num_q_rows, num_kv_tokens
+            ):
+                logits = _fp8_fp4_mqa_logits_with_fallback(
+                    (
+                        q_slice_cast[row_start:row_end],
+                        (
+                            q_scale_slice[row_start:row_end]
+                            if q_scale_slice is not None
+                            else None
+                        ),
+                    ),
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start + row_start : chunk.token_start + row_end],
+                    chunk.cu_seqlen_ks[row_start:row_end],
+                    chunk.cu_seqlen_ke[row_start:row_end],
+                    clean_logits=False,
+                    use_fp4_cache=use_fp4_cache,
                 )
-            else:
-                torch.ops._C.top_k_per_row_prefill(
+
+                _prefill_topk_indices(
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
+                    chunk.cu_seqlen_ks[row_start:row_end],
+                    chunk.cu_seqlen_ke[row_start:row_end],
+                    topk_indices[row_start:row_end],
                     topk_tokens,
+                    max_row_len=attn_metadata_narrowed.max_seq_len,
+                    all_row_starts_zero=chunk.num_reqs == 1,
+                    topk_workspace=topk_workspace,
+                    causal_row_offset=(
+                        chunk.token_start + row_start if chunk.num_reqs == 1 else None
+                    ),
                 )
 
     if has_decode:

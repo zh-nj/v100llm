@@ -617,6 +617,12 @@ class KVCacheTensor:
 
     size: int  # size of the KV cache tensor in bytes
     shared_by: list[str]  # layer names that share the same KV cache tensor
+    num_blocks: int | None = None
+    """
+    Physical blocks backing this tensor. When unset, the tensor follows the
+    KVCacheConfig.num_blocks pool size. Fixed-size ring/window tensors use this
+    to avoid being shrunk or interpreted as full-length cache tensors.
+    """
 
 
 @dataclass
@@ -632,6 +638,12 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+    physical_blocks_per_req: int | None = None
+    """
+    If set, the group stores logical positions in a per-request physical ring
+    with this many blocks. Scheduler block IDs for this group are virtual; the
+    worker maps absolute positions to request-local physical slots.
+    """
 
 
 @dataclass

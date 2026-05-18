@@ -299,6 +299,55 @@ def test_tilelang_prefill_writes_requested_out_dtype(monkeypatch):
     torch.testing.assert_close(result, torch.full_like(out, 3.0))
 
 
+def test_tilelang_prefill_chunks_large_out_temporary(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    calls = []
+
+    def fake_get_kernel(**kwargs):
+        def fake_kernel(Q_b, _KV_b, _Indices_b, _Sink, _TopkLen_b):
+            s_q, h_q, d_qk = Q_b.shape[1:]
+            assert d_qk == 576
+            calls.append(s_q)
+            fill = float(len(calls))
+            out_dtype = (
+                torch.bfloat16
+                if kwargs["output_dtype_str"] == "bfloat16"
+                else torch.float16
+            )
+            return (
+                torch.full((1, s_q, h_q, 512), fill, dtype=out_dtype),
+                torch.full((1, s_q, h_q), fill, dtype=torch.float32),
+                torch.full((1, s_q, h_q), -fill, dtype=torch.float32),
+            )
+
+        return fake_kernel
+
+    monkeypatch.setattr(tilelang_prefill, "_get_kernel", fake_get_kernel)
+    monkeypatch.setenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_OUTPUT_CHUNK_MB", "1")
+
+    q = torch.zeros((40, 64, 576), dtype=torch.float16)
+    kv = torch.zeros((512, 1, 576), dtype=torch.float16)
+    indices = torch.zeros((40, 1, 128), dtype=torch.int32)
+    out = torch.empty((40, 64, 512), dtype=torch.bfloat16)
+
+    result, max_logits, lse = tilelang_prefill.flash_mla_sparse_fwd_tilelang(
+        q, kv, indices, 1.0, 512, out=out
+    )
+
+    assert calls == [16, 16, 8]
+    assert result.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out[:16], torch.full_like(out[:16], 1.0))
+    torch.testing.assert_close(out[16:32], torch.full_like(out[16:32], 2.0))
+    torch.testing.assert_close(out[32:], torch.full_like(out[32:], 3.0))
+    torch.testing.assert_close(max_logits[:16], torch.full_like(max_logits[:16], 1.0))
+    torch.testing.assert_close(max_logits[16:32], torch.full_like(max_logits[16:32], 2.0))
+    torch.testing.assert_close(max_logits[32:], torch.full_like(max_logits[32:], 3.0))
+    torch.testing.assert_close(lse[:16], torch.full_like(lse[:16], -1.0))
+    torch.testing.assert_close(lse[16:32], torch.full_like(lse[16:32], -2.0))
+    torch.testing.assert_close(lse[32:], torch.full_like(lse[32:], -3.0))
+
+
 def test_sparse_flashmla_prefill_matches_torch_reference():
     import vllm.v1.attention.ops.flashmla as fm
 

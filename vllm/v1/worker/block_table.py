@@ -26,6 +26,7 @@ class BlockTable:
         device: torch.device,
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
+        physical_blocks_per_req: int | None = None,
     ):
         """
         Args:
@@ -66,6 +67,13 @@ class BlockTable:
             self.use_hybrid_blocks = True
 
         self.max_num_blocks_per_req = max_num_blocks_per_req * self.blocks_per_kv_block
+        self.physical_blocks_per_req = physical_blocks_per_req
+        if self.physical_blocks_per_req is not None:
+            self._ring_slot_per_row = np.full(max_num_reqs, -1, dtype=np.int32)
+            self._free_ring_slots = set(range(max_num_reqs))
+        else:
+            self._ring_slot_per_row = None
+            self._free_ring_slots = None
 
         self.block_table = self._make_buffer(
             self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
@@ -99,6 +107,33 @@ class BlockTable:
             self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
+    def _ensure_ring_base(self, row_idx: int) -> int | None:
+        if self.physical_blocks_per_req is None:
+            return None
+        assert self._ring_slot_per_row is not None
+        assert self._free_ring_slots is not None
+
+        slot = int(self._ring_slot_per_row[row_idx])
+        if slot < 0:
+            if row_idx in self._free_ring_slots:
+                slot = row_idx
+                self._free_ring_slots.remove(slot)
+            else:
+                slot = self._free_ring_slots.pop()
+            self._ring_slot_per_row[row_idx] = slot
+        return slot * self.physical_blocks_per_req
+
+    def _release_ring_slot(self, row_idx: int) -> None:
+        if self.physical_blocks_per_req is None:
+            return
+        assert self._ring_slot_per_row is not None
+        assert self._free_ring_slots is not None
+
+        slot = int(self._ring_slot_per_row[row_idx])
+        if slot >= 0:
+            self._ring_slot_per_row[row_idx] = -1
+            self._free_ring_slots.add(slot)
+
     def append_row(
         self,
         block_ids: list[int],
@@ -107,17 +142,32 @@ class BlockTable:
         if not block_ids:
             return
 
+        start = self.num_blocks_per_row[row_idx]
+        if self.physical_blocks_per_req is not None:
+            # The KV manager tracks logical blocks with null IDs for the
+            # request-local SWA ring. Materialize the physical ring block IDs
+            # only in the worker block table. The physical ring slot follows
+            # the request across InputBatch row moves/swaps.
+            ring_base = self._ensure_ring_base(row_idx)
+            assert ring_base is not None
+            start_kv_block = start // self.blocks_per_kv_block
+            block_ids = [
+                ring_base
+                + ((start_kv_block + i) % self.physical_blocks_per_req)
+                for i in range(len(block_ids))
+            ]
+
         if self.use_hybrid_blocks:
             block_ids = self.map_to_kernel_blocks(
                 np.array(block_ids), self.blocks_per_kv_block, self._kernel_block_arange
             )
 
         num_blocks = len(block_ids)
-        start = self.num_blocks_per_row[row_idx]
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
+        self._release_ring_slot(row_idx)
         self.num_blocks_per_row[row_idx] = 0
         self.append_row(block_ids, row_idx)
 
@@ -126,17 +176,27 @@ class BlockTable:
         if num_blocks > 0:
             self.block_table.np[row_idx, :num_blocks] = 0
         self.num_blocks_per_row[row_idx] = 0
+        self._release_ring_slot(row_idx)
 
     def move_row(self, src: int, tgt: int) -> None:
         num_blocks = self.num_blocks_per_row[src]
         block_table_np = self.block_table.np
         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
+        if self.physical_blocks_per_req is not None:
+            assert self._ring_slot_per_row is not None
+            assert self._free_ring_slots is not None
+            self._release_ring_slot(tgt)
+            self._ring_slot_per_row[tgt] = self._ring_slot_per_row[src]
+            self._ring_slot_per_row[src] = -1
 
     def swap_row(self, src: int, tgt: int) -> None:
         src_tgt, tgt_src = [src, tgt], [tgt, src]
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
+        if self.physical_blocks_per_req is not None:
+            assert self._ring_slot_per_row is not None
+            self._ring_slot_per_row[src_tgt] = self._ring_slot_per_row[tgt_src]
 
     def compute_slot_mapping(
         self,
@@ -233,6 +293,7 @@ class MultiGroupBlockTable:
         block_sizes: list[int],
         kernel_block_sizes: list[int],
         max_num_blocks: list[int] | None = None,
+        physical_blocks_per_req: list[int | None] | None = None,
         cp_kv_cache_interleave_size: int = 1,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
@@ -256,6 +317,14 @@ class MultiGroupBlockTable:
                 f"max_num_blocks length ({len(max_num_blocks)}) "
                 f"must match block_sizes length ({len(block_sizes)})"
             )
+        if physical_blocks_per_req is None:
+            physical_blocks_per_req = [None] * len(block_sizes)
+        if len(physical_blocks_per_req) != len(block_sizes):
+            raise ValueError(
+                "physical_blocks_per_req length "
+                f"({len(physical_blocks_per_req)}) must match block_sizes "
+                f"length ({len(block_sizes)})"
+            )
 
         self.block_tables = [
             BlockTable(
@@ -267,9 +336,18 @@ class MultiGroupBlockTable:
                 device,
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
+                ring_blocks_per_req,
             )
-            for block_size, kernel_block_size, max_num_blocks_per_req in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks
+            for (
+                block_size,
+                kernel_block_size,
+                max_num_blocks_per_req,
+                ring_blocks_per_req,
+            ) in zip(
+                block_sizes,
+                kernel_block_sizes,
+                max_num_blocks,
+                physical_blocks_per_req,
             )
         ]
 

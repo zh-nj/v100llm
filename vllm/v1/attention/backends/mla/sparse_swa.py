@@ -161,6 +161,7 @@ class DeepseekSparseSWAMetadata:
     # Pre-computed prefill metadata shared across all DeepseekV4 attention layers.
     prefill_seq_lens: torch.Tensor | None = None
     prefill_gather_lens: torch.Tensor | None = None
+    prefill_max_seq_len: int = 0
 
     # Per-layer-type FlashMLA tile-scheduler metadata. One FlashMLASchedMeta
     # per present DeepseekV4 layer type, shared across all ~60 layers of that type
@@ -329,6 +330,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             num_decodes,
             num_prefills,
             seq_lens,
+            common_attn_metadata.seq_lens_cpu,
             query_start_loc,
         )
 
@@ -393,8 +395,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         num_decodes: int,
         num_prefills: int,
         seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         query_start_loc: torch.Tensor,
-    ) -> dict[str, torch.Tensor | None]:
+    ) -> dict[str, torch.Tensor | int | None]:
         """Pre-compute DeepseekV4 prefill metadata during the metadata build phase.
 
         Returns a dict of keyword arguments to pass to the
@@ -403,7 +406,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         Note: C128A topk indices are computed by the FlashMLASparse builder
         (which owns the C128A block_table), not here.
         """
-        result: dict[str, torch.Tensor | None] = {}
+        result: dict[str, torch.Tensor | int | None] = {}
 
         # --- Prefill query metadata (single Triton kernel + CPU slicing) ---
         if num_prefills > 0:
@@ -422,6 +425,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
             result["prefill_seq_lens"] = seq_lens[num_decodes:]
             result["prefill_gather_lens"] = pfx_gather_lens
+            result["prefill_max_seq_len"] = int(
+                seq_lens_cpu[num_decodes:].max().item()
+            )
 
         return result
 

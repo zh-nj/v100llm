@@ -114,6 +114,7 @@ def _get_prefill_chunk_size() -> int:
 
 
 PREFILL_CHUNK_SIZE = _get_prefill_chunk_size()
+_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 _QK_NOPE_DIM = 448
 _QK_ROPE_DIM = 64
 _QK_FP8_MAX = 448.0
@@ -139,6 +140,65 @@ _DEEPSEEK_V4_PROFILE_MODE = os.getenv(
 ).strip().lower()
 if _DEEPSEEK_V4_PROFILE_MODE not in ("queue", "eager"):
     _DEEPSEEK_V4_PROFILE_MODE = "queue"
+
+
+def _align_sparse_prefill_topk(value: int) -> int:
+    return (
+        (max(1, value) + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        // _SPARSE_PREFILL_TOPK_ALIGNMENT
+        * _SPARSE_PREFILL_TOPK_ALIGNMENT
+    )
+
+
+def _prefill_compressed_pool_tokens(
+    *,
+    compress_ratio: int,
+    max_model_len: int,
+    seq_lens: torch.Tensor | None = None,
+    prefill_max_seq_len: int | None = None,
+) -> int:
+    if compress_ratio <= 1:
+        return 0
+    if prefill_max_seq_len is not None and prefill_max_seq_len > 0:
+        max_seq_len = min(prefill_max_seq_len, max_model_len)
+        return max_seq_len // compress_ratio
+    if seq_lens is not None and seq_lens.numel() > 0:
+        max_seq_len = min(int(seq_lens.max().item()), max_model_len)
+        return max_seq_len // compress_ratio
+    return (max_model_len + compress_ratio - 1) // compress_ratio
+
+
+def _tilelang_sparse_prefill_prewarm_topks(
+    *,
+    hf_index_topk: int,
+    window_size: int,
+    max_model_len: int,
+    prewarm_max_context_len: int | None = None,
+) -> list[int]:
+    from vllm.v1.attention.backends.mla.flashmla_sparse import (
+        c128a_prefill_compressed_topk_buckets,
+    )
+
+    mla_combined = _align_sparse_prefill_topk(hf_index_topk + window_size)
+
+    c128a_prewarm_len = max_model_len
+    if prewarm_max_context_len is not None and prewarm_max_context_len > 0:
+        c128a_prewarm_len = min(max_model_len, prewarm_max_context_len)
+    c128a_max_compressed = _align_sparse_prefill_topk(
+        (c128a_prewarm_len + 127) // 128
+    )
+    c128a_prefill_buckets = c128a_prefill_compressed_topk_buckets(
+        c128a_max_compressed
+    )
+
+    return sorted({
+        128,  # SWA-only / decode fallback
+        mla_combined,
+        *(
+            _align_sparse_prefill_topk(bucket + window_size)
+            for bucket in c128a_prefill_buckets
+        ),
+    })
 # Cap recorded steps; 0 / unset => unlimited.
 _DEEPSEEK_V4_PROFILE_STEP_LIMIT = int(
     os.getenv("VLLM_DEEPSEEK_V4_PROFILE_STEP_LIMIT", "0")
@@ -927,6 +987,18 @@ def _should_use_sm70_decode_prefill_fallback(
     ):
         return False
     return True
+
+
+def _should_use_sm70_decode_prefill_fallback_for_total_topk(
+    q: torch.Tensor,
+    direct_total_topk: int,
+) -> bool:
+    if not q.is_cuda:
+        return False
+    capability = torch.cuda.get_device_capability(q.device)
+    if capability != (7, 0):
+        return False
+    return direct_total_topk > 8192
 
 
 def _get_decode_prefill_fallback_workspace(
@@ -2163,7 +2235,7 @@ def _copy_flashmla_output(
 ) -> None:
     if flash_output.data_ptr() != output.data_ptr() or flash_output.dtype != output.dtype:
         with copy_source_trace("flashmla_bf16_io.output_to_model_dtype"):
-            output.copy_(flash_output.to(output.dtype))
+            output.copy_(flash_output)
 
 
 def _should_use_tilelang_sparse_prefill_fast_io(
@@ -2191,7 +2263,7 @@ def _should_use_tilelang_sparse_prefill_fast_io(
         ok, _reason = is_tilelang_available()
         if not ok:
             return False
-        return is_tilelang_sparse_fwd_cached(
+        cached = is_tilelang_sparse_fwd_cached(
             q,
             kv,
             indices,
@@ -2203,6 +2275,28 @@ def _should_use_tilelang_sparse_prefill_fast_io(
             block_I=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI,
             threads=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS,
         )
+        if cached:
+            return True
+        if (
+            envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            logger.warning_once(
+                "TileLang sparse prefill cache miss for shape "
+                "s_q=%d h_q=%d d_qk=%d topk=%d dtype=%s; compiling "
+                "bucket on first use instead of falling back.",
+                q.shape[0], q.shape[1], q.shape[2], indices.shape[-1],
+                output.dtype,
+            )
+            return True
+        logger.warning_once(
+            "TileLang sparse prefill cache miss for shape "
+            "s_q=%d h_q=%d d_qk=%d topk=%d dtype=%s; falling back to "
+            "FlashMLA.",
+            q.shape[0], q.shape[1], q.shape[2], indices.shape[-1],
+            output.dtype,
+        )
+        return False
     except Exception:
         return False
 
@@ -3168,17 +3262,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
                         # H18 prewarm list: DSv4F has three combined_topk
                         # paths, chosen by the layer's compress_ratio.
-                        # `top_k` does NOT depend on input length; it
-                        # comes from the topk_indices buffer width, which
-                        # is a model-config constant per layer type.
                         #
                         #   compress_ratio=0 / SWA-only / decode fallback:
                         #     top_k=0 (uses swa_indices directly)
                         #     -> combined_topk = window_size-aligned = 128
                         #   compress_ratio=128 (C128A):
-                        #     top_k = c128a_max_compressed
-                        #            = ceil(max_model_len/128/128)*128
-                        #     -> combined_topk = ceil((that+window)/128)*128
+                        #     top_k grows with absolute prompt position, then
+                        #     is rounded to the same deterministic buckets used
+                        #     by FlashMLASparseMetadataBuilder.
                         #   compress_ratio=4 (MLA main):
                         #     top_k = topk_indices_buffer.shape[-1]
                         #            = config.index_topk
@@ -3187,24 +3278,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         #        buffer width that ends up passed to
                         #        flash_mla_sparse_fwd as `topk`.)
                         #     -> combined_topk = ceil((index_topk+window)/128)*128
-                        _hf_index_topk = getattr(_hf, "index_topk", 512)
-                        _max_model_len = _vllm_cfg.model_config.max_model_len
-                        _mla_combined = (
-                            (_hf_index_topk + self.window_size + 127)
-                            // 128 * 128
+                        _prewarm_topks = _tilelang_sparse_prefill_prewarm_topks(
+                            hf_index_topk=getattr(_hf, "index_topk", 512),
+                            window_size=self.window_size,
+                            max_model_len=_vllm_cfg.model_config.max_model_len,
+                            prewarm_max_context_len=(
+                                envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT
+                            ),
                         )
-                        _c128a_compressed = (
-                            (_max_model_len // 128 + 127) // 128 * 128
-                        )
-                        _c128a_combined = (
-                            (_c128a_compressed + self.window_size + 127)
-                            // 128 * 128
-                        )
-                        _prewarm_topks = sorted({
-                            128,                 # SWA-only / decode fallback
-                            _c128a_combined,     # C128A path
-                            _mla_combined,       # MLA main path
-                        })
                         for _topk_v in _prewarm_topks:
                             for _d_qk in (_kv_lora + _rope, _kv_lora):
                                 prewarm_tilelang_sparse_fwd(
@@ -3395,7 +3476,17 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # q arrives pre-padded to self.padded_heads by the outer wrapper.
         q = q.unsqueeze(1)
 
-        if _should_use_sm70_decode_prefill_fallback(q, swa_only):
+        direct_total_topk = swa_indices.shape[-1]
+        if not swa_only:
+            assert topk_indices is not None
+            direct_total_topk += topk_indices.shape[-1]
+
+        if (
+            _should_use_sm70_decode_prefill_fallback(q, swa_only)
+            or _should_use_sm70_decode_prefill_fallback_for_total_topk(
+                q, direct_total_topk
+            )
+        ):
             if swa_only:
                 swa_topk = swa_indices.shape[-1]
                 fallback_kv = _get_decode_prefill_fallback_workspace(
@@ -3561,10 +3652,17 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 assert attn_metadata is not None
                 topk_indices = attn_metadata.c128a_prefill_topk_indices
             top_k = topk_indices.shape[-1]
-            # Compressed region must fit the full compressed pool (seq_len //
-            # compress_ratio), not just top_k. top_k bounds how many indices
-            # the indexer selects, not the pool size it indexes into.
-            N = (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio
+            # Compressed region must fit the current gathered compressed pool
+            # (seq_len // compress_ratio), not just top_k. top_k bounds how many
+            # indices the indexer selects, not the pool size it indexes into.
+            N = _prefill_compressed_pool_tokens(
+                compress_ratio=self.compress_ratio,
+                max_model_len=self.max_model_len,
+                seq_lens=seq_lens[:num_prefills],
+                prefill_max_seq_len=getattr(
+                    swa_metadata, "prefill_max_seq_len", None
+                ),
+            )
         else:
             # NOTE(woosuk): topk_indices will not be used for SWA-only layers.
             assert self.topk_indices_buffer is not None
@@ -3765,23 +3863,32 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         topk_length=combined_lens,
                         output=output_slice,
                     ):
+                        from vllm.v1.attention.ops import (  # noqa: PLC0415
+                            tilelang_sparse_prefill,
+                        )
+
                         q_chunk = q_slice
-                        with copy_source_trace(
-                            "flashmla_fast_q_io.output_alloc_bf16"
-                        ):
-                            output_chunk = torch.empty_like(
-                                output_slice, dtype=torch.bfloat16)
                         if trace_prefill:
                             _trace_tensor_summary(
                                 f"{self.prefix}.prefill.q_chunk", q_chunk)
-                        flash_output, max_logits, lse = flash_mla_sparse_fwd(
-                            q=q_chunk,
-                            kv=kv_flat,
-                            indices=indices_3d,
-                            sm_scale=self.scale,
-                            attn_sink=self.attn_sink,
-                            topk_length=combined_lens,
-                            out=output_chunk,
+                        flash_output, max_logits, lse = (
+                            tilelang_sparse_prefill.flash_mla_sparse_fwd_tilelang(
+                                q=q_chunk,
+                                kv=kv_flat,
+                                indices=indices_3d,
+                                sm_scale=self.scale,
+                                d_v=self.head_dim,
+                                attn_sink=self.attn_sink,
+                                topk_length=combined_lens,
+                                out=output_slice,
+                                output_dtype=torch.bfloat16,
+                                block_I=(
+                                    envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI
+                                ),
+                                threads=(
+                                    envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS
+                                ),
+                            )
                         )
                         _copy_flashmla_output(flash_output, output_slice)
                     else:

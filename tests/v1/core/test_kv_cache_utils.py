@@ -19,6 +19,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
+from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
@@ -46,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -138,6 +140,40 @@ def new_sliding_window_spec(
         dtype=dtype,
         page_size_padded=page_size_padded,
         sliding_window=sliding_window,
+    )
+
+
+def new_deepseek_v4_mla_spec(
+    block_size=256,
+    compress_ratio=4,
+    dtype=torch.uint8,
+):
+    return MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=dtype,
+        cache_dtype_str="fp8_ds_mla",
+        compress_ratio=compress_ratio,
+        alignment=576,
+        model_version="deepseek_v4",
+    )
+
+
+def new_deepseek_v4_swa_spec(
+    block_size=64,
+    sliding_window=128,
+    dtype=torch.uint8,
+):
+    return SlidingWindowMLASpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=dtype,
+        sliding_window=sliding_window,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+        model_version="deepseek_v4",
     )
 
 
@@ -2162,3 +2198,100 @@ def test_unify_hybrid_kv_cache_specs():
 
     with pytest.raises(ValueError):
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+
+def test_deepseek_v4_swa_mla_uses_ring_sized_tensors():
+    model_config = ModelConfig(max_model_len=4096)
+    scheduler_config = SchedulerConfig(
+        max_model_len=4096,
+        max_num_batched_tokens=128,
+        max_num_seqs=2,
+        is_encoder_decoder=False,
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        scheduler_config=scheduler_config,
+    )
+
+    full_spec = new_deepseek_v4_mla_spec()
+    swa_spec = new_deepseek_v4_swa_spec()
+    assert full_spec.page_size_bytes == swa_spec.page_size_bytes
+    page_size = full_spec.page_size_bytes
+
+    # The SWA cache only needs a per-request ring large enough for the active
+    # window plus the currently scheduled chunk, not full max_model_len pages.
+    swa_ring_blocks_per_req = cdiv(
+        swa_spec.max_memory_usage_bytes(vllm_config), swa_spec.page_size_bytes
+    )
+    swa_physical_blocks = swa_ring_blocks_per_req * scheduler_config.max_num_seqs
+
+    full_blocks = 100
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config,
+        [{"full_mla": full_spec, "swa_cache": swa_spec}],
+        [page_size * (full_blocks + swa_physical_blocks)],
+    )[0]
+
+    assert kv_cache_config.num_blocks == full_blocks
+    assert len(kv_cache_config.kv_cache_tensors) == 2
+    assert KVCacheTensor(
+        size=page_size * full_blocks,
+        shared_by=["full_mla"],
+    ) in kv_cache_config.kv_cache_tensors
+    assert KVCacheTensor(
+        size=page_size * swa_physical_blocks,
+        shared_by=["swa_cache"],
+        num_blocks=swa_physical_blocks,
+    ) in kv_cache_config.kv_cache_tensors
+
+    swa_group = next(
+        group
+        for group in kv_cache_config.kv_cache_groups
+        if "swa_cache" in group.layer_names
+    )
+    assert swa_group.physical_blocks_per_req == swa_ring_blocks_per_req
+
+
+def test_deepseek_v4_swa_mla_minimal_profiling_allows_fixed_ring():
+    model_config = ModelConfig(max_model_len=4096)
+    scheduler_config = SchedulerConfig(
+        max_model_len=4096,
+        max_num_batched_tokens=128,
+        max_num_seqs=2,
+        is_encoder_decoder=False,
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        scheduler_config=scheduler_config,
+    )
+    vllm_config.cache_config.num_gpu_blocks_override = 1
+
+    full_spec = new_deepseek_v4_mla_spec()
+    swa_spec = new_deepseek_v4_swa_spec()
+    page_size = full_spec.page_size_bytes
+
+    swa_ring_blocks_per_req = cdiv(
+        swa_spec.max_memory_usage_bytes(vllm_config), swa_spec.page_size_bytes
+    )
+    swa_physical_blocks = swa_ring_blocks_per_req * scheduler_config.max_num_seqs
+
+    kv_cache_groups = kv_cache_utils.get_kv_cache_groups(
+        vllm_config,
+        {"full_mla": full_spec, "swa_cache": swa_spec},
+    )
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        kv_cache_groups,
+        available_memory=0,
+    )
+
+    assert kv_cache_config.num_blocks == 1
+    assert KVCacheTensor(
+        size=page_size,
+        shared_by=["full_mla"],
+    ) in kv_cache_config.kv_cache_tensors
+    assert KVCacheTensor(
+        size=page_size * swa_physical_blocks,
+        shared_by=["swa_cache"],
+        num_blocks=swa_physical_blocks,
+    ) in kv_cache_config.kv_cache_tensors

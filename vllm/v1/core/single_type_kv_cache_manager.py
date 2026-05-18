@@ -636,6 +636,81 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return 0
 
 
+class RingSlidingWindowMLAManager(SlidingWindowManager):
+    """Logical manager for DeepSeek V4 SWA cache backed by a physical ring.
+
+    The worker maps logical block positions to request-local physical ring
+    slots, so this manager must not consume IDs from the shared BlockPool.
+    Prefix cache is disabled for the ring group because per-request rings are
+    not populated when a new request reuses cached full-MLA blocks.
+    """
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+    ) -> int:
+        return 0
+
+    def allocate_new_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        req_blocks = self.req_to_blocks[request_id]
+        target_blocks = cdiv(
+            num_local_computed_tokens + num_external_computed_tokens,
+            self.block_size,
+        )
+        if target_blocks > len(req_blocks):
+            req_blocks.extend([self._null_block] * (target_blocks - len(req_blocks)))
+        self.num_cached_block[request_id] = len(req_blocks)
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        req_blocks = self.req_to_blocks[request_id]
+        num_required_blocks = cdiv(num_tokens, self.block_size)
+        num_new_blocks = num_required_blocks - len(req_blocks)
+        if num_new_blocks <= 0:
+            return []
+        new_blocks = [self._null_block] * num_new_blocks
+        req_blocks.extend(new_blocks)
+        return new_blocks
+
+    def cache_blocks(self, request: Request, num_tokens: int) -> None:
+        self.num_cached_block[request.request_id] = num_tokens // self.block_size
+
+    def free(self, request_id: str) -> None:
+        self.req_to_blocks.pop(request_id, None)
+        self.num_cached_block.pop(request_id, None)
+
+    def remove_skipped_blocks(
+        self, request_id: str, total_computed_tokens: int
+    ) -> None:
+        return None
+
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        alignment_tokens: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+    ) -> tuple[list[KVCacheBlock], ...]:
+        return tuple([] for _ in range(len(kv_cache_group_ids)))
+
+
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
     def __init__(self, kv_cache_spec: ChunkedLocalAttentionSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
@@ -1150,7 +1225,13 @@ def get_manager_for_kv_cache_spec(
     max_model_len: int,
     **kwargs,
 ) -> SingleTypeKVCacheManager:
-    manager_class = spec_manager_map[type(kv_cache_spec)]
+    if (
+        isinstance(kv_cache_spec, SlidingWindowMLASpec)
+        and kv_cache_spec.model_version == "deepseek_v4"
+    ):
+        manager_class = RingSlidingWindowMLAManager
+    else:
+        manager_class = spec_manager_map[type(kv_cache_spec)]
     # SlidingWindow / ChunkedLocalAttention managers recycle blocks across
     # chunks; the runtime admission cap must match the recycling-aware bound
     # the startup pool sizer uses (single source of truth: the spec method).

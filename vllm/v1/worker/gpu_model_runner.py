@@ -614,6 +614,7 @@ class GPUModelRunner(
         )
         self._init_block_sizes = [placeholder_block_size]
         self._init_kernel_block_sizes = [placeholder_block_size]
+        self._init_physical_blocks_per_req: list[int | None] = [None]
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoder
@@ -6494,12 +6495,14 @@ class GPUModelRunner(
         """
         block_sizes = []
         max_num_blocks = []
+        physical_blocks_per_req = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
+            physical_blocks_per_req.append(kv_cache_group.physical_blocks_per_req)
             max_num_blocks_per_req = cdiv(
                 max_model_len, block_size * get_total_cp_world_size()
             )
@@ -6514,6 +6517,7 @@ class GPUModelRunner(
         if (
             block_sizes != self._init_block_sizes
             or kernel_block_sizes != self._init_kernel_block_sizes
+            or physical_blocks_per_req != self._init_physical_blocks_per_req
         ):
             assert self.offload_config.uva.cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
@@ -6522,6 +6526,7 @@ class GPUModelRunner(
             )
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
+            self._init_physical_blocks_per_req = physical_blocks_per_req
             self.input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
@@ -6532,6 +6537,7 @@ class GPUModelRunner(
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
+                physical_blocks_per_req=physical_blocks_per_req,
                 is_spec_decode=bool(self.vllm_config.speculative_config),
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
@@ -6545,6 +6551,11 @@ class GPUModelRunner(
         assert self._init_kernel_block_sizes == kernel_block_sizes, (
             f"InputBatch kernel_block_sizes {self._init_kernel_block_sizes} "
             f"!= kv_cache kernel_block_sizes {kernel_block_sizes}"
+        )
+        assert self._init_physical_blocks_per_req == physical_blocks_per_req, (
+            "InputBatch physical_blocks_per_req "
+            f"{self._init_physical_blocks_per_req} != "
+            f"kv_cache physical_blocks_per_req {physical_blocks_per_req}"
         )
 
     def _allocate_kv_cache_tensors(

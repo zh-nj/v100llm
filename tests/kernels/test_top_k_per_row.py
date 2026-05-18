@@ -386,3 +386,109 @@ def test_deepseek_hybrid_topk(clean_logits: bool) -> None:
     assert compare_top_k_results(
         logits_long, indices, torch_indices_long, row_starts_long, row_ends_long, top_k
     ), "large_context_topk kernel (long sequences) doesn't match torch.topk"
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not torch.cuda.is_available(),
+    reason="This test requires CUDA",
+)
+@torch.inference_mode()
+def test_large_context_topk_row_starts_return_local_indices() -> None:
+    """large_context_topk must keep the prefill local-index contract."""
+    torch.set_default_device("cuda:0")
+    top_k = 2048
+    row_starts = torch.tensor([17, 113], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([3072, 4096], dtype=torch.int32, device="cuda")
+    row_ends = row_starts + lengths
+    logits = torch.full(
+        (row_starts.shape[0], int(row_ends.max().item()) + 1),
+        -10000.0,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    expected = torch.empty((row_starts.shape[0], top_k), dtype=torch.int32, device="cuda")
+    for row in range(row_starts.shape[0]):
+        start = int(row_starts[row].item())
+        length = int(lengths[row].item())
+        values = torch.arange(length, dtype=torch.float32, device="cuda")
+        logits[row, start : start + length] = values
+        expected[row] = values.topk(top_k, dim=-1).indices.to(torch.int32)
+
+    indices = torch.empty_like(expected)
+    try:
+        torch.ops._C.large_context_topk(logits, indices, lengths, row_starts)
+    except RuntimeError as err:
+        if "no kernel image is available" in str(err):
+            pytest.skip("large_context_topk extension is unavailable for this device")
+        raise
+
+    for row in range(row_starts.shape[0]):
+        out = indices[row]
+        exp = expected[row]
+        assert out.min().item() >= 0
+        assert out.max().item() < int(lengths[row].item())
+        assert set(out.tolist()) == set(exp.tolist())
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not torch.cuda.is_available(),
+    reason="This test requires CUDA",
+)
+@torch.inference_mode()
+def test_persistent_topk_512_matches_torch_topk_sets() -> None:
+    """DSv4 Flash prefill uses k=512; output order is intentionally unspecified."""
+    torch.set_default_device("cuda:0")
+    rows = 64
+    row_len = 10000
+    top_k = 512
+    logits = torch.randn((rows, row_len), dtype=torch.float32, device="cuda")
+    lengths = torch.full((rows,), row_len, dtype=torch.int32, device="cuda")
+    indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    workspace = torch.empty((1024 * 1024,), dtype=torch.uint8, device="cuda")
+
+    torch.ops._C.persistent_topk(
+        logits,
+        lengths,
+        indices,
+        workspace,
+        top_k,
+        row_len,
+    )
+
+    for row in range(rows):
+        expected = logits[row].topk(top_k).indices.to(torch.int32)
+        assert set(indices[row].tolist()) == set(expected.tolist())
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not torch.cuda.is_available(),
+    reason="This test requires CUDA",
+)
+@torch.inference_mode()
+def test_large_context_topk_512_matches_torch_topk_sets() -> None:
+    """large_context_topk should support DSv4 Flash topk=512."""
+    torch.set_default_device("cuda:0")
+    rows = 32
+    row_len = 4096
+    top_k = 512
+    row_starts = torch.tensor([i % 7 for i in range(rows)], dtype=torch.int32, device="cuda")
+    lengths = torch.full((rows,), row_len, dtype=torch.int32, device="cuda")
+    row_ends = row_starts + lengths
+    logits = torch.randn(
+        (rows, int(row_ends.max().item()) + 1),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+
+    torch.ops._C.large_context_topk(logits, indices, lengths, row_starts)
+
+    for row in range(rows):
+        start = int(row_starts[row].item())
+        expected = logits[row, start : start + row_len].topk(top_k).indices.to(
+            torch.int32
+        )
+        assert indices[row].min().item() >= 0
+        assert indices[row].max().item() < row_len
+        assert set(indices[row].tolist()) == set(expected.tolist())

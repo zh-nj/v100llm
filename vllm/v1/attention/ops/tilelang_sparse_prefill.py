@@ -19,11 +19,33 @@ from typing import Optional, Tuple
 
 import torch
 
+from vllm import envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
 _TILELANG_AVAILABLE: Optional[bool] = None
+
+
+def _dtype_element_size(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _output_chunk_rows(
+    *,
+    s_q: int,
+    h_q: int,
+    d_v: int,
+    output_dtype: torch.dtype,
+) -> int:
+    chunk_mb = envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_OUTPUT_CHUNK_MB
+    if chunk_mb <= 0:
+        return s_q
+    bytes_per_row = h_q * d_v * _dtype_element_size(output_dtype)
+    if bytes_per_row <= 0:
+        return s_q
+    budget_bytes = chunk_mb * 1024 * 1024
+    return max(1, min(s_q, budget_bytes // bytes_per_row))
 
 
 def is_tilelang_available() -> Tuple[bool, Optional[str]]:
@@ -413,6 +435,7 @@ def flash_mla_sparse_fwd_tilelang(
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
     block_I: int = 16,
     num_stages: int = 1,
     threads: int = 128,
@@ -430,13 +453,49 @@ def flash_mla_sparse_fwd_tilelang(
     assert tail_dim in (0, 64), f"unsupported tail_dim {tail_dim}"
 
     input_dtype = q.dtype
-    output_dtype = out.dtype if out is not None else input_dtype
-    # Q/KV go in as fp16 (V100 MMA requirement). Output dtype follows an
-    # explicit `out` buffer when supplied; otherwise it follows q dtype. This
-    # lets DSv4F pass fp16 Q while reusing the prewarmed bf16 output kernel.
-    output_dtype_str = (
-        "bfloat16" if output_dtype == torch.bfloat16 else "float16"
+    requested_output_dtype = (
+        output_dtype if output_dtype is not None
+        else out.dtype if out is not None
+        else input_dtype
     )
+    # Q/KV go in as fp16 (V100 MMA requirement). `output_dtype` controls the
+    # TileLang temporary dtype when supplied; `out` is only the final destination
+    # buffer. This lets DSv4F request bf16 kernel output while copying each small
+    # chunk into the fp16 model output buffer, instead of materializing one large
+    # bf16 prefill tensor.
+    output_dtype_str = (
+        "bfloat16" if requested_output_dtype == torch.bfloat16 else "float16"
+    )
+    rows_per_chunk = _output_chunk_rows(
+        s_q=s_q, h_q=h_q, d_v=dim, output_dtype=requested_output_dtype
+    )
+    if out is not None and rows_per_chunk < s_q:
+        max_logits_full = torch.empty(
+            (s_q, h_q), dtype=torch.float32, device=q.device)
+        lse_full = torch.empty((s_q, h_q), dtype=torch.float32, device=q.device)
+        for row_start in range(0, s_q, rows_per_chunk):
+            row_end = min(row_start + rows_per_chunk, s_q)
+            _out, max_part, lse_part = flash_mla_sparse_fwd_tilelang(
+                q=q[row_start:row_end],
+                kv=kv,
+                indices=indices[row_start:row_end],
+                sm_scale=sm_scale,
+                d_v=d_v,
+                attn_sink=attn_sink,
+                topk_length=(
+                    topk_length[row_start:row_end]
+                    if topk_length is not None else None
+                ),
+                out=out[row_start:row_end],
+                output_dtype=requested_output_dtype,
+                block_I=block_I,
+                num_stages=num_stages,
+                threads=threads,
+            )
+            max_logits_full[row_start:row_end].copy_(max_part)
+            lse_full[row_start:row_end].copy_(lse_part)
+        return out, max_logits_full, lse_full
+
     q_fp16 = q.to(torch.float16) if q.dtype != torch.float16 else q
     kv_fp16 = kv.to(torch.float16) if kv.dtype != torch.float16 else kv
 
@@ -476,7 +535,12 @@ def flash_mla_sparse_fwd_tilelang(
     # If output_dtype_str="bfloat16", output is already bf16 from the
     # kernel; no cast needed. Only cast when no explicit out buffer was
     # supplied and the historical return dtype should match q.
-    if out is None and output_dtype_str == "float16" and input_dtype != torch.float16:
+    if (
+        out is None
+        and output_dtype is None
+        and output_dtype_str == "float16"
+        and input_dtype != torch.float16
+    ):
         output = output.to(input_dtype)
 
     if out is not None:
@@ -495,13 +559,15 @@ def prewarm_tilelang_sparse_fwd(
     dtype: torch.dtype = torch.bfloat16,
     block_I: int = 16,
     threads: int = 128,
+    all_feature_variants: bool = False,
 ) -> None:
     """Trigger JIT compile + first-call allocation of the TileLang kernel
     before it enters the prefill hot path.
 
-    Call this once from model-load to avoid a ~45s stall on the first
-    prefill. Emits both sink-on and sink-off variants because the
-    kernel is compiled per-feature-flag combination.
+    Call this once from model-load to avoid a ~45s stall on common prefill
+    buckets. Production DSv4F prefill uses both attn_sink and topk_length, so
+    compile that variant by default; pass all_feature_variants=True for
+    exhaustive debugging coverage.
     """
     logger.info(
         "TileLang sparse MLA: prewarming kernels for "
@@ -517,10 +583,12 @@ def prewarm_tilelang_sparse_fwd(
     attn_sink = torch.zeros(heads, dtype=torch.float32, device=device)
     topk_length = torch.ones(1, dtype=torch.int32, device=device)
 
-    # Compile all 4 variants we may encounter in production: with/without sink,
-    # with/without topk_length.
-    for sink, tl in [(None, None), (attn_sink, None),
-                     (None, topk_length), (attn_sink, topk_length)]:
+    variants = (
+        [(None, None), (attn_sink, None), (None, topk_length),
+         (attn_sink, topk_length)]
+        if all_feature_variants else [(attn_sink, topk_length)]
+    )
+    for sink, tl in variants:
         flash_mla_sparse_fwd_tilelang(
             Q, KV, Indices, sm_scale, d_v,
             attn_sink=sink, topk_length=tl,

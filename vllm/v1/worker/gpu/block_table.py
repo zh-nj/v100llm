@@ -14,6 +14,7 @@ class BlockTables:
     def __init__(
         self,
         block_sizes: list[int],
+        physical_blocks_per_req: list[int | None],
         max_num_reqs: int,
         max_num_batched_tokens: int,
         max_model_len: int,
@@ -23,6 +24,12 @@ class BlockTables:
         cp_interleave: int = 1,
     ):
         self.block_sizes = block_sizes
+        self.physical_blocks_per_req = physical_blocks_per_req
+        if len(self.physical_blocks_per_req) != len(self.block_sizes):
+            raise ValueError(
+                "physical_blocks_per_req must match block_sizes length, got "
+                f"{len(self.physical_blocks_per_req)} and {len(self.block_sizes)}"
+            )
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_model_len = max_model_len
@@ -93,6 +100,13 @@ class BlockTables:
         for i in range(self.num_kv_cache_groups):
             start = self.num_blocks.np[i, req_index] if not overwrite else 0
             block_ids = new_block_ids[i]
+            ring_blocks = self.physical_blocks_per_req[i]
+            if ring_blocks is not None:
+                ring_base = req_index * ring_blocks
+                block_ids = [
+                    ring_base + ((start + j) % ring_blocks)
+                    for j in range(len(block_ids))
+                ]
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = start + len(block_ids)
 

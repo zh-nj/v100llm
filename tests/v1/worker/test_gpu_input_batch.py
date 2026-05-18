@@ -29,6 +29,39 @@ CUDA_DEVICES = [
 MAX_NUM_PROMPT_TOKENS = 64
 
 
+def test_multigroup_block_table_maps_ring_blocks_by_request_row():
+    block_table = MultiGroupBlockTable(
+        max_num_reqs=3,
+        max_model_len=64,
+        max_num_batched_tokens=8,
+        pin_memory=False,
+        device=torch.device("cpu"),
+        block_sizes=[4, 4],
+        kernel_block_sizes=[4, 4],
+        max_num_blocks=[16, 16],
+        physical_blocks_per_req=[None, 3],
+    )
+
+    block_table.add_row(([10, 11], [0, 0]), row_idx=1)
+    block_table.append_row(([12, 13, 14], [0, 0, 0]), row_idx=1)
+
+    normal = block_table.block_tables[0].block_table.np[1, :5]
+    ring = block_table.block_tables[1].block_table.np[1, :5]
+    assert normal.tolist() == [10, 11, 12, 13, 14]
+    assert ring.tolist() == [3, 4, 5, 3, 4]
+
+    block_table.add_row(([20], [0]), row_idx=2)
+    assert block_table.block_tables[1].block_table.np[2, :1].tolist() == [6]
+
+    block_table.block_tables[1].move_row(src=1, tgt=0)
+    block_table.append_row(([], [0]), row_idx=0)
+    moved_ring = block_table.block_tables[1].block_table.np[0, :6]
+    assert moved_ring.tolist() == [3, 4, 5, 3, 4, 5]
+
+    block_table.add_row(([30], [0]), row_idx=1)
+    assert block_table.block_tables[1].block_table.np[1, :1].tolist() == [0]
+
+
 def _compare_objs(obj1, obj2, skip: Sequence = ("logitsprocs", "batch_update_builder")):
     attrs = inspect.getmembers(obj1, lambda a: not (inspect.isroutine(a)))
     attr_names = set(

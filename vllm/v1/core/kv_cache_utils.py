@@ -1148,6 +1148,32 @@ def _get_kv_cache_groups_uniform_page_size(
     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
 
 
+def _is_deepseek_v4_swa_ring_group(group: KVCacheGroupSpec) -> bool:
+    spec = group.kv_cache_spec
+    if not isinstance(spec, UniformTypeKVCacheSpecs):
+        return False
+    return all(
+        isinstance(layer_spec, SlidingWindowMLASpec)
+        and layer_spec.model_version == "deepseek_v4"
+        for layer_spec in spec.kv_cache_specs.values()
+    )
+
+
+def _deepseek_v4_swa_ring_blocks_per_req(
+    layer_spec: SlidingWindowMLASpec,
+    vllm_config: VllmConfig,
+) -> int:
+    # vLLM inserts the current scheduled chunk into the SWA cache before the
+    # prefill attention gathers it. The physical ring must therefore hold the
+    # live window plus the current scheduled chunk. fastllm can use a strict
+    # 128-token window because it builds the prefix window before updating the
+    # ring with the current chunk.
+    return layer_spec.max_admission_blocks_per_request(
+        max_num_batched_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+        max_model_len=vllm_config.model_config.max_model_len,
+    )
+
+
 def _get_kv_cache_config_deepseek_v4(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1165,7 +1191,68 @@ def _get_kv_cache_config_deepseek_v4(
     per (tuple_idx, bucket) whose shared_by is the union of per-group
     layers at that slot.
     """
-    full_mla_spec = kv_cache_groups[0].kv_cache_spec
+    ring_groups: list[KVCacheGroupSpec] = []
+    full_groups: list[KVCacheGroupSpec] = []
+    for group in kv_cache_groups:
+        if _is_deepseek_v4_swa_ring_group(group):
+            ring_groups.append(group)
+        else:
+            full_groups.append(group)
+
+    assert full_groups, "DeepseekV4 allocator expects at least one full MLA group"
+
+    # CUDA graph memory profiling initializes a minimal KV cache by passing
+    # available_memory=0 while temporarily setting num_gpu_blocks_override.
+    # The full-MLA tensors are governed by that override; the fixed SWA ring
+    # tensors need the same treatment or DSv4F allocates the full scheduler
+    # request capacity (default 256) during profiling and can OOM before real
+    # KV-cache planning runs.
+    is_minimal_profiling_config = (
+        available_memory == 0
+        and vllm_config.cache_config.num_gpu_blocks_override is not None
+    )
+    max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+    if is_minimal_profiling_config:
+        max_num_reqs = max(1, vllm_config.cache_config.num_gpu_blocks_override or 1)
+
+    fixed_ring_bytes = 0
+    ring_tensors: list[KVCacheTensor] = []
+
+    for group in ring_groups:
+        assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        specs = group.kv_cache_spec.kv_cache_specs
+        ring_blocks_per_req: int | None = None
+        for layer_name in group.layer_names:
+            layer_spec = specs[layer_name]
+            assert isinstance(layer_spec, SlidingWindowMLASpec)
+            layer_ring_blocks = _deepseek_v4_swa_ring_blocks_per_req(
+                layer_spec, vllm_config
+            )
+            if ring_blocks_per_req is None:
+                ring_blocks_per_req = layer_ring_blocks
+            else:
+                assert ring_blocks_per_req == layer_ring_blocks
+            physical_blocks = layer_ring_blocks * max_num_reqs
+            fixed_ring_bytes += physical_blocks * layer_spec.page_size_bytes
+            ring_tensors.append(
+                KVCacheTensor(
+                    size=physical_blocks * layer_spec.page_size_bytes,
+                    shared_by=[layer_name],
+                    num_blocks=physical_blocks,
+                )
+            )
+        group.physical_blocks_per_req = ring_blocks_per_req
+
+    if fixed_ring_bytes > available_memory and not is_minimal_profiling_config:
+        raise ValueError(
+            "No available memory for DeepSeek V4 SWA ring KV cache. "
+            f"Need {format_gib(fixed_ring_bytes)} GiB but only "
+            f"{format_gib(available_memory)} GiB is available."
+        )
+
+    available_memory = max(0, available_memory - fixed_ring_bytes)
+
+    full_mla_spec = full_groups[0].kv_cache_spec
     assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
     page_sizes = sorted(full_mla_spec.get_page_sizes())
     layer_tuple_page_bytes = sum(page_sizes)
@@ -1173,7 +1260,7 @@ def _get_kv_cache_config_deepseek_v4(
     # Pre-bucket each group's layers by page_size (registration order within
     # bucket). bucketed[g_idx][page_size] = [layer_name, ...].
     bucketed: list[dict[int, list[str]]] = []
-    for group in kv_cache_groups:
+    for group in full_groups:
         assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         specs = group.kv_cache_spec.kv_cache_specs
         b: dict[int, list[str]] = defaultdict(list)
@@ -1199,9 +1286,13 @@ def _get_kv_cache_config_deepseek_v4(
                 if bucket is not None and tuple_idx < len(bucket):
                     shared_by.append(bucket[tuple_idx])
             kv_cache_tensors.append(
-                KVCacheTensor(size=ps * num_blocks, shared_by=shared_by)
+                KVCacheTensor(
+                    size=ps * num_blocks,
+                    shared_by=shared_by,
+                )
             )
 
+    kv_cache_tensors.extend(ring_tensors)
     return num_blocks, kv_cache_tensors
 
 
@@ -1283,7 +1374,10 @@ def get_kv_cache_config_from_groups(
                 if i < len(kv_cache_groups[j].layer_names):
                     shared_by.append(kv_cache_groups[j].layer_names[i])
             kv_cache_tensors.append(
-                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+                KVCacheTensor(
+                    size=page_size * num_blocks,
+                    shared_by=shared_by,
+                )
             )
 
     return KVCacheConfig(
@@ -1735,15 +1829,38 @@ def _max_memory_usage_bytes_from_groups(
         # They must already be page_size aligned and share a common padded
         # layer-tuple layout. Even groups with fewer actual tuples still reserve
         # the global number of tuple slots in the shared tensor layout.
-        full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
+        ring_groups = [
+            group for group in kv_cache_groups if _is_deepseek_v4_swa_ring_group(group)
+        ]
+        full_groups = [
+            group
+            for group in kv_cache_groups
+            if not _is_deepseek_v4_swa_ring_group(group)
+        ]
+        assert full_groups, "DeepseekV4 memory estimate expects full MLA groups"
+
+        total_max_mem_usage_bytes = 0
+        max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        for group in ring_groups:
+            group_spec = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec)
+            for layer_name in group.layer_names:
+                layer_spec = group_spec.kv_cache_specs[layer_name]
+                assert isinstance(layer_spec, SlidingWindowMLASpec)
+                ring_blocks = _deepseek_v4_swa_ring_blocks_per_req(
+                    layer_spec, vllm_config
+                )
+                total_max_mem_usage_bytes += (
+                    ring_blocks * max_num_reqs * layer_spec.page_size_bytes
+                )
+
+        full_mla_spec = cast(UniformTypeKVCacheSpecs, full_groups[0].kv_cache_spec)
         layer_tuple_bytes = sum(full_mla_spec.get_page_sizes())
         num_layer_tuples = max(
             cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).get_num_layer_tuples()
-            for group in kv_cache_groups
+            for group in full_groups
         )
 
-        total_max_mem_usage_bytes = 0
-        for group in kv_cache_groups:
+        for group in full_groups:
             group_spec = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec)
             g_max_mem_usage_pages = group_spec.max_memory_usage_pages(vllm_config)
             g_max_mem_usage_page_bytes = (
@@ -1905,6 +2022,7 @@ def _project_kv_cache_groups_to_worker(
                 worker_layer_names,
                 group_spec,
                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
+                physical_blocks_per_req=group.physical_blocks_per_req,
             )
         )
     return projected_groups
@@ -2013,6 +2131,11 @@ def get_kv_cache_configs(
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:
+            if tensor.num_blocks is not None:
+                # Fixed-size ring/window tensors are not tied to the global
+                # block-pool size and must not be shrunk by rank-level
+                # min_num_blocks synchronization.
+                continue
             assert tensor.size % num_blocks_old == 0
             tensor.size = tensor.size // num_blocks_old * min_num_blocks
 

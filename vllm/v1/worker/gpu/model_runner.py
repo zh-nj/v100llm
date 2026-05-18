@@ -341,6 +341,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_cache_group.kv_cache_spec.block_size
             for kv_cache_group in kv_cache_config.kv_cache_groups
         ]
+        physical_blocks_per_req = [
+            kv_cache_group.physical_blocks_per_req
+            for kv_cache_group in kv_cache_config.kv_cache_groups
+        ]
 
         block_table_max_model_len = self.max_model_len
         if self.is_encoder_decoder:
@@ -353,6 +357,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
+            physical_blocks_per_req=physical_blocks_per_req,
             max_num_reqs=self.max_num_reqs,
             max_num_batched_tokens=self.max_num_tokens,
             max_model_len=block_table_max_model_len,

@@ -113,8 +113,11 @@ if TYPE_CHECKING:
     VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS: int = 4
     VLLM_SM70_USE_TILELANG_SPARSE_PREFILL: bool = True
     VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO: bool = True
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS: bool = True
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT: int = 65536
     VLLM_SM70_TILELANG_SPARSE_PREFILL_BI: int = 16
     VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS: int = 128
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_OUTPUT_CHUNK_MB: int = 64
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -987,6 +990,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO": lambda: bool(
         int(os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO", "1"))
     ),
+    # Compile a deterministic TileLang sparse-prefill bucket on first use
+    # instead of falling back to FlashMLA when the length was not prewarmed.
+    "VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS": lambda: bool(
+        int(os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS", "1"))
+    ),
+    # Startup prewarm budget for C128A absolute-position buckets. 64k covers
+    # the common long-prefill benchmark shapes without compiling every 512k/1M
+    # bucket at service start. Larger contexts can still JIT on first use.
+    "VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT": lambda: int(
+        os.getenv(
+            "VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT", "65536"
+        )
+    ),
     # TileLang sparse MLA tile width (per-tile KV rows). Only BI=16 is
     # validated on V100; larger values OOM smem, smaller values violate
     # the SM70 MMA macro's N >= 16 constraint.
@@ -997,6 +1013,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # setting on V100.
     "VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS": lambda: int(
         os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS", "128")
+    ),
+    # Cap the per-call TileLang sparse prefill output temporary. The TileLang
+    # adapter returns Output/Max/Lse tensors; for long chunked prefill a single
+    # bf16 Output can be hundreds of MiB. Chunking query rows keeps the hot
+    # TileLang path while avoiding long-context OOM spikes.
+    "VLLM_SM70_TILELANG_SPARSE_PREFILL_OUTPUT_CHUNK_MB": lambda: int(
+        os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_OUTPUT_CHUNK_MB", "64")
     ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (
