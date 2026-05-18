@@ -296,6 +296,103 @@ def test_streaming_topk_prefill_requires_sm70_fp8_and_long_rows(monkeypatch):
     )
 
 
+def test_try_streaming_topk_prefill_calls_streaming_wrapper(monkeypatch):
+    from vllm.model_executor.layers import sparse_attn_indexer
+    from vllm.v1.attention.ops import tilelang_prefill_streaming_topk
+
+    monkeypatch.setattr(
+        sparse_attn_indexer,
+        "_should_use_streaming_topk_prefill",
+        lambda **kwargs: True,
+    )
+    captured = {}
+
+    def fake_streaming_topk(**kwargs):
+        captured.update(kwargs)
+        kwargs["out_indices"].fill_(23)
+
+    monkeypatch.setattr(
+        tilelang_prefill_streaming_topk,
+        "prefill_streaming_topk_tilelang",
+        fake_streaming_topk,
+    )
+
+    q = torch.empty((2, 4, 16), dtype=torch.float32)
+    k_cache_values = torch.empty((128, 16), dtype=torch.float16)
+    k_cache_scales = torch.ones((128,), dtype=torch.float32)
+    weights = torch.ones((2, 4), dtype=torch.float32)
+    row_starts = torch.zeros((2,), dtype=torch.int32)
+    row_ends = torch.full((2,), 128, dtype=torch.int32)
+    out_indices = torch.empty((2, 512), dtype=torch.int32)
+
+    handled = sparse_attn_indexer._try_prefill_streaming_topk_indices(
+        q=q,
+        k_cache_values=k_cache_values,
+        k_cache_scales=k_cache_scales,
+        weights=weights,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        out_indices=out_indices,
+        topk_tokens=512,
+        use_fp4_cache=False,
+        max_row_len=16384,
+    )
+
+    assert handled
+    assert captured["q"].dtype == torch.float16
+    assert captured["k_cache_values"] is k_cache_values
+    assert captured["k_cache_scales"] is k_cache_scales
+    assert captured["weights"] is weights
+    assert captured["row_starts"] is row_starts
+    assert captured["row_ends"] is row_ends
+    assert captured["out_indices"] is out_indices
+    assert captured["topk_tokens"] == 512
+    assert torch.all(out_indices == 23)
+
+
+def test_try_streaming_topk_prefill_returns_false_when_disabled(monkeypatch):
+    from vllm.model_executor.layers import sparse_attn_indexer
+    from vllm.v1.attention.ops import tilelang_prefill_streaming_topk
+
+    monkeypatch.setattr(
+        sparse_attn_indexer,
+        "_should_use_streaming_topk_prefill",
+        lambda **kwargs: False,
+    )
+
+    def fail_streaming_topk(**kwargs):
+        raise AssertionError("streaming topk should not run")
+
+    monkeypatch.setattr(
+        tilelang_prefill_streaming_topk,
+        "prefill_streaming_topk_tilelang",
+        fail_streaming_topk,
+    )
+
+    q = torch.empty((2, 4, 16), dtype=torch.float16)
+    k_cache_values = torch.empty((128, 16), dtype=torch.float16)
+    k_cache_scales = torch.ones((128,), dtype=torch.float32)
+    weights = torch.ones((2, 4), dtype=torch.float32)
+    row_starts = torch.zeros((2,), dtype=torch.int32)
+    row_ends = torch.full((2,), 128, dtype=torch.int32)
+    out_indices = torch.empty((2, 512), dtype=torch.int32)
+
+    handled = sparse_attn_indexer._try_prefill_streaming_topk_indices(
+        q=q,
+        k_cache_values=k_cache_values,
+        k_cache_scales=k_cache_scales,
+        weights=weights,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        out_indices=out_indices,
+        topk_tokens=512,
+        use_fp4_cache=False,
+        max_row_len=16384,
+    )
+
+    assert not handled
+
+
 def test_prefill_topk_routes_to_large_context_topk(monkeypatch):
     from vllm.model_executor.layers import sparse_attn_indexer
 

@@ -427,6 +427,48 @@ def _should_use_streaming_topk_prefill(
     return True
 
 
+def _try_prefill_streaming_topk_indices(
+    *,
+    q: torch.Tensor,
+    k_cache_values: torch.Tensor,
+    k_cache_scales: torch.Tensor,
+    weights: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    out_indices: torch.Tensor,
+    topk_tokens: int,
+    use_fp4_cache: bool,
+    max_row_len: int | None,
+) -> bool:
+    if not _should_use_streaming_topk_prefill(
+        q=q,
+        kv_cache=k_cache_values,
+        topk_tokens=topk_tokens,
+        use_fp4_cache=use_fp4_cache,
+        max_row_len=max_row_len,
+    ):
+        return False
+
+    from vllm.v1.attention.ops.tilelang_prefill_streaming_topk import (
+        prefill_streaming_topk_tilelang,
+    )
+
+    q_for_streaming = (
+        q if q.dtype in (torch.float16, torch.bfloat16) else q.to(torch.float16)
+    )
+    prefill_streaming_topk_tilelang(
+        q=q_for_streaming,
+        k_cache_values=k_cache_values,
+        k_cache_scales=k_cache_scales,
+        weights=weights,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        out_indices=out_indices,
+        topk_tokens=topk_tokens,
+    )
+    return True
+
+
 def _prefill_topk_indices(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
@@ -675,6 +717,20 @@ def sparse_attn_indexer(
 
             num_q_rows = q_slice_cast.shape[0]
             num_kv_tokens = k_quant_cast.shape[0]
+            if _try_prefill_streaming_topk_indices(
+                q=q_slice_cast,
+                k_cache_values=k_quant_cast,
+                k_cache_scales=k_scale_cast,
+                weights=weights[chunk.token_start : chunk.token_end],
+                row_starts=chunk.cu_seqlen_ks,
+                row_ends=chunk.cu_seqlen_ke,
+                out_indices=topk_indices,
+                topk_tokens=topk_tokens,
+                use_fp4_cache=use_fp4_cache,
+                max_row_len=attn_metadata_narrowed.max_seq_len,
+            ):
+                continue
+
             for row_start, row_end in _iter_prefill_logits_row_chunks(
                 num_q_rows, num_kv_tokens
             ):
