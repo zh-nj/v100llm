@@ -5,6 +5,12 @@ from __future__ import annotations
 
 import torch
 
+from vllm.v1.attention.ops import tilelang_sparse_prefill
+from vllm.v1.attention.ops.deepseek_v4_ops import (
+    combine_topk_swa_indices,
+    dequantize_and_gather_k_cache,
+)
+
 
 def _require_cuda_tensors(*tensors: torch.Tensor) -> None:
     if not all(t.is_cuda for t in tensors):
@@ -29,10 +35,62 @@ def _flash_mla_sparse_prefill_v2_oracle(
     attn_sink: torch.Tensor,
     out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    raise NotImplementedError(
-        "sparse prefill v2 oracle is not routed yet; Task 4 replaces this "
-        "helper with direct-cache sparse prefill execution"
+    num_reqs = int(seq_lens.shape[0])
+    compressed_tokens = int(torch.max(seq_lens).item()) // compress_ratio
+    m_tokens = compressed_tokens + int(window_size) + int(q.shape[0])
+    kv = torch.empty(
+        (num_reqs, m_tokens, q.shape[-1]),
+        dtype=torch.bfloat16,
+        device=q.device,
     )
+
+    dequantize_and_gather_k_cache(
+        kv,
+        compressed_k_cache,
+        seq_lens=seq_lens // compress_ratio,
+        gather_lens=None,
+        block_table=compressed_block_table,
+        block_size=compressed_k_cache.shape[1],
+        offset=0,
+    )
+    dequantize_and_gather_k_cache(
+        kv,
+        swa_k_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=swa_block_table,
+        block_size=swa_k_cache.shape[1],
+        offset=compressed_tokens,
+    )
+
+    combined_indices, combined_lens = combine_topk_swa_indices(
+        topk_indices,
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        window_size,
+        compress_ratio,
+        top_k,
+        m_tokens,
+        compressed_tokens,
+    )
+    flash_output, max_logits, lse = (
+        tilelang_sparse_prefill.flash_mla_sparse_fwd_tilelang(
+            q=q,
+            kv=kv.view(-1, 1, q.shape[-1]),
+            indices=combined_indices.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=512,
+            attn_sink=attn_sink,
+            topk_length=combined_lens,
+            out=out,
+            output_dtype=torch.bfloat16,
+        )
+    )
+    if flash_output.data_ptr() != out.data_ptr() or flash_output.dtype != out.dtype:
+        out.copy_(flash_output)
+        flash_output = out
+    return flash_output, max_logits, lse
 
 
 def flash_mla_sparse_prefill_v2(
