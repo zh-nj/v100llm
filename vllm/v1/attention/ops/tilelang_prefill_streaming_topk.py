@@ -24,6 +24,10 @@ _FP8_DTYPES = tuple(
     for name in ("float8_e4m3fn", "float8_e4m3fnuz")
     if hasattr(torch, name)
 )
+_CANDIDATE_BUFFER_FACTORY = None
+_CANDIDATE_BUFFER_CACHE: dict[tuple[int, int, int], object] = {}
+_CANDIDATE_GATHER_FACTORY = None
+_CANDIDATE_GATHER_CACHE: dict[tuple[int, int, int], object] = {}
 
 
 def _require_cuda_tensors(*tensors: torch.Tensor) -> None:
@@ -56,6 +60,142 @@ def _can_use_sm70_fp8_tile_logits(
         and q.ndim == 3
         and q.shape[1] <= 8
     )
+
+
+def _build_candidate_buffer_kernel_factory():
+    import tilelang
+    from tilelang import language as T
+
+    @tilelang.jit(
+        target="cuda -arch=sm_70",
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        },
+    )
+    def build_candidate_buffer_kernel(
+        topk: int,
+        tile_keep: int,
+        threads: int = 256,
+    ):
+        rows = T.dynamic("rows")
+        tile_len = T.dynamic("tile_len")
+        candidate_width = topk + tile_keep
+        neg_inf = -3.4028234663852886e38
+
+        @T.prim_func
+        def main(
+            BestScores: T.Tensor((rows, topk), T.float32),
+            BestIndices: T.Tensor((rows, topk), T.int32),
+            TileLogits: T.Tensor((rows, tile_len), T.float32),
+            TileOffsets: T.Tensor((rows, tile_keep), T.int32),
+            RowStarts: T.Tensor((rows,), T.int32),
+            TileLocalStarts: T.Tensor((rows,), T.int32),
+            TileAbsStarts: T.Tensor((rows,), T.int32),
+            CandidateScores: T.Tensor((rows, candidate_width), T.float32),
+            CandidateIndices: T.Tensor((rows, candidate_width), T.int32),
+        ):
+            with T.Kernel(rows, threads=threads) as row:
+                for col in T.Parallel(candidate_width):
+                    if col < topk:
+                        CandidateScores[row, col] = BestScores[row, col]
+                        CandidateIndices[row, col] = BestIndices[row, col]
+                    else:
+                        k = col - topk
+                        offset = TileOffsets[row, k]
+                        valid = offset >= 0
+                        tile_col = TileLocalStarts[row] + offset
+                        safe_tile_col = T.if_then_else(valid, tile_col, 0)
+                        CandidateScores[row, col] = T.if_then_else(
+                            valid,
+                            TileLogits[row, safe_tile_col],
+                            neg_inf,
+                        )
+                        CandidateIndices[row, col] = T.if_then_else(
+                            valid,
+                            TileAbsStarts[row] + offset - RowStarts[row],
+                            -1,
+                        )
+
+        return main
+
+    return build_candidate_buffer_kernel
+
+
+def _build_candidate_gather_kernel_factory():
+    import tilelang
+    from tilelang import language as T
+
+    @tilelang.jit(
+        target="cuda -arch=sm_70",
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        },
+    )
+    def build_candidate_gather_kernel(
+        topk: int,
+        candidate_width: int,
+        threads: int = 256,
+    ):
+        rows = T.dynamic("rows")
+        neg_inf = -3.4028234663852886e38
+
+        @T.prim_func
+        def main(
+            CandidateScores: T.Tensor((rows, candidate_width), T.float32),
+            CandidateIndices: T.Tensor((rows, candidate_width), T.int32),
+            MergePositions: T.Tensor((rows, topk), T.int32),
+            NextScores: T.Tensor((rows, topk), T.float32),
+            NextIndices: T.Tensor((rows, topk), T.int32),
+        ):
+            with T.Kernel(rows, threads=threads) as row:
+                for col in T.Parallel(topk):
+                    pos = MergePositions[row, col]
+                    valid = pos >= 0
+                    safe_pos = T.if_then_else(valid, pos, 0)
+                    NextScores[row, col] = T.if_then_else(
+                        valid,
+                        CandidateScores[row, safe_pos],
+                        neg_inf,
+                    )
+                    NextIndices[row, col] = T.if_then_else(
+                        valid,
+                        CandidateIndices[row, safe_pos],
+                        -1,
+                    )
+
+        return main
+
+    return build_candidate_gather_kernel
+
+
+def _get_candidate_buffer_kernel(topk: int, tile_keep: int, threads: int):
+    global _CANDIDATE_BUFFER_FACTORY
+    if _CANDIDATE_BUFFER_FACTORY is None:
+        _CANDIDATE_BUFFER_FACTORY = _build_candidate_buffer_kernel_factory()
+    key = (topk, tile_keep, threads)
+    if key not in _CANDIDATE_BUFFER_CACHE:
+        _CANDIDATE_BUFFER_CACHE[key] = _CANDIDATE_BUFFER_FACTORY(
+            topk=topk,
+            tile_keep=tile_keep,
+            threads=threads,
+        )
+    return _CANDIDATE_BUFFER_CACHE[key]
+
+
+def _get_candidate_gather_kernel(topk: int, candidate_width: int, threads: int):
+    global _CANDIDATE_GATHER_FACTORY
+    if _CANDIDATE_GATHER_FACTORY is None:
+        _CANDIDATE_GATHER_FACTORY = _build_candidate_gather_kernel_factory()
+    key = (topk, candidate_width, threads)
+    if key not in _CANDIDATE_GATHER_CACHE:
+        _CANDIDATE_GATHER_CACHE[key] = _CANDIDATE_GATHER_FACTORY(
+            topk=topk,
+            candidate_width=candidate_width,
+            threads=threads,
+        )
+    return _CANDIDATE_GATHER_CACHE[key]
 
 
 def _compute_tile_logits(
@@ -161,7 +301,7 @@ def _prefill_streaming_topk_chunked_torch(
     out_indices.copy_(torch.where(valid_out, selected, torch.full_like(selected, -1)))
 
 
-def _select_tile_candidates_tilelang(
+def _select_tile_offsets_tilelang(
     *,
     tile_logits: torch.Tensor,
     row_starts: torch.Tensor,
@@ -200,74 +340,83 @@ def _select_tile_candidates_tilelang(
         topk_tokens=tile_keep,
         threads=threads,
     )
-
-    valid = tile_offsets >= 0
-    tile_cols = torch.where(
-        valid,
-        tile_offsets + tile_row_starts.view(-1, 1),
-        torch.zeros_like(tile_offsets),
-    )
-    tile_scores = tile_logits.gather(1, tile_cols.to(torch.int64))
-    tile_scores = torch.where(
-        valid,
-        tile_scores,
-        torch.full_like(tile_scores, -torch.inf),
-    )
-    tile_indices = tile_start + tile_cols - row_starts.view(-1, 1)
-    tile_indices = torch.where(
-        valid,
-        tile_indices.to(torch.int32),
-        torch.full_like(tile_offsets, -1),
-    )
-    return tile_scores, tile_indices
+    return tile_offsets, tile_row_starts
 
 
-def _merge_topk_candidates_tilelang(
+def _update_best_candidates_tilelang(
     *,
     best_scores: torch.Tensor,
     best_indices: torch.Tensor,
-    tile_scores: torch.Tensor,
-    tile_indices: torch.Tensor,
+    tile_logits: torch.Tensor,
+    tile_offsets: torch.Tensor,
+    row_starts: torch.Tensor,
+    tile_row_starts: torch.Tensor,
+    tile_start: int,
     topk_tokens: int,
     threads: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    merged_scores = torch.cat((best_scores, tile_scores), dim=1).contiguous()
-    merged_indices = torch.cat((best_indices, tile_indices), dim=1).contiguous()
-    rows, merged_width = merged_scores.shape
+    rows = best_scores.shape[0]
+    tile_keep = tile_offsets.shape[1]
+    candidate_width = topk_tokens + tile_keep
+    candidate_scores = torch.empty(
+        (rows, candidate_width),
+        dtype=torch.float32,
+        device=best_scores.device,
+    )
+    candidate_indices = torch.empty(
+        (rows, candidate_width),
+        dtype=torch.int32,
+        device=best_scores.device,
+    )
+    tile_abs_starts = (tile_row_starts + tile_start).to(torch.int32).contiguous()
+    fill_kernel = _get_candidate_buffer_kernel(topk_tokens, tile_keep, threads)
+    fill_kernel(
+        best_scores,
+        best_indices,
+        tile_logits.contiguous(),
+        tile_offsets,
+        row_starts.contiguous(),
+        tile_row_starts,
+        tile_abs_starts,
+        candidate_scores,
+        candidate_indices,
+    )
+
     merge_positions = torch.empty(
         (rows, topk_tokens),
         dtype=torch.int32,
-        device=merged_scores.device,
+        device=best_scores.device,
     )
-    row_starts = torch.zeros((rows,), dtype=torch.int32, device=merged_scores.device)
-    lengths = torch.full(
+    candidate_row_starts = torch.zeros(
         (rows,),
-        merged_width,
         dtype=torch.int32,
-        device=merged_scores.device,
+        device=best_scores.device,
+    )
+    candidate_lengths = torch.full(
+        (rows,),
+        candidate_width,
+        dtype=torch.int32,
+        device=best_scores.device,
     )
     prefill_topk_tilelang(
-        merged_scores,
+        candidate_scores,
         merge_positions,
-        lengths,
-        row_starts,
+        candidate_lengths,
+        candidate_row_starts,
         topk_tokens=topk_tokens,
         threads=threads,
     )
-    valid = merge_positions >= 0
-    safe_positions = torch.where(
-        valid,
+
+    next_scores = torch.empty_like(best_scores)
+    next_indices = torch.empty_like(best_indices)
+    gather_kernel = _get_candidate_gather_kernel(topk_tokens, candidate_width, threads)
+    gather_kernel(
+        candidate_scores,
+        candidate_indices,
         merge_positions,
-        torch.zeros_like(merge_positions),
-    ).to(torch.int64)
-    next_scores = merged_scores.gather(1, safe_positions)
-    next_indices = merged_indices.gather(1, safe_positions)
-    next_scores = torch.where(
-        valid,
         next_scores,
-        torch.full_like(next_scores, -torch.inf),
+        next_indices,
     )
-    next_indices = torch.where(valid, next_indices, torch.full_like(next_indices, -1))
     return next_scores, next_indices
 
 
@@ -286,8 +435,18 @@ def _prefill_streaming_topk_chunked_tilelang(
 ) -> None:
     rows = q.shape[0]
     kv_tokens = k_cache_values.shape[0]
-    best_scores = None
-    best_indices = None
+    best_scores = torch.full(
+        (rows, topk_tokens),
+        -torch.inf,
+        dtype=torch.float32,
+        device=q.device,
+    )
+    best_indices = torch.full(
+        (rows, topk_tokens),
+        -1,
+        dtype=torch.int32,
+        device=q.device,
+    )
 
     for tile_start in range(0, kv_tokens, tile_k):
         tile_end = min(tile_start + tile_k, kv_tokens)
@@ -301,7 +460,7 @@ def _prefill_streaming_topk_chunked_tilelang(
             tile_start=tile_start,
             tile_end=tile_end,
         )
-        tile_scores, tile_indices = _select_tile_candidates_tilelang(
+        tile_offsets, tile_row_starts = _select_tile_offsets_tilelang(
             tile_logits=tile_logits,
             row_starts=row_starts,
             row_ends=row_ends,
@@ -309,50 +468,19 @@ def _prefill_streaming_topk_chunked_tilelang(
             topk_tokens=topk_tokens,
             threads=threads,
         )
-        if best_scores is None or best_indices is None:
-            if tile_scores.shape[1] == topk_tokens:
-                best_scores = tile_scores
-                best_indices = tile_indices
-            else:
-                pad_cols = topk_tokens - tile_scores.shape[1]
-                best_scores = torch.cat(
-                    (
-                        tile_scores,
-                        torch.full(
-                            (rows, pad_cols),
-                            -torch.inf,
-                            dtype=tile_scores.dtype,
-                            device=tile_scores.device,
-                        ),
-                    ),
-                    dim=1,
-                ).contiguous()
-                best_indices = torch.cat(
-                    (
-                        tile_indices,
-                        torch.full(
-                            (rows, pad_cols),
-                            -1,
-                            dtype=tile_indices.dtype,
-                            device=tile_indices.device,
-                        ),
-                    ),
-                    dim=1,
-                ).contiguous()
-            continue
-
-        best_scores, best_indices = _merge_topk_candidates_tilelang(
+        best_scores, best_indices = _update_best_candidates_tilelang(
             best_scores=best_scores,
             best_indices=best_indices,
-            tile_scores=tile_scores,
-            tile_indices=tile_indices,
+            tile_logits=tile_logits,
+            tile_offsets=tile_offsets,
+            row_starts=row_starts,
+            tile_row_starts=tile_row_starts,
+            tile_start=tile_start,
             topk_tokens=topk_tokens,
             threads=threads,
         )
 
     out_indices.fill_(-1)
-    if best_indices is None:
-        return
     valid_counts = torch.clamp(
         row_ends.to(torch.int64) - row_starts.to(torch.int64),
         min=0,

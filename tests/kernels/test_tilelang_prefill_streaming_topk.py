@@ -352,3 +352,72 @@ def test_streaming_topk_tilelang_candidate_loop_matches_full_logits_cuda():
         end = int(row_ends[row].item())
         expected = logits[row, start:end].topk(topk_tokens).indices.to(torch.int32)
         assert set(out_indices[row].tolist()) == set(expected.tolist())
+
+
+@pytest.mark.skipif(
+    not _has_sm70_cuda(),
+    reason="SM70 CUDA is required for TileLang candidate merge",
+)
+@torch.inference_mode()
+def test_streaming_topk_tilelang_candidate_merge_matches_torch_cuda():
+    from vllm.v1.attention.ops.tilelang_prefill_topk import is_tilelang_available
+    from vllm.v1.attention.ops.tilelang_prefill_streaming_topk import (
+        _update_best_candidates_tilelang,
+    )
+
+    ok, reason = is_tilelang_available()
+    if not ok:
+        pytest.skip(reason)
+
+    device = torch.device("cuda")
+    topk_tokens = 4
+    best_scores = torch.tensor(
+        [[10.0, 5.0, -1.0, -3.0], [6.0, 4.0, 2.0, -2.0]],
+        dtype=torch.float32,
+        device=device,
+    )
+    best_indices = torch.tensor(
+        [[0, 1, 2, 3], [10, 11, 12, 13]],
+        dtype=torch.int32,
+        device=device,
+    )
+    tile_logits = torch.tensor(
+        [
+            [9.0, 13.0, 1.0, 7.0, 12.0, -4.0, 3.0, 2.0],
+            [-5.0, 8.0, 3.0, 7.0, 1.0, 9.0, 0.0, 5.0],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    tile_offsets = torch.tensor(
+        [[1, 4, 3, 6], [3, 1, 5, 7]],
+        dtype=torch.int32,
+        device=device,
+    )
+    row_starts = torch.tensor([96, 99], dtype=torch.int32, device=device)
+    tile_row_starts = torch.tensor([0, 0], dtype=torch.int32, device=device)
+    tile_start = 100
+
+    next_scores, next_indices = _update_best_candidates_tilelang(
+        best_scores=best_scores,
+        best_indices=best_indices,
+        tile_logits=tile_logits,
+        tile_offsets=tile_offsets,
+        row_starts=row_starts,
+        tile_row_starts=tile_row_starts,
+        tile_start=tile_start,
+        topk_tokens=topk_tokens,
+        threads=256,
+    )
+
+    tile_cols = tile_offsets + tile_row_starts.view(-1, 1)
+    tile_scores = tile_logits.gather(1, tile_cols.to(torch.int64))
+    tile_indices = tile_start + tile_cols - row_starts.view(-1, 1)
+    merged_scores = torch.cat((best_scores, tile_scores), dim=1)
+    merged_indices = torch.cat((best_indices, tile_indices.to(torch.int32)), dim=1)
+    expected_scores, keep_pos = merged_scores.topk(topk_tokens, dim=1)
+    expected_indices = merged_indices.gather(1, keep_pos)
+
+    for row in range(best_scores.shape[0]):
+        assert set(next_scores[row].tolist()) == set(expected_scores[row].tolist())
+        assert set(next_indices[row].tolist()) == set(expected_indices[row].tolist())
