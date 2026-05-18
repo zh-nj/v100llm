@@ -383,6 +383,20 @@ def is_tilelang_prefill_topk_cached(topk: int, threads: int = 256) -> bool:
     return (topk, threads) in _KERNEL_CACHE
 
 
+def prewarm_prefill_topk_tilelang(topk_tokens: int, threads: int = 256) -> None:
+    """JIT compile the logits-input TileLang prefill top-k kernel.
+
+    Streaming prefill invokes this kernel from the model custom-op path.  On
+    vLLM compiled execution that path runs inside the request hot loop, so the
+    kernel must be compiled before serving traffic rather than lazily during
+    the first long-prefill request.
+    """
+    ok, reason = is_tilelang_available()
+    if not ok:
+        raise RuntimeError(reason)
+    _get_kernel(topk_tokens, threads)
+
+
 def _prefill_topk_legacy(
     logits: torch.Tensor,
     indices: torch.Tensor,

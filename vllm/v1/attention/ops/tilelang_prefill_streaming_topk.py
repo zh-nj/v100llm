@@ -12,9 +12,13 @@ fusion target.
 
 import torch
 
-from vllm.model_executor.layers.sm70_mqa_logits import sm70_fp8_mqa_logits
+from vllm.model_executor.layers.sm70_mqa_logits import (
+    sm70_fp8_mqa_logits,
+    sm70_fp8_mqa_logits_gemm,
+)
 from vllm.v1.attention.ops.tilelang_prefill_topk import (
     is_tilelang_available,
+    prewarm_prefill_topk_tilelang,
     prefill_topk_tilelang,
 )
 
@@ -66,7 +70,6 @@ def _can_use_sm70_fp8_tile_logits(
         and q.dtype in _FP8_DTYPES
         and k_cache_values.dtype in _FP8_DTYPES
         and q.ndim == 3
-        and q.shape[1] <= 8
     )
 
 
@@ -698,7 +701,10 @@ def _compute_tile_logits(
         tile_len = tile_end - tile_start
         tile_row_starts = torch.clamp(row_starts - tile_start, 0, tile_len)
         tile_row_ends = torch.clamp(row_ends - tile_start, 0, tile_len)
-        return sm70_fp8_mqa_logits(
+        logits_kernel = (
+            sm70_fp8_mqa_logits if q.shape[1] <= 8 else sm70_fp8_mqa_logits_gemm
+        )
+        return logits_kernel(
             q,
             (k_tile, scale_tile),
             weights,
@@ -794,7 +800,7 @@ def _select_tile_offsets_tilelang(
     threads: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows, tile_len = tile_logits.shape
-    tile_keep = min(topk_tokens, tile_len)
+    tile_keep = topk_tokens
     tile_row_starts = torch.clamp(
         row_starts - tile_start,
         min=0,
@@ -815,8 +821,15 @@ def _select_tile_offsets_tilelang(
         dtype=torch.int32,
         device=tile_logits.device,
     )
+    tile_logits_for_topk = tile_logits
+    if tile_len < tile_keep:
+        tile_logits_for_topk = tile_logits.new_full(
+            (rows, tile_keep),
+            -torch.inf,
+        )
+        tile_logits_for_topk[:, :tile_len].copy_(tile_logits)
     prefill_topk_tilelang(
-        tile_logits.contiguous(),
+        tile_logits_for_topk.contiguous(),
         tile_offsets,
         tile_lengths,
         tile_row_starts,
@@ -878,6 +891,28 @@ def _copy_final_indices_tilelang(
         row_ends.contiguous(),
         out_indices,
     )
+
+
+def prewarm_prefill_streaming_topk_tilelang(
+    topk_tokens: int,
+    *,
+    tile_k: int = 1024,
+    threads: int = 256,
+) -> None:
+    """JIT compile TileLang kernels used by the streaming top-k path.
+
+    Keeping these compiles out of the request path avoids invoking TileLang's
+    layout lowering from vLLM's compiled custom-op execution frame.
+    """
+    ok, reason = is_tilelang_available()
+    if not ok:
+        raise RuntimeError(reason)
+    if topk_tokens > _MAX_BENCHED_TILELANG_CANDIDATE_TOPK:
+        return
+    tile_keep = min(topk_tokens, tile_k)
+    prewarm_prefill_topk_tilelang(tile_keep, threads)
+    _get_fused_candidate_update_kernel(topk_tokens, tile_keep, threads)
+    _get_final_indices_kernel(topk_tokens, threads)
 
 
 def _prefill_streaming_topk_chunked_tilelang(

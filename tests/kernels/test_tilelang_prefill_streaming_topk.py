@@ -202,6 +202,68 @@ def test_streaming_topk_tile_logits_uses_sm70_fp8_hot_kernel(monkeypatch):
     )
 
 
+def test_streaming_topk_tile_logits_uses_sm70_gemm_for_many_heads(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_prefill_streaming_topk as streaming_topk
+
+    monkeypatch.setattr(
+        streaming_topk,
+        "_can_use_sm70_fp8_tile_logits",
+        lambda q, k_cache_values: True,
+    )
+    calls = []
+
+    def fail_scalar_kernel(*args, **kwargs):
+        raise AssertionError("scalar SM70 logits kernel only supports <=8 heads")
+
+    def fake_gemm_kernel(q, kv, weights, row_starts, row_ends):
+        calls.append(
+            {
+                "q_shape": tuple(q.shape),
+                "k_shape": tuple(kv[0].shape),
+                "row_starts": row_starts.clone(),
+                "row_ends": row_ends.clone(),
+            }
+        )
+        rows = q.shape[0]
+        cols = kv[0].shape[0]
+        return torch.full((rows, cols), 7.0, dtype=torch.float32)
+
+    monkeypatch.setattr(streaming_topk, "sm70_fp8_mqa_logits", fail_scalar_kernel)
+    monkeypatch.setattr(
+        streaming_topk,
+        "sm70_fp8_mqa_logits_gemm",
+        fake_gemm_kernel,
+    )
+
+    q = torch.empty((2, 16, 8), dtype=torch.float16)
+    k_cache_values = torch.empty((64, 8), dtype=torch.float16)
+    k_cache_scales = torch.ones((64,), dtype=torch.float32)
+    weights = torch.ones((2, 16), dtype=torch.float32)
+    row_starts = torch.tensor([4, 17], dtype=torch.int32)
+    row_ends = torch.tensor([40, 64], dtype=torch.int32)
+
+    logits = streaming_topk._compute_tile_logits(
+        q=q,
+        k_cache_values=k_cache_values,
+        k_cache_scales=k_cache_scales,
+        weights=weights,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        tile_start=16,
+        tile_end=48,
+    )
+
+    assert calls[0]["q_shape"] == (2, 16, 8)
+    assert calls[0]["k_shape"] == (32, 8)
+    torch.testing.assert_close(
+        calls[0]["row_starts"], torch.tensor([0, 1], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        calls[0]["row_ends"], torch.tensor([24, 32], dtype=torch.int32)
+    )
+    torch.testing.assert_close(logits, torch.full((2, 32), 7.0))
+
+
 def test_streaming_topk_oracle_uses_tilelang_for_benched_topk(monkeypatch):
     import vllm.v1.attention.ops.tilelang_prefill_streaming_topk as streaming_topk
 
@@ -557,6 +619,114 @@ def test_streaming_topk_candidate_update_uses_single_fused_kernel(monkeypatch):
     assert calls == [("get_fused", 4, 4, 256), ("run_fused", 9)]
     assert torch.all(next_scores == 1.0)
     assert torch.all(next_indices == 2)
+
+
+def test_streaming_topk_tilelang_pads_tail_tile_to_fixed_topk(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_prefill_streaming_topk as streaming_topk
+
+    calls = []
+
+    def fake_prefill_topk_tilelang(
+        logits,
+        indices,
+        lengths,
+        row_starts,
+        *,
+        topk_tokens,
+        threads,
+    ):
+        calls.append(
+            {
+                "logits_shape": tuple(logits.shape),
+                "topk_tokens": topk_tokens,
+                "threads": threads,
+                "lengths": lengths.clone(),
+                "row_starts": row_starts.clone(),
+                "tail_pad": logits[:, 452:].clone(),
+            }
+        )
+        indices.fill_(-1)
+        for row in range(indices.shape[0]):
+            length = int(lengths[row].item())
+            indices[row, :length] = torch.arange(length, dtype=torch.int32)
+
+    monkeypatch.setattr(
+        streaming_topk,
+        "prefill_topk_tilelang",
+        fake_prefill_topk_tilelang,
+    )
+
+    tile_logits = torch.arange(2 * 452, dtype=torch.float32).view(2, 452)
+    row_starts = torch.tensor([9216, 9360], dtype=torch.int32)
+    row_ends = torch.tensor([9668, 9480], dtype=torch.int32)
+
+    tile_offsets, tile_row_starts = streaming_topk._select_tile_offsets_tilelang(
+        tile_logits=tile_logits,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        tile_start=9216,
+        topk_tokens=512,
+        threads=256,
+    )
+
+    assert calls[0]["logits_shape"] == (2, 512)
+    assert calls[0]["topk_tokens"] == 512
+    assert calls[0]["threads"] == 256
+    torch.testing.assert_close(
+        calls[0]["lengths"],
+        torch.tensor([452, 120], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        calls[0]["row_starts"],
+        torch.tensor([0, 144], dtype=torch.int32),
+    )
+    assert torch.isneginf(calls[0]["tail_pad"]).all()
+    assert tile_offsets.shape == (2, 512)
+    torch.testing.assert_close(
+        tile_row_starts,
+        torch.tensor([0, 144], dtype=torch.int32),
+    )
+
+
+def test_streaming_topk_prewarm_compiles_request_path_kernels(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_prefill_streaming_topk as streaming_topk
+
+    calls = []
+
+    monkeypatch.setattr(
+        streaming_topk,
+        "is_tilelang_available",
+        lambda: (True, None),
+    )
+    monkeypatch.setattr(
+        streaming_topk,
+        "prewarm_prefill_topk_tilelang",
+        lambda topk, threads: calls.append(("tile_topk", topk, threads)),
+    )
+    monkeypatch.setattr(
+        streaming_topk,
+        "_get_fused_candidate_update_kernel",
+        lambda topk, tile_keep, threads: calls.append(
+            ("candidate_update", topk, tile_keep, threads)
+        ),
+    )
+    monkeypatch.setattr(
+        streaming_topk,
+        "_get_final_indices_kernel",
+        lambda topk, threads: calls.append(("final_copy", topk, threads)),
+    )
+
+    streaming_topk.prewarm_prefill_streaming_topk_tilelang(
+        512,
+        tile_k=1024,
+        threads=256,
+    )
+
+    assert calls == [
+        ("tile_topk", 512, 256),
+        ("candidate_update", 512, 512, 256),
+        ("final_copy", 512, 256),
+    ]
 
 
 @pytest.mark.skipif(

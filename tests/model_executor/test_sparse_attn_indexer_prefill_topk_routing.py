@@ -393,6 +393,146 @@ def test_try_streaming_topk_prefill_returns_false_when_disabled(monkeypatch):
     assert not handled
 
 
+def test_try_streaming_topk_prefill_debug_compare_falls_back_on_mismatch(
+    monkeypatch,
+):
+    from vllm.model_executor.layers import sparse_attn_indexer
+    from vllm.v1.attention.ops import tilelang_prefill_streaming_topk
+
+    monkeypatch.setattr(
+        sparse_attn_indexer.envs,
+        "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sparse_attn_indexer,
+        "_should_use_streaming_topk_prefill",
+        lambda **kwargs: True,
+    )
+
+    calls = []
+
+    def fake_streaming_topk(**kwargs):
+        calls.append("streaming")
+        kwargs["out_indices"].fill_(0)
+
+    def fake_logits(*args, **kwargs):
+        calls.append("reference_logits")
+        return torch.tensor(
+            [[0.0, 1.0, 2.0, 3.0], [0.0, 1.0, 2.0, 3.0]],
+            dtype=torch.float32,
+        )
+
+    def fake_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk_indices,
+        topk_tokens,
+        **kwargs,
+    ):
+        calls.append("reference_topk")
+        topk_indices.copy_(
+            torch.tensor([[3, 2, 1, 0], [3, 2, 1, 0]], dtype=torch.int32)
+        )
+
+    monkeypatch.setattr(
+        tilelang_prefill_streaming_topk,
+        "prefill_streaming_topk_tilelang",
+        fake_streaming_topk,
+    )
+    monkeypatch.setattr(
+        sparse_attn_indexer,
+        "_fp8_fp4_mqa_logits_with_fallback",
+        fake_logits,
+    )
+    monkeypatch.setattr(
+        sparse_attn_indexer,
+        "_prefill_topk_indices",
+        fake_prefill_topk_indices,
+    )
+
+    q = torch.empty((2, 4, 16), dtype=torch.float16)
+    k_cache_values = torch.empty((4, 16), dtype=torch.float16)
+    k_cache_scales = torch.ones((4,), dtype=torch.float32)
+    weights = torch.ones((2, 4), dtype=torch.float32)
+    row_starts = torch.zeros((2,), dtype=torch.int32)
+    row_ends = torch.full((2,), 4, dtype=torch.int32)
+    out_indices = torch.empty((2, 4), dtype=torch.int32)
+
+    handled = sparse_attn_indexer._try_prefill_streaming_topk_indices(
+        q=q,
+        k_cache_values=k_cache_values,
+        k_cache_scales=k_cache_scales,
+        weights=weights,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        out_indices=out_indices,
+        topk_tokens=4,
+        use_fp4_cache=False,
+        max_row_len=16384,
+    )
+
+    assert handled
+    assert calls == ["streaming", "reference_logits", "reference_topk"]
+    torch.testing.assert_close(
+        out_indices,
+        torch.tensor([[3, 2, 1, 0], [3, 2, 1, 0]], dtype=torch.int32),
+    )
+
+
+def test_sparse_indexer_prewarms_streaming_topk_when_enabled(
+    monkeypatch,
+    default_vllm_config,
+):
+    from vllm.model_executor.layers import sparse_attn_indexer
+    from vllm.v1.attention.ops import tilelang_prefill_streaming_topk
+
+    monkeypatch.setattr(
+        sparse_attn_indexer.envs,
+        "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(sparse_attn_indexer.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        sparse_attn_indexer.current_platform,
+        "is_device_capability_family",
+        lambda capability: capability == 70,
+    )
+    monkeypatch.setattr(sparse_attn_indexer, "has_deep_gemm", lambda: True)
+
+    calls = []
+
+    def fake_prewarm(topk_tokens, *, threads):
+        calls.append((topk_tokens, threads))
+
+    monkeypatch.setattr(
+        tilelang_prefill_streaming_topk,
+        "prewarm_prefill_streaming_topk_tilelang",
+        fake_prewarm,
+    )
+
+    class FakeCache:
+        prefix = "fake"
+        kv_cache = torch.empty(0)
+
+    sparse_attn_indexer.SparseAttnIndexer(
+        FakeCache(),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=512,
+        head_dim=576,
+        max_model_len=16384,
+        max_total_seq_len=16384,
+        topk_indices_buffer=torch.empty((1, 512), dtype=torch.int32),
+        use_fp4_cache=False,
+    )
+
+    assert calls == [(512, sparse_attn_indexer.TILELANG_TOPK_THREADS)]
+
+
 def test_prefill_topk_routes_to_large_context_topk(monkeypatch):
     from vllm.model_executor.layers import sparse_attn_indexer
 

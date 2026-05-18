@@ -463,7 +463,73 @@ def _try_prefill_streaming_topk_indices(
         out_indices=out_indices,
         topk_tokens=topk_tokens,
     )
+    if envs.VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE:
+        reference_logits = _fp8_fp4_mqa_logits_with_fallback(
+            (q, None),
+            (k_cache_values, k_cache_scales),
+            weights,
+            row_starts,
+            row_ends,
+            clean_logits=False,
+            use_fp4_cache=False,
+        )
+        reference_indices = torch.empty_like(out_indices)
+        _prefill_topk_indices(
+            reference_logits,
+            row_starts,
+            row_ends,
+            reference_indices,
+            topk_tokens,
+            max_row_len=max_row_len,
+            all_row_starts_zero=bool(torch.count_nonzero(row_starts).item() == 0),
+        )
+        if not _streaming_topk_indices_match_scores(
+            reference_logits,
+            row_starts,
+            row_ends,
+            out_indices,
+            reference_indices,
+        ):
+            logger.warning(
+                "Streaming prefill top-k debug compare failed; "
+                "using logits-input top-k output for this chunk."
+            )
+            out_indices.copy_(reference_indices)
     return True
+
+
+def _streaming_topk_indices_match_scores(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    streaming_indices: torch.Tensor,
+    reference_indices: torch.Tensor,
+) -> bool:
+    def selected_scores(indices: torch.Tensor) -> torch.Tensor:
+        max_col = logits.shape[1] - 1
+        local = indices.to(torch.int64)
+        abs_cols = row_starts.to(torch.int64).view(-1, 1) + local.clamp_min(0)
+        abs_cols = abs_cols.clamp(0, max_col)
+        scores = logits.gather(1, abs_cols)
+        valid = (local >= 0) & (
+            local < (row_ends - row_starts).to(torch.int64).view(-1, 1)
+        )
+        return torch.where(valid, scores, torch.full_like(scores, -torch.inf))
+
+    streaming_scores = selected_scores(streaming_indices)
+    reference_scores = selected_scores(reference_indices)
+    streaming_sorted = streaming_scores.sort(dim=1).values
+    reference_sorted = reference_scores.sort(dim=1).values
+    if torch.allclose(streaming_sorted, reference_sorted, atol=2e-2, rtol=2e-2):
+        return True
+    finite = torch.isfinite(streaming_sorted) & torch.isfinite(reference_sorted)
+    if finite.any():
+        max_gap = (streaming_sorted[finite] - reference_sorted[finite]).abs().max()
+        logger.warning(
+            "Streaming prefill top-k debug compare max score gap: %.6f",
+            float(max_gap.item()),
+        )
+    return False
 
 
 def _prefill_topk_indices(
@@ -962,6 +1028,20 @@ class SparseAttnIndexer(CustomOp):
                 "Sparse Attention Indexer logits (prefill + decode). This "
                 "path handles FP8 E4M3 via manual bit-decode and is "
                 "correctness-safe on Volta."
+            )
+        if (
+            envs.VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(70)
+            and not use_fp4_cache
+        ):
+            from vllm.v1.attention.ops.tilelang_prefill_streaming_topk import (
+                prewarm_prefill_streaming_topk_tilelang,
+            )
+
+            prewarm_prefill_streaming_topk_tilelang(
+                topk_tokens,
+                threads=TILELANG_TOPK_THREADS,
             )
 
     def forward_native(
