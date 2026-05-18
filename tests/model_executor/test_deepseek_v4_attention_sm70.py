@@ -1067,6 +1067,147 @@ def test_sparse_prefill_v2_requires_supported_shape(monkeypatch):
     )
 
 
+def _make_sparse_prefill_v2_attn():
+    attn = object.__new__(DeepseekV4MLAAttention)
+    attn.compress_ratio = 4
+    attn.scale = 1.0
+    attn.attn_sink = torch.zeros(64, dtype=torch.float32)
+    attn.window_size = 2
+    attn.max_num_batched_tokens = 2
+    attn.max_model_len = 16
+    attn.head_dim = 512
+    attn.padded_heads = 64
+    attn.topk_indices_buffer = torch.zeros(2, 2, dtype=torch.int32)
+    attn._prefill_graph_dispatcher = None
+    attn.prefix = "layers.0.attn"
+    return attn
+
+
+def _make_sparse_prefill_v2_metadata():
+    swa_metadata = SimpleNamespace(
+        num_prefills=1,
+        num_prefill_tokens=2,
+        num_decodes=0,
+        num_decode_tokens=0,
+        prefill_seq_lens=torch.tensor([8], dtype=torch.int32),
+        prefill_gather_lens=torch.tensor([4], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        block_table=torch.zeros(1, 2, dtype=torch.int32),
+        block_size=4,
+    )
+    attn_metadata = SimpleNamespace(
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        block_size=16,
+    )
+    return attn_metadata, swa_metadata
+
+
+def test_forward_prefill_v2_skips_full_gather_workspace(monkeypatch):
+    monkeypatch.setattr(d4a.envs, "VLLM_SM70_USE_SPARSE_PREFILL_V2", True)
+    monkeypatch.setattr(
+        d4a.envs, "VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE", False
+    )
+    attn = _make_sparse_prefill_v2_attn()
+    attn_metadata, swa_metadata = _make_sparse_prefill_v2_metadata()
+    q = torch.randn(2, 64, 512, dtype=torch.float16)
+    output = torch.empty_like(q)
+    calls = []
+
+    class FailWorkspaceManager:
+        def get_simultaneous(self, _spec):
+            raise AssertionError("v2 should skip full gathered kv workspace")
+
+    def fail_gather(*_args, **_kwargs):
+        raise AssertionError("v2 should skip v1 gather")
+
+    def fake_v2(**kwargs):
+        calls.append(kwargs)
+        kwargs["out"].fill_(5)
+        return kwargs["out"], None, None
+
+    import vllm.v1.attention.ops.tilelang_sparse_prefill_v2 as v2
+
+    monkeypatch.setattr(
+        d4a, "current_workspace_manager", lambda: FailWorkspaceManager()
+    )
+    monkeypatch.setattr(d4a, "dequantize_and_gather_k_cache", fail_gather)
+    monkeypatch.setattr(v2, "flash_mla_sparse_prefill_v2", fake_v2)
+
+    attn._forward_prefill(
+        q=q,
+        positions=torch.arange(2, dtype=torch.int64),
+        compressed_k_cache=torch.zeros(1, 4, 584, dtype=torch.uint8),
+        swa_k_cache=torch.zeros(2, 4, 584, dtype=torch.uint8),
+        output=output,
+        attn_metadata=attn_metadata,
+        swa_metadata=swa_metadata,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["q"].shape == (2, 64, 512)
+    torch.testing.assert_close(output, torch.full_like(output, 5))
+
+
+def test_forward_prefill_v2_debug_compare_falls_back_to_v1(monkeypatch):
+    monkeypatch.setattr(d4a.envs, "VLLM_SM70_USE_SPARSE_PREFILL_V2", True)
+    monkeypatch.setattr(
+        d4a.envs, "VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE", True
+    )
+    attn = _make_sparse_prefill_v2_attn()
+    attn_metadata, swa_metadata = _make_sparse_prefill_v2_metadata()
+    q = torch.randn(2, 64, 512, dtype=torch.float16)
+    output = torch.empty_like(q)
+    calls = []
+
+    def fake_v2(**kwargs):
+        calls.append("v2")
+        kwargs["out"].fill_(5)
+        return kwargs["out"], None, None
+
+    def fake_gather(out, *_args, **_kwargs):
+        calls.append("gather")
+        out.fill_(1)
+
+    def fake_combine(*_args):
+        calls.append("combine")
+        return (
+            torch.zeros(2, 128, dtype=torch.int32),
+            torch.full((2,), 4, dtype=torch.int32),
+        )
+
+    def fake_flash_mla_sparse_fwd(**kwargs):
+        calls.append("v1")
+        kwargs["out"].fill_(7)
+        return kwargs["out"], None, None
+
+    import vllm.v1.attention.ops.tilelang_sparse_prefill_v2 as v2
+
+    monkeypatch.setattr(v2, "flash_mla_sparse_prefill_v2", fake_v2)
+    monkeypatch.setattr(d4a, "dequantize_and_gather_k_cache", fake_gather)
+    monkeypatch.setattr(d4a, "combine_topk_swa_indices", fake_combine)
+    monkeypatch.setattr(d4a, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
+    monkeypatch.setattr(
+        d4a, "_should_use_tilelang_sparse_prefill_fast_io", lambda **_kwargs: False
+    )
+
+    attn._forward_prefill(
+        q=q,
+        positions=torch.arange(2, dtype=torch.int64),
+        compressed_k_cache=torch.zeros(1, 4, 584, dtype=torch.uint8),
+        swa_k_cache=torch.zeros(2, 4, 584, dtype=torch.uint8),
+        output=output,
+        attn_metadata=attn_metadata,
+        swa_metadata=swa_metadata,
+    )
+
+    assert calls.count("v2") == 1
+    assert calls.count("v1") == 1
+    assert calls.count("gather") == 2
+    assert "combine" in calls
+    torch.testing.assert_close(output, torch.full_like(output, 7))
+
+
 def test_prefill_graph_dispatcher_cache_reuses_shape_and_device(monkeypatch):
     d4a._PREFILL_GRAPH_DISPATCHER_CACHE.clear()
     created = []
