@@ -22,6 +22,8 @@ _TOKEN_BF16_DIM = 64
 _TOKEN_SCALE_DIM = 8
 _TOKEN_DATA_SIZE = _TOKEN_FP8_DIM + _TOKEN_BF16_DIM * 2
 _QUANT_BLOCK_SIZE = 64
+_FUSED_KERNEL_CACHE: dict[tuple, object] = {}
+_FUSED_KERNEL_FACTORY = None
 
 
 @dataclass(frozen=True)
@@ -735,6 +737,451 @@ def _selected_kv_chunk_tokens(
     bytes_per_token = max(1, total_topk * dim * element_size)
     max_bytes = max_chunk_mb * 1024 * 1024
     return max(1, min(num_tokens, max_bytes // bytes_per_token))
+
+
+def _build_fused_kernel_factory():
+    import tilelang
+    from tilelang import language as T
+
+    @tilelang.jit(
+        out_idx=[-3, -2, -1],
+        target="cuda -arch=sm_70",
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        },
+    )
+    def build_fused_sparse_prefill_kernel(
+        heads: int,
+        dim: int,
+        top_k: int,
+        window_size: int,
+        compress_ratio: int,
+        compressed_block_size: int,
+        swa_block_size: int,
+        sm_scale: float,
+        block_I: int = 16,
+        num_stages: int = 1,
+        threads: int = 128,
+        has_sink: bool = True,
+        output_dtype_str: str = "float16",
+    ):
+        assert dim == 512
+        assert heads == 64
+        total_topk = ((top_k + window_size + block_I - 1) // block_I) * block_I
+        assert total_topk % block_I == 0
+
+        LOG2E = 1.4426950408889634
+        sm_scale_log2 = sm_scale * LOG2E
+
+        seq_len = T.dynamic("seq_len")
+        num_c_blocks = T.dynamic("num_c_blocks")
+        c_block_bytes = T.dynamic("c_block_bytes")
+        num_swa_blocks = T.dynamic("num_swa_blocks")
+        swa_block_bytes = T.dynamic("swa_block_bytes")
+        max_c_blocks = T.dynamic("max_c_blocks")
+        max_swa_blocks = T.dynamic("max_swa_blocks")
+
+        q_shape = [seq_len, heads, dim]
+        cache_c_shape = [num_c_blocks, c_block_bytes]
+        cache_swa_shape = [num_swa_blocks, swa_block_bytes]
+        c_table_shape = [max_c_blocks]
+        swa_table_shape = [max_swa_blocks]
+        topk_shape = [seq_len, top_k]
+        scalar_shape = [1]
+        sink_shape = [heads]
+        output_shape = [seq_len, heads, dim]
+        stats_shape = [seq_len, heads]
+        dtype = T.float16
+        out_dtype = T.bfloat16 if output_dtype_str == "bfloat16" else T.float16
+        accum_dtype = T.float32
+        _shape_refs = (
+            q_shape, cache_c_shape, cache_swa_shape, c_table_shape,
+            swa_table_shape, topk_shape, scalar_shape, sink_shape,
+            output_shape, stats_shape,
+        )
+
+        H = heads
+        D = dim
+        BI = block_I
+        NI = tilelang.cdiv(total_topk, block_I)
+
+        @T.prim_func
+        def main(
+            Q: T.Tensor(q_shape, dtype),
+            CompressedCache: T.Tensor(cache_c_shape, T.uint8),
+            SwaCache: T.Tensor(cache_swa_shape, T.uint8),
+            CompressedBlockTable: T.Tensor(c_table_shape, T.int32),
+            SwaBlockTable: T.Tensor(swa_table_shape, T.int32),
+            TopkIndices: T.Tensor(topk_shape, T.int32),
+            SeqLens: T.Tensor(scalar_shape, T.int32),
+            GatherLens: T.Tensor(scalar_shape, T.int32),
+            Sink: T.Tensor(sink_shape, accum_dtype),
+            Output: T.Tensor(output_shape, out_dtype),
+            MaxLogits: T.Tensor(stats_shape, accum_dtype),
+            Lse: T.Tensor(stats_shape, accum_dtype),
+        ):
+            with T.Kernel(seq_len, threads=threads) as bx:
+                Q_shared = T.alloc_shared([H, D], dtype)
+                KV_shared = T.alloc_shared([BI, D], dtype)
+                mask = T.alloc_fragment([BI], "bool")
+
+                acc_o = T.alloc_fragment([H, D], accum_dtype)
+                acc_s = T.alloc_fragment([H, BI], accum_dtype)
+                S_shared = T.alloc_shared([H, BI], dtype)
+                sumexp = T.alloc_fragment([H], accum_dtype)
+                sumexp_i = T.alloc_fragment([H], accum_dtype)
+                alpha = T.alloc_fragment([H], accum_dtype)
+                m_i = T.alloc_fragment([H], accum_dtype)
+                m_i_prev = T.alloc_fragment([H], accum_dtype)
+
+                T.fill(acc_o, 0)
+                T.fill(sumexp, 0)
+                T.fill(m_i, -(2 ** 30))
+
+                s_i = bx
+                seq_len_abs = SeqLens[0]
+                token_pos = seq_len_abs - seq_len + s_i
+                topk_len = T.min((token_pos + 1) // compress_ratio, top_k)
+                swa_len = T.min(token_pos + 1, window_size)
+                combined_len = topk_len + swa_len
+                compressed_seq_len = seq_len_abs // compress_ratio
+
+                T.copy(Q[s_i, 0:H, 0:D], Q_shared)
+
+                for i_i in T.Pipelined(NI, num_stages=num_stages):
+                    for bi_i in T.Parallel(BI):
+                        pos = i_i * BI + bi_i
+                        is_compressed = pos < topk_len
+                        topk_pos = T.min(pos, top_k - 1)
+                        compressed_idx_raw = TopkIndices[s_i, topk_pos]
+                        compressed_valid = (
+                            is_compressed
+                            & (compressed_idx_raw >= 0)
+                            & (compressed_idx_raw < compressed_seq_len)
+                        )
+                        compressed_idx = T.if_then_else(
+                            compressed_valid, compressed_idx_raw, 0)
+                        c_block_in_seq = compressed_idx // compressed_block_size
+                        c_pos_in_block = compressed_idx % compressed_block_size
+                        c_phys = CompressedBlockTable[c_block_in_seq]
+
+                        swa_offset = pos - topk_len
+                        swa_valid = (
+                            (pos >= topk_len)
+                            & (swa_offset < swa_len)
+                            & (pos < combined_len)
+                        )
+                        swa_logical = T.if_then_else(
+                            swa_valid,
+                            token_pos - swa_len + 1 + swa_offset,
+                            0,
+                        )
+                        swa_block_in_seq = swa_logical // swa_block_size
+                        swa_pos_in_block = swa_logical % swa_block_size
+                        swa_phys = SwaBlockTable[swa_block_in_seq]
+
+                        mask[bi_i] = compressed_valid | swa_valid
+
+                    for bi_i, d_i in T.Parallel(BI, D):
+                        pos = i_i * BI + bi_i
+                        is_compressed = pos < topk_len
+                        topk_pos = T.min(pos, top_k - 1)
+                        compressed_idx_raw = TopkIndices[s_i, topk_pos]
+                        compressed_valid = (
+                            is_compressed
+                            & (compressed_idx_raw >= 0)
+                            & (compressed_idx_raw < compressed_seq_len)
+                        )
+                        compressed_idx = T.if_then_else(
+                            compressed_valid, compressed_idx_raw, 0)
+                        c_block_in_seq = compressed_idx // compressed_block_size
+                        c_pos_in_block = compressed_idx % compressed_block_size
+                        c_phys = CompressedBlockTable[c_block_in_seq]
+
+                        swa_offset = pos - topk_len
+                        swa_valid = (
+                            (pos >= topk_len)
+                            & (swa_offset < swa_len)
+                            & (pos < combined_len)
+                        )
+                        swa_logical = T.if_then_else(
+                            swa_valid,
+                            token_pos - swa_len + 1 + swa_offset,
+                            0,
+                        )
+                        swa_block_in_seq = swa_logical // swa_block_size
+                        swa_pos_in_block = swa_logical % swa_block_size
+                        swa_phys = SwaBlockTable[swa_block_in_seq]
+
+                        c_token_data_offset = c_pos_in_block * _TOKEN_DATA_SIZE
+                        swa_token_data_offset = (
+                            swa_pos_in_block * _TOKEN_DATA_SIZE)
+                        token_scale_offset_c = (
+                            compressed_block_size * _TOKEN_DATA_SIZE
+                            + c_pos_in_block * _TOKEN_SCALE_DIM
+                        )
+                        token_scale_offset_swa = (
+                            swa_block_size * _TOKEN_DATA_SIZE
+                            + swa_pos_in_block * _TOKEN_SCALE_DIM
+                        )
+
+                        x_uint8_c = CompressedCache[
+                            c_phys, c_token_data_offset + d_i
+                        ]
+                        x_uint8_swa = SwaCache[
+                            swa_phys, swa_token_data_offset + d_i
+                        ]
+                        x_uint8 = T.if_then_else(
+                            compressed_valid, x_uint8_c, x_uint8_swa)
+                        val32 = T.Cast(T.int32, x_uint8)
+                        sign_bit = (val32 & 0x80) << 24
+                        low7 = val32 & 0x7F
+                        fp32_bits = sign_bit | ((low7 + (120 << 3)) << 20)
+                        fp32_bits = T.if_then_else(low7 == 0, 0, fp32_bits)
+                        normal_val = T.reinterpret(fp32_bits, "float32")
+                        is_subnorm = (low7 < 8) & (low7 != 0)
+                        subnorm_val = T.Cast(T.float32, low7) * 1.953125e-3
+                        sign_mask = (val32 >> 7) & 1
+                        subnorm_val = T.if_then_else(
+                            sign_mask == 1, -subnorm_val, subnorm_val)
+                        x_float = T.if_then_else(
+                            is_subnorm, subnorm_val, normal_val)
+                        scale_idx = d_i // _QUANT_BLOCK_SIZE
+                        scale_c = CompressedCache[
+                            c_phys, token_scale_offset_c + scale_idx
+                        ]
+                        scale_swa = SwaCache[
+                            swa_phys, token_scale_offset_swa + scale_idx
+                        ]
+                        scale_byte = T.if_then_else(
+                            compressed_valid, scale_c, scale_swa)
+                        dequant = (
+                            x_float
+                            * T.exp2(T.Cast(T.float32, scale_byte) - 127.0)
+                        )
+
+                        rope_i = T.if_then_else(
+                            d_i >= _TOKEN_FP8_DIM, d_i - _TOKEN_FP8_DIM, 0)
+                        byte_offset = (
+                            c_token_data_offset
+                            + _TOKEN_FP8_DIM
+                            + rope_i * 2
+                        )
+                        lo_c = T.Cast(T.int32, CompressedCache[
+                            c_phys, byte_offset])
+                        hi_c = T.Cast(T.int32, CompressedCache[
+                            c_phys, byte_offset + 1])
+                        swa_byte_offset = (
+                            swa_token_data_offset
+                            + _TOKEN_FP8_DIM
+                            + rope_i * 2
+                        )
+                        lo_swa = T.Cast(T.int32, SwaCache[
+                            swa_phys, swa_byte_offset])
+                        hi_swa = T.Cast(T.int32, SwaCache[
+                            swa_phys, swa_byte_offset + 1])
+                        lo = T.if_then_else(compressed_valid, lo_c, lo_swa)
+                        hi = T.if_then_else(compressed_valid, hi_c, hi_swa)
+                        bf16_u16 = lo | (hi << 8)
+                        rope_val = T.reinterpret(bf16_u16 << 16, "float32")
+                        val = T.if_then_else(
+                            d_i < _TOKEN_FP8_DIM, dequant, rope_val)
+                        KV_shared[bi_i, d_i] = T.if_then_else(
+                            mask[bi_i], T.Cast(dtype, val), T.Cast(dtype, 0.0))
+
+                    for h_i, bi_i in T.Parallel(H, BI):
+                        acc_s[h_i, bi_i] = T.if_then_else(
+                            mask[bi_i], 0, -T.infinity(acc_s.dtype))
+                    T.gemm(
+                        Q_shared, KV_shared, acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullRow,
+                    )
+                    T.copy(m_i, m_i_prev)
+                    T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                    for h_i in T.Parallel(H):
+                        m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
+                    for h_i in T.Parallel(H):
+                        alpha[h_i] = T.exp2(
+                            (m_i_prev[h_i] - m_i[h_i]) * sm_scale_log2)
+                    for h_i, bi_i in T.Parallel(H, BI):
+                        acc_s[h_i, bi_i] = T.exp2(
+                            acc_s[h_i, bi_i] * sm_scale_log2
+                            - m_i[h_i] * sm_scale_log2)
+                    T.reduce_sum(acc_s, sumexp_i, dim=1)
+                    for h_i in T.Parallel(H):
+                        sumexp[h_i] = (
+                            sumexp[h_i] * alpha[h_i] + sumexp_i[h_i])
+                    for h_i, d_i in T.Parallel(H, D):
+                        acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
+
+                    T.copy(acc_s, S_shared)
+                    T.gemm(
+                        S_shared, KV_shared, acc_o,
+                        policy=T.GemmWarpPolicy.FullRow,
+                    )
+
+                for h_i in T.Parallel(H):
+                    MaxLogits[s_i, h_i] = m_i[h_i] * sm_scale
+                for h_i in T.Parallel(H):
+                    Lse[s_i, h_i] = (
+                        T.log2(sumexp[h_i]) / LOG2E
+                        + m_i[h_i] * sm_scale
+                    )
+                if has_sink:
+                    for h_i in T.Parallel(H):
+                        extra = T.exp2(
+                            (Sink[h_i] - m_i[h_i] * sm_scale) * LOG2E)
+                        sumexp[h_i] = sumexp[h_i] + extra
+                for h_i, d_i in T.Parallel(H, D):
+                    acc_o[h_i, d_i] = acc_o[h_i, d_i] / sumexp[h_i]
+                if output_dtype_str == "bfloat16":
+                    for h_i, d_i in T.Parallel(H, D):
+                        Output[s_i, h_i, d_i] = T.Cast(
+                            out_dtype, acc_o[h_i, d_i])
+                else:
+                    T.copy(acc_o, Output[s_i, 0:H, 0:D])
+
+        return main
+
+    return build_fused_sparse_prefill_kernel
+
+
+def _get_fused_kernel(
+    *,
+    heads: int,
+    dim: int,
+    top_k: int,
+    window_size: int,
+    compress_ratio: int,
+    compressed_block_size: int,
+    swa_block_size: int,
+    sm_scale: float,
+    block_I: int,
+    num_stages: int,
+    threads: int,
+    has_sink: bool,
+    output_dtype_str: str,
+):
+    global _FUSED_KERNEL_FACTORY
+    if _FUSED_KERNEL_FACTORY is None:
+        _FUSED_KERNEL_FACTORY = _build_fused_kernel_factory()
+    key = (
+        heads,
+        dim,
+        top_k,
+        window_size,
+        compress_ratio,
+        compressed_block_size,
+        swa_block_size,
+        sm_scale,
+        block_I,
+        num_stages,
+        threads,
+        has_sink,
+        output_dtype_str,
+    )
+    if key not in _FUSED_KERNEL_CACHE:
+        _FUSED_KERNEL_CACHE[key] = _FUSED_KERNEL_FACTORY(
+            heads=heads,
+            dim=dim,
+            top_k=top_k,
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+            compressed_block_size=compressed_block_size,
+            swa_block_size=swa_block_size,
+            sm_scale=sm_scale,
+            block_I=block_I,
+            num_stages=num_stages,
+            threads=threads,
+            has_sink=has_sink,
+            output_dtype_str=output_dtype_str,
+        )
+    return _FUSED_KERNEL_CACHE[key]
+
+
+def _flash_mla_sparse_prefill_v2_fused_tilelang(
+    *,
+    q: torch.Tensor,
+    compressed_k_cache: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    compressed_block_table: torch.Tensor,
+    swa_block_table: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    top_k: int,
+    sm_scale: float,
+    attn_sink: torch.Tensor | None,
+    out: torch.Tensor,
+    block_I: int = 16,
+    num_stages: int = 1,
+    threads: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Experimental monolithic fused direct-cache sparse prefill kernel.
+
+    This is intentionally not routed from production.  It keeps the desired
+    public shape for the real fused kernel, but the current TileLang lowering
+    path is too slow/unstable when row mapping, fp8 dequant, QK, softmax, and PV
+    all live in one SM70 kernel.  Keep it behind the explicit kernel test while
+    the implementation is split into smaller stages or replaced by CUDA.
+    """
+    del query_start_loc, gather_lens
+    if q.ndim != 3 or tuple(q.shape[1:]) != (64, 512):
+        raise ValueError("fused v2 supports q [tokens, 64, 512]")
+    if q.dtype is not torch.float16 or out.dtype is not torch.float16:
+        raise ValueError("fused v2 starts with fp16 q/out only")
+    if out.shape != q.shape:
+        raise ValueError("out must match q shape for fused v2")
+    if seq_lens.numel() != 1:
+        raise NotImplementedError("fused v2 currently supports one request")
+    if topk_indices.shape != (q.shape[0], top_k):
+        raise ValueError("topk_indices must have shape [tokens, top_k]")
+
+    compressed_cache_2d = compressed_k_cache.reshape(
+        compressed_k_cache.shape[0], -1).contiguous()
+    swa_cache_2d = swa_k_cache.reshape(swa_k_cache.shape[0], -1).contiguous()
+    compressed_table = compressed_block_table.reshape(-1).to(
+        torch.int32).contiguous()
+    swa_table = swa_block_table.reshape(-1).to(torch.int32).contiguous()
+    sink = (
+        attn_sink.to(torch.float32).contiguous()
+        if attn_sink is not None
+        else torch.zeros(q.shape[1], dtype=torch.float32, device=q.device)
+    )
+
+    kernel = _get_fused_kernel(
+        heads=q.shape[1],
+        dim=q.shape[-1],
+        top_k=top_k,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+        compressed_block_size=compressed_k_cache.shape[1],
+        swa_block_size=swa_k_cache.shape[1],
+        sm_scale=sm_scale,
+        block_I=block_I,
+        num_stages=num_stages,
+        threads=threads,
+        has_sink=attn_sink is not None,
+        output_dtype_str="float16",
+    )
+    output, max_logits, lse = kernel(
+        q.contiguous(),
+        compressed_cache_2d,
+        swa_cache_2d,
+        compressed_table,
+        swa_table,
+        topk_indices.to(torch.int32).contiguous(),
+        seq_lens.to(torch.int32).contiguous(),
+        torch.empty(1, dtype=torch.int32, device=q.device),
+        sink,
+    )
+    out.copy_(output)
+    return out, max_logits, lse
 
 
 def _flash_mla_sparse_prefill_v2_direct_cache(
