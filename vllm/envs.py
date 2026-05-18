@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TILELANG_SPARSE_PREFILL_BI: int = 16
     VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS: int = 128
     VLLM_SM70_TILELANG_SPARSE_PREFILL_OUTPUT_CHUNK_MB: int = 64
+    VLLM_SM70_HC_HEAD_CHUNK_MB: int = 128
     VLLM_SM70_USE_SPARSE_PREFILL_V2: bool = False
     VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS: bool = False
     VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE: bool = False
@@ -1023,6 +1024,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TileLang path while avoiding long-context OOM spikes.
     "VLLM_SM70_TILELANG_SPARSE_PREFILL_OUTPUT_CHUNK_MB": lambda: int(
         os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_OUTPUT_CHUNK_MB", "64")
+    ),
+    # Cap the fp32 activation temporary in DSv4 hc_head. For the production
+    # SM70 shape, 128 MiB means 2048-row chunks instead of one 4096-row
+    # [tokens, 16384] fp32 buffer.
+    "VLLM_SM70_HC_HEAD_CHUNK_MB": lambda: int(
+        os.getenv("VLLM_SM70_HC_HEAD_CHUNK_MB", "128")
     ),
     # Experimental SM70 sparse prefill v2: direct paged fp8_ds_mla cache
     # loads in the sparse attention kernel. Default off until correctness and

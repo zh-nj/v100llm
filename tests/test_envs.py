@@ -113,6 +113,7 @@ def test_deepseek_v4_sm70_experimental_envs_are_registered() -> None:
         "VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE",
         "VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS",
         "VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT",
+        "VLLM_SM70_HC_HEAD_CHUNK_MB",
         "VLLM_SM70_USE_SPARSE_PREFILL_V2",
         "VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS",
         "VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE",
@@ -137,6 +138,18 @@ def test_deepseek_v4_sparse_prefill_v2_envs_default_off(
         environment_variables["VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE"]()
         is False
     )
+
+
+def test_deepseek_v4_hc_head_chunk_mb_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_SM70_HC_HEAD_CHUNK_MB", raising=False)
+
+    assert environment_variables["VLLM_SM70_HC_HEAD_CHUNK_MB"]() == 128
+
+    monkeypatch.setenv("VLLM_SM70_HC_HEAD_CHUNK_MB", "64")
+
+    assert environment_variables["VLLM_SM70_HC_HEAD_CHUNK_MB"]() == 64
 
 
 def test_deepseek_v4_prefill_chunk_size_env(

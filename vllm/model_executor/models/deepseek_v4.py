@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -75,6 +76,13 @@ from .utils import (
 
 logger = init_logger(__name__)
 _SM70_FP16_HC_OUTPUT_MAX = float(torch.finfo(torch.float16).max)
+try:
+    _SM70_HC_HEAD_CHUNKED_AVAILABLE = (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(70)
+    )
+except Exception:
+    _SM70_HC_HEAD_CHUNKED_AVAILABLE = False
 
 
 def _compile_boundary_output_dtype_from_experts(
@@ -1582,8 +1590,14 @@ class DeepseekV4Model(nn.Module):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
 
-@torch.compile(backend=current_platform.simple_compile_backend)
-def hc_head(
+def _hc_head_rows_per_chunk(hidden_columns: int) -> int:
+    chunk_mb = envs.VLLM_SM70_HC_HEAD_CHUNK_MB
+    max_bytes = max(chunk_mb, 1) * 1024 * 1024
+    bytes_per_row = max(hidden_columns, 1) * torch.float32.itemsize
+    return max(1, max_bytes // bytes_per_row)
+
+
+def _hc_head_eager_impl(
     hidden_states: torch.Tensor,
     hc_fn: torch.Tensor,
     hc_scale: torch.Tensor,
@@ -1599,6 +1613,137 @@ def hc_head(
     pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
     y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
     return y.to(dtype)
+
+
+@torch.compile(backend=current_platform.simple_compile_backend)
+def _hc_head_compiled_impl(
+    hidden_states: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_norm_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    return _hc_head_eager_impl(
+        hidden_states,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        rms_norm_eps,
+        hc_eps,
+    )
+
+
+def _hc_head_chunked_impl(
+    hidden_states: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_norm_eps: float,
+    hc_eps: float,
+    *,
+    chunk_rows: int | None = None,
+    chunk_kernel: Callable[..., torch.Tensor] | None = None,
+) -> torch.Tensor:
+    if chunk_kernel is None:
+        chunk_kernel = _hc_head_compiled_impl
+    if chunk_rows is None:
+        hidden_columns = int(hidden_states.shape[-2] * hidden_states.shape[-1])
+        chunk_rows = _hc_head_rows_per_chunk(hidden_columns)
+    chunk_rows = max(int(chunk_rows), 1)
+
+    num_tokens = int(hidden_states.shape[0])
+    if num_tokens <= chunk_rows:
+        return chunk_kernel(
+            hidden_states,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            rms_norm_eps,
+            hc_eps,
+        )
+
+    output = hidden_states.new_empty((num_tokens, hidden_states.shape[-1]))
+    for row_start in range(0, num_tokens, chunk_rows):
+        row_end = min(row_start + chunk_rows, num_tokens)
+        output[row_start:row_end].copy_(
+            chunk_kernel(
+                hidden_states[row_start:row_end],
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_norm_eps,
+                hc_eps,
+            )
+        )
+    return output
+
+
+def _deepseek_v4_hc_head_chunked_op(
+    hidden_states: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_norm_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    return _hc_head_chunked_impl(
+        hidden_states,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        rms_norm_eps,
+        hc_eps,
+    )
+
+
+def _deepseek_v4_hc_head_chunked_fake(
+    hidden_states: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_norm_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    del hc_fn, hc_scale, hc_base, rms_norm_eps, hc_eps
+    return hidden_states.new_empty(
+        (*hidden_states.shape[:-2], hidden_states.shape[-1])
+    )
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_hc_head_chunked",
+    op_func=_deepseek_v4_hc_head_chunked_op,
+    mutates_args=[],
+    fake_impl=_deepseek_v4_hc_head_chunked_fake,
+)
+
+
+def hc_head(
+    hidden_states: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_norm_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    if hidden_states.is_cuda and _SM70_HC_HEAD_CHUNKED_AVAILABLE:
+        return torch.ops.vllm.deepseek_v4_hc_head_chunked(
+            hidden_states,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            rms_norm_eps,
+            hc_eps,
+        )
+    return _hc_head_compiled_impl(
+        hidden_states,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        rms_norm_eps,
+        hc_eps,
+    )
 
 
 class DeepseekV4ForCausalLM(nn.Module):
