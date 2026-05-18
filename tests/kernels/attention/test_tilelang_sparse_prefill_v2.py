@@ -570,3 +570,114 @@ def test_sparse_prefill_v2_triton_selected_gather_matches_scaffold():
     torch.testing.assert_close(actual_kv, expected_kv, rtol=0, atol=0)
     torch.testing.assert_close(actual_indices, expected_indices, rtol=0, atol=0)
     torch.testing.assert_close(actual_lens, expected_lens, rtol=0, atol=0)
+
+
+def test_sparse_prefill_v2_triton_selected_gather_supports_row_slices():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    import vllm.v1.attention.ops.tilelang_sparse_prefill_v2 as v2
+    from vllm.v1.attention.ops.deepseek_v4_ops.cache_utils import (
+        _torch_quantize_and_insert_k_cache,
+    )
+
+    device = torch.device("cuda")
+    block_size = 4
+    compress_ratio = 2
+    top_k = 2
+    window_size = 2
+    total_topk = 16
+    num_tokens = 4
+    seq_lens = torch.tensor([8], dtype=torch.int32, device=device)
+    gather_lens = torch.tensor([6], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor(
+        [0, num_tokens], dtype=torch.int32, device=device
+    )
+    compressed_block_table = torch.tensor(
+        [[0]], dtype=torch.int32, device=device
+    )
+    swa_block_table = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+    topk_indices = torch.tensor(
+        [[0, 1], [1, 2], [2, 3], [3, 0]],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    compressed_rows = torch.linspace(
+        -0.5, 0.5, 4 * 512, dtype=torch.float32
+    ).reshape(4, 512).to(torch.bfloat16)
+    swa_rows = torch.linspace(
+        0.25, -0.25, 8 * 512, dtype=torch.float32
+    ).reshape(8, 512).to(torch.bfloat16)
+    compressed_cache = torch.zeros(1, block_size, 584, dtype=torch.uint8)
+    swa_cache = torch.zeros(2, block_size, 584, dtype=torch.uint8)
+    _torch_quantize_and_insert_k_cache(
+        compressed_rows,
+        compressed_cache,
+        torch.arange(4, dtype=torch.int64),
+        block_size,
+    )
+    _torch_quantize_and_insert_k_cache(
+        swa_rows,
+        swa_cache,
+        torch.arange(8, dtype=torch.int64),
+        block_size,
+    )
+    compressed_cache = compressed_cache.to(device)
+    swa_cache = swa_cache.to(device)
+
+    full_kv, full_indices, full_lens = (
+        v2._triton_gather_selected_fp8_ds_mla_cache(
+            compressed_k_cache=compressed_cache,
+            swa_k_cache=swa_cache,
+            compressed_block_table=compressed_block_table,
+            swa_block_table=swa_block_table,
+            topk_indices=topk_indices,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+            top_k=top_k,
+            total_topk=total_topk,
+            dim=512,
+            output_dtype=torch.float16,
+        )
+    )
+
+    chunks = []
+    chunk_indices = []
+    chunk_lens = []
+    for row_start, row_end in ((0, 2), (2, 4)):
+        sliced_kv, sliced_indices, sliced_lens = (
+            v2._triton_gather_selected_fp8_ds_mla_cache(
+                compressed_k_cache=compressed_cache,
+                swa_k_cache=swa_cache,
+                compressed_block_table=compressed_block_table,
+                swa_block_table=swa_block_table,
+                topk_indices=topk_indices[row_start:row_end],
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                gather_lens=gather_lens,
+                window_size=window_size,
+                compress_ratio=compress_ratio,
+                top_k=top_k,
+                total_topk=total_topk,
+                dim=512,
+                output_dtype=torch.float16,
+                total_query_tokens=num_tokens,
+                query_token_offset=row_start,
+            )
+        )
+        chunks.append(sliced_kv)
+        chunk_indices.append(sliced_indices)
+        chunk_lens.append(sliced_lens)
+
+    torch.testing.assert_close(
+        torch.cat(chunks, dim=0), full_kv, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        torch.cat(chunk_lens, dim=0), full_lens, rtol=0, atol=0
+    )
+    assert chunk_indices[0].max().item() < 2 * total_topk
+    assert chunk_indices[1].max().item() < 2 * total_topk

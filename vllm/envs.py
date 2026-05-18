@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     VLLM_SM70_USE_SPARSE_PREFILL_V2: bool = False
     VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS: bool = False
     VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE: bool = False
+    VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB: int = 64
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -1042,6 +1043,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE": lambda: bool(
         int(os.getenv("VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE", "0"))
+    ),
+    # Current sparse prefill v2 prototype still materializes selected KV before
+    # the TileLang attention call. Bound that temporary until the true fused
+    # direct-cache attention kernel replaces it.
+    "VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB": lambda: int(
+        os.getenv("VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB", "64")
     ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm import envs
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops import tilelang_sparse_prefill
 from vllm.v1.attention.ops.deepseek_v4_ops import (
@@ -455,6 +456,8 @@ def _triton_gather_selected_fp8_ds_mla_kernel(
     max_c_blocks: tl.constexpr,
     max_swa_blocks: tl.constexpr,
     num_tokens: tl.constexpr,
+    total_query_tokens: tl.constexpr,
+    query_token_offset: tl.constexpr,
     total_topk: tl.constexpr,
     top_k: tl.constexpr,
     window_size: tl.constexpr,
@@ -475,7 +478,7 @@ def _triton_gather_selected_fp8_ds_mla_kernel(
     offsets = tl.arange(0, block_elems)
 
     seq_len_abs = tl.load(SeqLens)
-    token_pos = seq_len_abs - num_tokens + token_idx
+    token_pos = seq_len_abs - total_query_tokens + query_token_offset + token_idx
     topk_len = tl.minimum((token_pos + 1) // compress_ratio, top_k)
     swa_len = tl.minimum(token_pos + 1, window_size)
     combined_len = topk_len + swa_len
@@ -635,6 +638,8 @@ def _triton_gather_selected_fp8_ds_mla_cache(
     total_topk: int,
     dim: int,
     output_dtype: torch.dtype = torch.float16,
+    total_query_tokens: int | None = None,
+    query_token_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     del query_start_loc
     if seq_lens.numel() != 1:
@@ -650,6 +655,16 @@ def _triton_gather_selected_fp8_ds_mla_cache(
         raise ValueError("topk_indices must have shape [tokens, top_k]")
 
     num_tokens = topk_indices.shape[0]
+    if total_query_tokens is None:
+        total_query_tokens = num_tokens
+    if total_query_tokens < num_tokens:
+        raise ValueError("total_query_tokens must cover the sliced token count")
+    if query_token_offset < 0:
+        raise ValueError("query_token_offset must be non-negative")
+    if query_token_offset + num_tokens > total_query_tokens:
+        raise ValueError(
+            "query_token_offset + sliced tokens exceeds total_query_tokens"
+        )
     selected_kv = torch.zeros(
         (num_tokens, total_topk, dim),
         dtype=output_dtype,
@@ -685,6 +700,8 @@ def _triton_gather_selected_fp8_ds_mla_cache(
         max_c_blocks=compressed_block_table.shape[-1],
         max_swa_blocks=swa_block_table.shape[-1],
         num_tokens=num_tokens,
+        total_query_tokens=total_query_tokens,
+        query_token_offset=query_token_offset,
         total_topk=total_topk,
         top_k=top_k,
         window_size=window_size,
@@ -700,6 +717,24 @@ def _triton_gather_selected_fp8_ds_mla_cache(
         block_elems=_QUANT_BLOCK_SIZE,
     )
     return selected_kv, local_indices, topk_length
+
+
+def _selected_kv_chunk_tokens(
+    *,
+    num_tokens: int,
+    total_topk: int,
+    dim: int,
+    dtype: torch.dtype,
+    max_chunk_mb: int,
+) -> int:
+    if num_tokens <= 0:
+        return 0
+    if max_chunk_mb <= 0:
+        return num_tokens
+    element_size = torch.empty((), dtype=dtype).element_size()
+    bytes_per_token = max(1, total_topk * dim * element_size)
+    max_bytes = max_chunk_mb * 1024 * 1024
+    return max(1, min(num_tokens, max_bytes // bytes_per_token))
 
 
 def _flash_mla_sparse_prefill_v2_direct_cache(
@@ -728,43 +763,65 @@ def _flash_mla_sparse_prefill_v2_direct_cache(
     if topk_indices.shape != (q.shape[0], top_k):
         raise ValueError("topk_indices must have shape [tokens, top_k]")
 
+    num_tokens = q.shape[0]
     total_topk = ((top_k + window_size + block_I - 1) // block_I) * block_I
-    selected_kv, local_indices, topk_length = (
-        _triton_gather_selected_fp8_ds_mla_cache(
-            compressed_k_cache=compressed_k_cache,
-            swa_k_cache=swa_k_cache,
-            compressed_block_table=compressed_block_table,
-            swa_block_table=swa_block_table,
-            topk_indices=topk_indices,
-            query_start_loc=query_start_loc,
-            seq_lens=seq_lens,
-            gather_lens=gather_lens,
-            window_size=window_size,
-            compress_ratio=compress_ratio,
-            top_k=top_k,
-            total_topk=total_topk,
-            dim=q.shape[-1],
-            output_dtype=torch.float16,
-        )
+    chunk_tokens = _selected_kv_chunk_tokens(
+        num_tokens=num_tokens,
+        total_topk=total_topk,
+        dim=q.shape[-1],
+        dtype=torch.float16,
+        max_chunk_mb=envs.VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB,
     )
-    flash_output, max_logits, lse = (
-        tilelang_sparse_prefill.flash_mla_sparse_fwd_tilelang(
-            q=q,
-            kv=selected_kv.view(-1, 1, q.shape[-1]),
-            indices=local_indices,
-            sm_scale=sm_scale,
-            d_v=512,
-            attn_sink=attn_sink,
-            topk_length=topk_length,
-            out=out,
-            output_dtype=torch.float16,
-            block_I=block_I,
+    max_logits_parts: list[torch.Tensor] = []
+    lse_parts: list[torch.Tensor] = []
+
+    for row_start in range(0, num_tokens, chunk_tokens):
+        row_end = min(row_start + chunk_tokens, num_tokens)
+        q_chunk = q[row_start:row_end]
+        out_chunk = out[row_start:row_end]
+        selected_kv, local_indices, topk_length = (
+            _triton_gather_selected_fp8_ds_mla_cache(
+                compressed_k_cache=compressed_k_cache,
+                swa_k_cache=swa_k_cache,
+                compressed_block_table=compressed_block_table,
+                swa_block_table=swa_block_table,
+                topk_indices=topk_indices[row_start:row_end],
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                gather_lens=gather_lens,
+                window_size=window_size,
+                compress_ratio=compress_ratio,
+                top_k=top_k,
+                total_topk=total_topk,
+                dim=q.shape[-1],
+                output_dtype=torch.float16,
+                total_query_tokens=num_tokens,
+                query_token_offset=row_start,
+            )
         )
-    )
-    if flash_output.data_ptr() != out.data_ptr() or flash_output.dtype != out.dtype:
-        out.copy_(flash_output)
-        flash_output = out
-    return flash_output, max_logits, lse
+        flash_output, max_logits, lse = (
+            tilelang_sparse_prefill.flash_mla_sparse_fwd_tilelang(
+                q=q_chunk,
+                kv=selected_kv.view(-1, 1, q.shape[-1]),
+                indices=local_indices,
+                sm_scale=sm_scale,
+                d_v=512,
+                attn_sink=attn_sink,
+                topk_length=topk_length,
+                out=out_chunk,
+                output_dtype=torch.float16,
+                block_I=block_I,
+            )
+        )
+        if (
+            flash_output.data_ptr() != out_chunk.data_ptr()
+            or flash_output.dtype != out_chunk.dtype
+        ):
+            out_chunk.copy_(flash_output)
+        max_logits_parts.append(max_logits)
+        lse_parts.append(lse)
+
+    return out, torch.cat(max_logits_parts, dim=0), torch.cat(lse_parts, dim=0)
 
 
 def _flash_mla_sparse_prefill_v2_oracle(

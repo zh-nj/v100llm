@@ -117,6 +117,7 @@ def test_deepseek_v4_sm70_experimental_envs_are_registered() -> None:
         "VLLM_SM70_USE_SPARSE_PREFILL_V2",
         "VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS",
         "VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE",
+        "VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB",
     }
 
     assert expected_envs.issubset(environment_variables)
@@ -128,6 +129,10 @@ def test_deepseek_v4_sparse_prefill_v2_envs_default_off(
     monkeypatch.delenv("VLLM_SM70_USE_SPARSE_PREFILL_V2", raising=False)
     monkeypatch.delenv("VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS", raising=False)
     monkeypatch.delenv("VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE", raising=False)
+    monkeypatch.delenv(
+        "VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB",
+        raising=False,
+    )
 
     assert environment_variables["VLLM_SM70_USE_SPARSE_PREFILL_V2"]() is False
     assert (
@@ -137,6 +142,16 @@ def test_deepseek_v4_sparse_prefill_v2_envs_default_off(
     assert (
         environment_variables["VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE"]()
         is False
+    )
+    assert (
+        environment_variables["VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB"]()
+        == 64
+    )
+
+    monkeypatch.setenv("VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB", "32")
+    assert (
+        environment_variables["VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB"]()
+        == 32
     )
 
 
