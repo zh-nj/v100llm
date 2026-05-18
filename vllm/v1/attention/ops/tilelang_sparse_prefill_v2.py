@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from vllm.v1.attention.ops import tilelang_sparse_prefill
@@ -12,9 +14,176 @@ from vllm.v1.attention.ops.deepseek_v4_ops import (
 )
 
 
+_DIRECT_CACHE_SOURCE_INVALID = 0
+_DIRECT_CACHE_SOURCE_COMPRESSED = 1
+_DIRECT_CACHE_SOURCE_SWA = 2
+_TOKEN_FP8_DIM = 448
+_TOKEN_BF16_DIM = 64
+_TOKEN_SCALE_DIM = 8
+_TOKEN_DATA_SIZE = _TOKEN_FP8_DIM + _TOKEN_BF16_DIM * 2
+_QUANT_BLOCK_SIZE = 64
+
+
+@dataclass(frozen=True)
+class _DirectCacheRowMap:
+    source: torch.Tensor
+    physical_block: torch.Tensor
+    block_offset: torch.Tensor
+    logical_position: torch.Tensor
+    length: torch.Tensor
+
+
 def _require_cuda_tensors(*tensors: torch.Tensor) -> None:
     if not all(t.is_cuda for t in tensors):
         raise ValueError("sparse prefill v2 inputs must be CUDA tensors")
+
+
+def _reference_direct_cache_row_map(
+    *,
+    topk_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    compressed_block_table: torch.Tensor,
+    swa_block_table: torch.Tensor,
+    compressed_block_size: int,
+    swa_block_size: int,
+    window_size: int,
+    compress_ratio: int,
+    top_k: int,
+) -> _DirectCacheRowMap:
+    """Reference direct-cache row mapping used to lock v2 semantics.
+
+    This mirrors `combine_topk_swa_indices()` plus the gather kernel's paged
+    cache addressing, but keeps the result split into cache source,
+    physical block, block offset, and source-local logical position. It is a
+    slow correctness oracle for tests and for the future TileLang kernel.
+    """
+    if topk_indices.ndim != 2:
+        raise ValueError("topk_indices must have shape [tokens, topk]")
+    num_tokens = topk_indices.shape[0]
+    row_capacity = top_k + window_size
+    device = topk_indices.device
+
+    source = torch.full(
+        (num_tokens, row_capacity),
+        _DIRECT_CACHE_SOURCE_INVALID,
+        dtype=torch.int32,
+        device=device,
+    )
+    physical_block = torch.full(
+        (num_tokens, row_capacity), -1, dtype=torch.int32, device=device
+    )
+    block_offset = torch.full(
+        (num_tokens, row_capacity), -1, dtype=torch.int32, device=device
+    )
+    logical_position = torch.full(
+        (num_tokens, row_capacity), -1, dtype=torch.int32, device=device
+    )
+    length = torch.empty(num_tokens, dtype=torch.int32, device=device)
+
+    query_base = int(query_start_loc[0].item())
+    for req_idx in range(seq_lens.shape[0]):
+        query_start = int(query_start_loc[req_idx].item()) - query_base
+        query_end = int(query_start_loc[req_idx + 1].item()) - query_base
+        query_len = query_end - query_start
+        seq_len = int(seq_lens[req_idx].item())
+        gather_len = int(gather_lens[req_idx].item())
+        gather_start = seq_len - gather_len
+        start_pos = seq_len - query_len
+        compressed_seq_len = seq_len // compress_ratio
+
+        for token_idx in range(query_start, query_end):
+            token_pos = start_pos + token_idx - query_start
+            topk_len = min((token_pos + 1) // compress_ratio, top_k)
+            swa_len = min(token_pos + 1, window_size)
+            length[token_idx] = topk_len + swa_len
+
+            for topk_pos in range(topk_len):
+                compressed_pos = int(topk_indices[token_idx, topk_pos].item())
+                if compressed_pos < 0 or compressed_pos >= compressed_seq_len:
+                    continue
+                block_in_seq = compressed_pos // compressed_block_size
+                pos_in_block = compressed_pos % compressed_block_size
+                physical_block[token_idx, topk_pos] = compressed_block_table[
+                    req_idx, block_in_seq
+                ]
+                block_offset[token_idx, topk_pos] = pos_in_block
+                logical_position[token_idx, topk_pos] = compressed_pos
+                source[token_idx, topk_pos] = _DIRECT_CACHE_SOURCE_COMPRESSED
+
+            swa_start = token_pos - swa_len + 1
+            if swa_start < gather_start:
+                raise ValueError(
+                    "gather_lens does not cover the requested SWA window"
+                )
+            for swa_pos in range(swa_len):
+                logical_pos = swa_start + swa_pos
+                block_in_seq = logical_pos // swa_block_size
+                pos_in_block = logical_pos % swa_block_size
+                row_pos = topk_len + swa_pos
+                physical_block[token_idx, row_pos] = swa_block_table[
+                    req_idx, block_in_seq
+                ]
+                block_offset[token_idx, row_pos] = pos_in_block
+                logical_position[token_idx, row_pos] = logical_pos
+                source[token_idx, row_pos] = _DIRECT_CACHE_SOURCE_SWA
+
+    return _DirectCacheRowMap(
+        source=source,
+        physical_block=physical_block,
+        block_offset=block_offset,
+        logical_position=logical_position,
+        length=length,
+    )
+
+
+def _reference_load_fp8_ds_mla_token(
+    k_cache: torch.Tensor,
+    *,
+    physical_block: int,
+    block_offset: int,
+    block_size: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Reference load/dequant for one token in the fp8_ds_mla cache.
+
+    The current paged-cache block layout matches `cache_utils.py`: all token
+    data rows are stored first (`block_size * 576` bytes), followed by
+    `block_size * 8` scale bytes. This is the layout the TileLang direct-cache
+    kernel must read.
+    """
+    if k_cache.dtype is not torch.uint8:
+        raise ValueError("fp8_ds_mla cache must be uint8")
+
+    cache_2d = k_cache.reshape(k_cache.shape[0], -1)
+    token_data_offset = block_offset * _TOKEN_DATA_SIZE
+    token_scale_offset = block_size * _TOKEN_DATA_SIZE + (
+        block_offset * _TOKEN_SCALE_DIM
+    )
+    fp8_bytes = cache_2d[
+        physical_block, token_data_offset : token_data_offset + _TOKEN_FP8_DIM
+    ].contiguous()
+    bf16_bytes = cache_2d[
+        physical_block,
+        token_data_offset + _TOKEN_FP8_DIM : token_data_offset + _TOKEN_DATA_SIZE,
+    ].contiguous()
+    encoded_scales = cache_2d[
+        physical_block, token_scale_offset : token_scale_offset + 7
+    ].to(torch.float32)
+
+    fp8_values = fp8_bytes.view(torch.float8_e4m3fn).to(torch.float32)
+    scales = torch.exp2(encoded_scales - 127.0).repeat_interleave(
+        _QUANT_BLOCK_SIZE
+    )
+    token = torch.empty(
+        _TOKEN_FP8_DIM + _TOKEN_BF16_DIM,
+        dtype=output_dtype,
+        device=k_cache.device,
+    )
+    token[:_TOKEN_FP8_DIM] = (fp8_values * scales).to(output_dtype)
+    token[_TOKEN_FP8_DIM:] = bf16_bytes.view(torch.bfloat16).to(output_dtype)
+    return token
 
 
 def _flash_mla_sparse_prefill_v2_oracle(

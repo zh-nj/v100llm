@@ -142,3 +142,106 @@ def test_sparse_prefill_v2_oracle_uses_existing_gather_tilelang_path(
     ]
     assert calls[0][3]["offset"] == 0
     assert calls[1][3]["offset"] == 2
+
+
+def test_sparse_prefill_v2_reference_row_map_matches_direct_cache_layout():
+    from vllm.v1.attention.ops.tilelang_sparse_prefill_v2 import (
+        _reference_direct_cache_row_map,
+    )
+
+    row_map = _reference_direct_cache_row_map(
+        topk_indices=torch.tensor(
+            [
+                [0, 1, 5, 99],
+                [1, 0, 3, 4],
+                [3, 4, 2, 1],
+                [0, 1, 2, 3],
+                [6, 5, 4, 3],
+            ],
+            dtype=torch.int32,
+        ),
+        query_start_loc=torch.tensor([10, 12, 15], dtype=torch.int32),
+        seq_lens=torch.tensor([10, 20], dtype=torch.int32),
+        gather_lens=torch.tensor([6, 8], dtype=torch.int32),
+        compressed_block_table=torch.tensor(
+            [[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32
+        ),
+        swa_block_table=torch.tensor(
+            [[30, 31, 32, 33], [40, 41, 42, 43]], dtype=torch.int32
+        ),
+        compressed_block_size=3,
+        swa_block_size=5,
+        window_size=4,
+        compress_ratio=4,
+        top_k=4,
+    )
+
+    # 0 = invalid/padding, 1 = compressed cache, 2 = SWA cache.
+    assert row_map.source[0].tolist() == [1, 1, 2, 2, 2, 2, 0, 0]
+    assert row_map.physical_block[0].tolist() == [
+        10,
+        10,
+        31,
+        31,
+        31,
+        31,
+        -1,
+        -1,
+    ]
+    assert row_map.block_offset[0].tolist() == [0, 1, 0, 1, 2, 3, -1, -1]
+    assert row_map.logical_position[0].tolist() == [0, 1, 5, 6, 7, 8, -1, -1]
+    assert row_map.length.tolist() == [6, 6, 8, 8, 8]
+
+    assert row_map.source[2].tolist() == [1, 1, 1, 1, 2, 2, 2, 2]
+    assert row_map.physical_block[2].tolist() == [21, 21, 20, 20, 42, 43, 43, 43]
+    assert row_map.block_offset[2].tolist() == [0, 1, 2, 1, 4, 0, 1, 2]
+    assert row_map.logical_position[2].tolist() == [3, 4, 2, 1, 14, 15, 16, 17]
+
+
+def test_sparse_prefill_v2_reference_load_fp8_ds_mla_token_matches_layout():
+    from vllm.v1.attention.ops.tilelang_sparse_prefill_v2 import (
+        _reference_load_fp8_ds_mla_token,
+    )
+
+    block_size = 4
+    physical_block = 1
+    block_offset = 2
+    cache = torch.zeros(2, block_size, 584, dtype=torch.uint8)
+    cache_2d = cache.reshape(cache.shape[0], -1)
+
+    fp8_values = torch.linspace(
+        -2.0, 2.0, 448, dtype=torch.float32
+    ).to(torch.float8_e4m3fn)
+    fp8_bytes = fp8_values.view(torch.uint8)
+    scales = torch.tensor([127, 128, 126, 127, 129, 125, 127], dtype=torch.uint8)
+    rope_tail = (
+        torch.arange(64, dtype=torch.float32).to(torch.bfloat16) + 100
+    )
+
+    token_data_offset = block_offset * 576
+    token_scale_offset = block_size * 576 + block_offset * 8
+    cache_2d[
+        physical_block, token_data_offset : token_data_offset + 448
+    ] = fp8_bytes
+    cache_2d[
+        physical_block, token_data_offset + 448 : token_data_offset + 576
+    ] = rope_tail.view(torch.uint8)
+    cache_2d[
+        physical_block, token_scale_offset : token_scale_offset + 7
+    ] = scales
+
+    token = _reference_load_fp8_ds_mla_token(
+        cache,
+        physical_block=physical_block,
+        block_offset=block_offset,
+        block_size=block_size,
+        output_dtype=torch.float16,
+    )
+
+    expected_scales = torch.exp2(scales.to(torch.float32) - 127.0)
+    expected_nope = (
+        fp8_values.to(torch.float32)
+        * expected_scales.repeat_interleave(64)
+    )
+    torch.testing.assert_close(token[:448], expected_nope.to(torch.float16))
+    torch.testing.assert_close(token[448:], rope_tail.to(torch.float16))
