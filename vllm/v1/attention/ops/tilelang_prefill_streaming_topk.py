@@ -4,8 +4,8 @@
 
 The public call boundary is intentionally shaped like the final implementation:
 query rows + gathered K cache + row ranges -> local top-k indices.  The first
-body is an oracle that still materializes logits, so routing can be developed
-against a stable API before the tile-local candidate merge replaces it.
+body uses torch tile chunks to establish the streaming candidate-merge
+semantics before the hot loop is lowered into TileLang/CUDA.
 """
 
 import torch
@@ -14,6 +14,73 @@ import torch
 def _require_cuda_tensors(*tensors: torch.Tensor) -> None:
     if not all(t.is_cuda for t in tensors):
         raise ValueError("streaming topk inputs must be CUDA tensors")
+
+
+def _prefill_streaming_topk_chunked_torch(
+    *,
+    q: torch.Tensor,
+    k_cache_values: torch.Tensor,
+    k_cache_scales: torch.Tensor,
+    weights: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    out_indices: torch.Tensor,
+    topk_tokens: int,
+    tile_k: int,
+) -> None:
+    q_f32 = q.float()
+    weights_t = weights.float().transpose(0, 1).unsqueeze(-1)
+    scale_flat = k_cache_scales.reshape(-1).float()
+    row_starts_i64 = row_starts.to(torch.int64)
+    row_ends_i64 = row_ends.to(torch.int64)
+    rows = q.shape[0]
+    kv_tokens = k_cache_values.shape[0]
+    device = q.device
+
+    best_scores = torch.empty((rows, 0), dtype=torch.float32, device=device)
+    best_indices = torch.empty((rows, 0), dtype=torch.int32, device=device)
+    for tile_start in range(0, kv_tokens, tile_k):
+        tile_end = min(tile_start + tile_k, kv_tokens)
+        k_tile = (
+            k_cache_values[tile_start:tile_end].float()
+            * scale_flat[tile_start:tile_end].view(-1, 1)
+        )
+        score = torch.einsum("mhd,nd->hmn", q_f32, k_tile)
+        tile_logits = (score.relu() * weights_t).sum(dim=0)
+        positions = torch.arange(tile_start, tile_end, device=device)
+        valid = (
+            (positions.view(1, -1) >= row_starts_i64.view(-1, 1))
+            & (positions.view(1, -1) < row_ends_i64.view(-1, 1))
+        )
+        tile_logits = tile_logits.masked_fill(~valid, -torch.inf)
+        tile_topk = min(topk_tokens, tile_end - tile_start)
+        tile_scores, tile_offsets = tile_logits.topk(tile_topk, dim=1)
+        tile_indices = (
+            positions[tile_offsets].to(torch.int64) - row_starts_i64.view(-1, 1)
+        ).to(torch.int32)
+
+        merged_scores = torch.cat((best_scores, tile_scores), dim=1)
+        merged_indices = torch.cat((best_indices, tile_indices), dim=1)
+        keep = min(topk_tokens, merged_scores.shape[1])
+        best_scores, keep_pos = merged_scores.topk(keep, dim=1)
+        best_indices = merged_indices.gather(1, keep_pos)
+
+    out_indices.fill_(-1)
+    if best_indices.shape[1] == 0:
+        return
+    if best_indices.shape[1] < topk_tokens:
+        pad = torch.full(
+            (rows, topk_tokens - best_indices.shape[1]),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        best_indices = torch.cat((best_indices, pad), dim=1)
+    valid_counts = torch.clamp(row_ends_i64 - row_starts_i64, min=0, max=topk_tokens)
+    cols = torch.arange(topk_tokens, device=device).view(1, -1)
+    valid_out = cols < valid_counts.view(-1, 1)
+    selected = best_indices[:, :topk_tokens]
+    out_indices.copy_(torch.where(valid_out, selected, torch.full_like(selected, -1)))
 
 
 def _prefill_streaming_topk_oracle(
@@ -29,25 +96,17 @@ def _prefill_streaming_topk_oracle(
     tile_k: int,
     threads: int,
 ) -> None:
-    del tile_k
-    from vllm.v1.attention.ops.tilelang_prefill_topk import (
-        prefill_topk_tilelang,
-    )
-
-    q_f32 = q.float()
-    k_f32 = k_cache_values.float() * k_cache_scales.reshape(-1).float().view(-1, 1)
-    score = torch.einsum("mhd,nd->hmn", q_f32, k_f32)
-    logits = (
-        score.relu() * weights.float().transpose(0, 1).unsqueeze(-1)
-    ).sum(dim=0).contiguous()
-    lengths = (row_ends - row_starts).to(torch.int32).contiguous()
-    prefill_topk_tilelang(
-        logits,
-        out_indices,
-        lengths,
-        row_starts.to(torch.int32).contiguous(),
+    del threads
+    _prefill_streaming_topk_chunked_torch(
+        q=q,
+        k_cache_values=k_cache_values,
+        k_cache_scales=k_cache_scales,
+        weights=weights,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        out_indices=out_indices,
         topk_tokens=topk_tokens,
-        threads=threads,
+        tile_k=tile_k,
     )
 
 
