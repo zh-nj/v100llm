@@ -45,7 +45,7 @@ def test_sparse_prefill_v2_rejects_unsupported_head_count():
     flash_mla_sparse_prefill_v2, kwargs = _base_inputs()
     kwargs["q"] = torch.empty(1, 32, 576, dtype=torch.float16)
 
-    with pytest.raises(ValueError, match=r"shape \[tokens, 64, 576\]"):
+    with pytest.raises(ValueError, match=r"shape \[tokens, 64, 512 or 576\]"):
         flash_mla_sparse_prefill_v2(**kwargs)
 
 
@@ -142,6 +142,58 @@ def test_sparse_prefill_v2_oracle_uses_existing_gather_tilelang_path(
     ]
     assert calls[0][3]["offset"] == 0
     assert calls[1][3]["offset"] == 2
+
+
+def test_sparse_prefill_v2_wrapper_uses_direct_cache_for_512_dim_q(
+    monkeypatch,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    import vllm.v1.attention.ops.tilelang_sparse_prefill_v2 as v2
+
+    q = torch.empty(2, 64, 512, dtype=torch.float16, device="cuda")
+    out = torch.empty(2, 64, 512, dtype=torch.float16, device="cuda")
+    cache = torch.empty(2, 4, 584, dtype=torch.uint8, device="cuda")
+    block_table = torch.zeros(1, 2, dtype=torch.int32, device="cuda")
+    calls = []
+
+    def fake_direct(**kwargs):
+        calls.append(kwargs)
+        return (
+            kwargs["out"],
+            torch.zeros(2, 64, dtype=torch.float32, device="cuda"),
+            torch.zeros(2, 64, dtype=torch.float32, device="cuda"),
+        )
+
+    monkeypatch.setattr(
+        v2,
+        "_flash_mla_sparse_prefill_v2_direct_cache",
+        fake_direct,
+    )
+
+    result, max_logits, lse = v2.flash_mla_sparse_prefill_v2(
+        q=q,
+        compressed_k_cache=cache,
+        swa_k_cache=cache,
+        compressed_block_table=block_table,
+        swa_block_table=block_table,
+        topk_indices=torch.zeros(2, 2, dtype=torch.int32, device="cuda"),
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+        seq_lens=torch.tensor([6], dtype=torch.int32, device="cuda"),
+        gather_lens=torch.tensor([4], dtype=torch.int32, device="cuda"),
+        window_size=2,
+        compress_ratio=4,
+        top_k=2,
+        sm_scale=1.0,
+        attn_sink=torch.zeros(64, dtype=torch.float32, device="cuda"),
+        out=out,
+    )
+
+    assert calls and calls[0]["q"].data_ptr() == q.data_ptr()
+    assert result.data_ptr() == out.data_ptr()
+    assert max_logits.shape == (2, 64)
+    assert lse.shape == (2, 64)
 
 
 def test_sparse_prefill_v2_reference_row_map_matches_direct_cache_layout():

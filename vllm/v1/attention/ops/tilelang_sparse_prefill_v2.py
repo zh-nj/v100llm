@@ -863,8 +863,8 @@ def flash_mla_sparse_prefill_v2(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if q.dtype is not torch.float16 or out.dtype is not torch.float16:
         raise ValueError("sparse prefill v2 starts with fp16 q/out only")
-    if q.ndim != 3 or tuple(q.shape[1:]) != (64, 576):
-        raise ValueError("q must have shape [tokens, 64, 576]")
+    if q.ndim != 3 or q.shape[1] != 64 or q.shape[-1] not in (512, 576):
+        raise ValueError("q must have shape [tokens, 64, 512 or 576]")
     if out.ndim != 3 or tuple(out.shape[1:]) != (64, 512):
         raise ValueError("out must have shape [tokens, 64, 512]")
     if q.shape[0] != out.shape[0]:
@@ -887,6 +887,25 @@ def flash_mla_sparse_prefill_v2(
         attn_sink,
         out,
     )
+
+    if q.shape[-1] == 512:
+        return _flash_mla_sparse_prefill_v2_direct_cache(
+            q=q,
+            compressed_k_cache=compressed_k_cache,
+            swa_k_cache=swa_k_cache,
+            compressed_block_table=compressed_block_table,
+            swa_block_table=swa_block_table,
+            topk_indices=topk_indices,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+            top_k=top_k,
+            sm_scale=sm_scale,
+            attn_sink=attn_sink,
+            out=out,
+        )
 
     return _flash_mla_sparse_prefill_v2_oracle(
         q=q,
