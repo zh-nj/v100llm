@@ -28,12 +28,14 @@ _CANDIDATE_BUFFER_FACTORY = None
 _CANDIDATE_BUFFER_CACHE: dict[tuple[int, int, int], object] = {}
 _CANDIDATE_GATHER_FACTORY = None
 _CANDIDATE_GATHER_CACHE: dict[tuple[int, int, int], object] = {}
+_FUSED_CANDIDATE_UPDATE_FACTORY = None
+_FUSED_CANDIDATE_UPDATE_CACHE: dict[tuple[int, int, int], object] = {}
 _FINAL_INDICES_FACTORY = None
 _FINAL_INDICES_CACHE: dict[tuple[int, int], object] = {}
-# Current TileLang candidate maintenance is useful for small correctness tests,
-# but topk=512 production shapes benchmark slower than the chunked torch
-# candidate loop until the tile loop and merge are fused into fewer launches.
-_MAX_BENCHED_TILELANG_CANDIDATE_TOPK = 128
+# Keep the TileLang candidate path to shapes with a measured win.  The fused
+# candidate-update kernel makes topk=512 faster than the chunked torch loop on
+# the SM70 benchmark shape; larger top-k widths still need their own sweep.
+_MAX_BENCHED_TILELANG_CANDIDATE_TOPK = 512
 
 
 def _require_cuda_tensors(*tensors: torch.Tensor) -> None:
@@ -176,6 +178,417 @@ def _build_candidate_gather_kernel_factory():
     return build_candidate_gather_kernel
 
 
+def _build_fused_candidate_update_kernel_factory():
+    import tilelang
+    from tilelang import language as T
+
+    @tilelang.jit(
+        target="cuda -arch=sm_70",
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        },
+    )
+    def build_fused_candidate_update_kernel(
+        topk: int,
+        tile_keep: int,
+        threads: int = 256,
+    ):
+        rows = T.dynamic("rows")
+        tile_len = T.dynamic("tile_len")
+        candidate_width = topk + tile_keep
+        RADIX = 256
+        neg_inf = -3.4028234663852886e38
+
+        @T.prim_func
+        def main(
+            BestScores: T.Tensor((rows, topk), T.float32),
+            BestIndices: T.Tensor((rows, topk), T.int32),
+            TileLogits: T.Tensor((rows, tile_len), T.float32),
+            TileOffsets: T.Tensor((rows, tile_keep), T.int32),
+            RowStarts: T.Tensor((rows,), T.int32),
+            TileLocalStarts: T.Tensor((rows,), T.int32),
+            TileAbsStarts: T.Tensor((rows,), T.int32),
+            NextScores: T.Tensor((rows, topk), T.float32),
+            NextIndices: T.Tensor((rows, topk), T.int32),
+        ):
+            with T.Kernel(rows, threads=threads) as row:
+                hist = T.alloc_shared((RADIX,), T.int32)
+                threshold_bin = T.alloc_shared((1,), T.int32)
+                greater_count = T.alloc_shared((1,), T.int32)
+                remaining = T.alloc_shared((1,), T.int32)
+                output_count = T.alloc_shared((1,), T.int32)
+                tb0 = T.alloc_shared((1,), T.int32)
+                tb1 = T.alloc_shared((1,), T.int32)
+                tb2 = T.alloc_shared((1,), T.int32)
+                tb3 = T.alloc_shared((1,), T.int32)
+                tx = T.get_thread_binding()
+                rounded = T.ceildiv(candidate_width, threads) * threads
+
+                if tx == 0:
+                    remaining[0] = topk
+                    output_count[0] = 0
+                T.sync_threads()
+
+                # Pass 0: bits [31:24].
+                for b in T.Parallel(RADIX):
+                    hist[b] = 0
+                T.sync_threads()
+                for pos in T.serial(tx, rounded, threads):
+                    if pos < candidate_width:
+                        is_best = pos < topk
+                        best_pos = T.if_then_else(is_best, pos, 0)
+                        tile_k = T.if_then_else(is_best, 0, pos - topk)
+                        offset = TileOffsets[row, tile_k]
+                        valid = offset >= 0
+                        tile_col = TileLocalStarts[row] + offset
+                        safe_tile_col = T.if_then_else(valid, tile_col, 0)
+                        tile_v = T.if_then_else(
+                            valid,
+                            TileLogits[row, safe_tile_col],
+                            neg_inf,
+                        )
+                        v = T.if_then_else(
+                            is_best,
+                            BestScores[row, best_pos],
+                            tile_v,
+                        )
+                        bits = T.reinterpret(T.uint32, v)
+                        mask = T.if_then_else(
+                            (bits & T.uint32(0x80000000)) != T.uint32(0),
+                            T.uint32(0xFFFFFFFF),
+                            T.uint32(0x80000000),
+                        )
+                        key = bits ^ mask
+                        bin_idx = (
+                            (key >> T.uint32(24)) & T.uint32(0xFF)
+                        ).astype(T.int32)
+                        T.atomic_add(hist[bin_idx], 1)
+                T.sync_threads()
+                if tx == 0:
+                    seen = T.alloc_fragment((1,), T.int32)
+                    found = T.alloc_fragment((1,), T.int32)
+                    seen[0] = 0
+                    found[0] = 0
+                    for i in T.serial(RADIX):
+                        b = RADIX - 1 - i
+                        cnt = hist[b]
+                        if (found[0] == 0) & ((seen[0] + cnt) >= remaining[0]):
+                            threshold_bin[0] = b
+                            greater_count[0] = seen[0]
+                            found[0] = 1
+                        seen[0] += cnt
+                    tb0[0] = threshold_bin[0]
+                    remaining[0] -= greater_count[0]
+                T.sync_threads()
+
+                # Pass 1: bits [23:16] among pass-0 threshold bin.
+                for b in T.Parallel(RADIX):
+                    hist[b] = 0
+                T.sync_threads()
+                for pos in T.serial(tx, rounded, threads):
+                    if pos < candidate_width:
+                        is_best = pos < topk
+                        best_pos = T.if_then_else(is_best, pos, 0)
+                        tile_k = T.if_then_else(is_best, 0, pos - topk)
+                        offset = TileOffsets[row, tile_k]
+                        valid = offset >= 0
+                        tile_col = TileLocalStarts[row] + offset
+                        safe_tile_col = T.if_then_else(valid, tile_col, 0)
+                        tile_v = T.if_then_else(
+                            valid,
+                            TileLogits[row, safe_tile_col],
+                            neg_inf,
+                        )
+                        v = T.if_then_else(
+                            is_best,
+                            BestScores[row, best_pos],
+                            tile_v,
+                        )
+                        bits = T.reinterpret(T.uint32, v)
+                        mask = T.if_then_else(
+                            (bits & T.uint32(0x80000000)) != T.uint32(0),
+                            T.uint32(0xFFFFFFFF),
+                            T.uint32(0x80000000),
+                        )
+                        key = bits ^ mask
+                        hi0 = (
+                            (key >> T.uint32(24)) & T.uint32(0xFF)
+                        ).astype(T.int32)
+                        if hi0 == tb0[0]:
+                            bin_idx = (
+                                (key >> T.uint32(16)) & T.uint32(0xFF)
+                            ).astype(T.int32)
+                            T.atomic_add(hist[bin_idx], 1)
+                T.sync_threads()
+                if tx == 0:
+                    seen = T.alloc_fragment((1,), T.int32)
+                    found = T.alloc_fragment((1,), T.int32)
+                    seen[0] = 0
+                    found[0] = 0
+                    for i in T.serial(RADIX):
+                        b = RADIX - 1 - i
+                        cnt = hist[b]
+                        if (found[0] == 0) & ((seen[0] + cnt) >= remaining[0]):
+                            threshold_bin[0] = b
+                            greater_count[0] = seen[0]
+                            found[0] = 1
+                        seen[0] += cnt
+                    tb1[0] = threshold_bin[0]
+                    remaining[0] -= greater_count[0]
+                T.sync_threads()
+
+                # Pass 2: bits [15:8].
+                for b in T.Parallel(RADIX):
+                    hist[b] = 0
+                T.sync_threads()
+                for pos in T.serial(tx, rounded, threads):
+                    if pos < candidate_width:
+                        is_best = pos < topk
+                        best_pos = T.if_then_else(is_best, pos, 0)
+                        tile_k = T.if_then_else(is_best, 0, pos - topk)
+                        offset = TileOffsets[row, tile_k]
+                        valid = offset >= 0
+                        tile_col = TileLocalStarts[row] + offset
+                        safe_tile_col = T.if_then_else(valid, tile_col, 0)
+                        tile_v = T.if_then_else(
+                            valid,
+                            TileLogits[row, safe_tile_col],
+                            neg_inf,
+                        )
+                        v = T.if_then_else(
+                            is_best,
+                            BestScores[row, best_pos],
+                            tile_v,
+                        )
+                        bits = T.reinterpret(T.uint32, v)
+                        mask = T.if_then_else(
+                            (bits & T.uint32(0x80000000)) != T.uint32(0),
+                            T.uint32(0xFFFFFFFF),
+                            T.uint32(0x80000000),
+                        )
+                        key = bits ^ mask
+                        hi0 = (
+                            (key >> T.uint32(24)) & T.uint32(0xFF)
+                        ).astype(T.int32)
+                        hi1 = (
+                            (key >> T.uint32(16)) & T.uint32(0xFF)
+                        ).astype(T.int32)
+                        if (hi0 == tb0[0]) & (hi1 == tb1[0]):
+                            bin_idx = (
+                                (key >> T.uint32(8)) & T.uint32(0xFF)
+                            ).astype(T.int32)
+                            T.atomic_add(hist[bin_idx], 1)
+                T.sync_threads()
+                if tx == 0:
+                    seen = T.alloc_fragment((1,), T.int32)
+                    found = T.alloc_fragment((1,), T.int32)
+                    seen[0] = 0
+                    found[0] = 0
+                    for i in T.serial(RADIX):
+                        b = RADIX - 1 - i
+                        cnt = hist[b]
+                        if (found[0] == 0) & ((seen[0] + cnt) >= remaining[0]):
+                            threshold_bin[0] = b
+                            greater_count[0] = seen[0]
+                            found[0] = 1
+                        seen[0] += cnt
+                    tb2[0] = threshold_bin[0]
+                    remaining[0] -= greater_count[0]
+                T.sync_threads()
+
+                # Pass 3: bits [7:0].
+                for b in T.Parallel(RADIX):
+                    hist[b] = 0
+                T.sync_threads()
+                for pos in T.serial(tx, rounded, threads):
+                    if pos < candidate_width:
+                        is_best = pos < topk
+                        best_pos = T.if_then_else(is_best, pos, 0)
+                        tile_k = T.if_then_else(is_best, 0, pos - topk)
+                        offset = TileOffsets[row, tile_k]
+                        valid = offset >= 0
+                        tile_col = TileLocalStarts[row] + offset
+                        safe_tile_col = T.if_then_else(valid, tile_col, 0)
+                        tile_v = T.if_then_else(
+                            valid,
+                            TileLogits[row, safe_tile_col],
+                            neg_inf,
+                        )
+                        v = T.if_then_else(
+                            is_best,
+                            BestScores[row, best_pos],
+                            tile_v,
+                        )
+                        bits = T.reinterpret(T.uint32, v)
+                        mask = T.if_then_else(
+                            (bits & T.uint32(0x80000000)) != T.uint32(0),
+                            T.uint32(0xFFFFFFFF),
+                            T.uint32(0x80000000),
+                        )
+                        key = bits ^ mask
+                        hi0 = (
+                            (key >> T.uint32(24)) & T.uint32(0xFF)
+                        ).astype(T.int32)
+                        hi1 = (
+                            (key >> T.uint32(16)) & T.uint32(0xFF)
+                        ).astype(T.int32)
+                        hi2 = (
+                            (key >> T.uint32(8)) & T.uint32(0xFF)
+                        ).astype(T.int32)
+                        if (hi0 == tb0[0]) & (hi1 == tb1[0]) & (hi2 == tb2[0]):
+                            bin_idx = (key & T.uint32(0xFF)).astype(T.int32)
+                            T.atomic_add(hist[bin_idx], 1)
+                T.sync_threads()
+                if tx == 0:
+                    seen = T.alloc_fragment((1,), T.int32)
+                    found = T.alloc_fragment((1,), T.int32)
+                    seen[0] = 0
+                    found[0] = 0
+                    for i in T.serial(RADIX):
+                        b = RADIX - 1 - i
+                        cnt = hist[b]
+                        if (found[0] == 0) & ((seen[0] + cnt) >= remaining[0]):
+                            threshold_bin[0] = b
+                            found[0] = 1
+                        seen[0] += cnt
+                    tb3[0] = threshold_bin[0]
+                T.sync_threads()
+
+                # Emit all candidates strictly above the threshold key.
+                for pos in T.serial(tx, rounded, threads):
+                    if pos < candidate_width:
+                        is_best = pos < topk
+                        best_pos = T.if_then_else(is_best, pos, 0)
+                        tile_k = T.if_then_else(is_best, 0, pos - topk)
+                        offset = TileOffsets[row, tile_k]
+                        valid = offset >= 0
+                        tile_col = TileLocalStarts[row] + offset
+                        safe_tile_col = T.if_then_else(valid, tile_col, 0)
+                        tile_v = T.if_then_else(
+                            valid,
+                            TileLogits[row, safe_tile_col],
+                            neg_inf,
+                        )
+                        tile_index = T.if_then_else(
+                            valid,
+                            TileAbsStarts[row] + offset - RowStarts[row],
+                            -1,
+                        )
+                        v = T.if_then_else(
+                            is_best,
+                            BestScores[row, best_pos],
+                            tile_v,
+                        )
+                        out_index = T.if_then_else(
+                            is_best,
+                            BestIndices[row, best_pos],
+                            tile_index,
+                        )
+                        bits = T.reinterpret(T.uint32, v)
+                        mask = T.if_then_else(
+                            (bits & T.uint32(0x80000000)) != T.uint32(0),
+                            T.uint32(0xFFFFFFFF),
+                            T.uint32(0x80000000),
+                        )
+                        key = bits ^ mask
+                        hi0 = (
+                            (key >> T.uint32(24)) & T.uint32(0xFF)
+                        ).astype(T.int32)
+                        hi1 = (
+                            (key >> T.uint32(16)) & T.uint32(0xFF)
+                        ).astype(T.int32)
+                        hi2 = (
+                            (key >> T.uint32(8)) & T.uint32(0xFF)
+                        ).astype(T.int32)
+                        hi3 = (key & T.uint32(0xFF)).astype(T.int32)
+                        is_greater = (hi0 > tb0[0]) | (
+                            (hi0 == tb0[0])
+                            & (
+                                (hi1 > tb1[0])
+                                | (
+                                    (hi1 == tb1[0])
+                                    & (
+                                        (hi2 > tb2[0])
+                                        | ((hi2 == tb2[0]) & (hi3 > tb3[0]))
+                                    )
+                                )
+                            )
+                        )
+                        if is_greater:
+                            out_pos = T.atomic_add(
+                                output_count[0], 1, return_prev=True
+                            )
+                            if out_pos < topk:
+                                NextScores[row, out_pos] = v
+                                NextIndices[row, out_pos] = out_index
+                T.sync_threads()
+
+                # Fill threshold-equal candidates until top-k is complete.
+                for pos in T.serial(tx, rounded, threads):
+                    if pos < candidate_width:
+                        is_best = pos < topk
+                        best_pos = T.if_then_else(is_best, pos, 0)
+                        tile_k = T.if_then_else(is_best, 0, pos - topk)
+                        offset = TileOffsets[row, tile_k]
+                        valid = offset >= 0
+                        tile_col = TileLocalStarts[row] + offset
+                        safe_tile_col = T.if_then_else(valid, tile_col, 0)
+                        tile_v = T.if_then_else(
+                            valid,
+                            TileLogits[row, safe_tile_col],
+                            neg_inf,
+                        )
+                        tile_index = T.if_then_else(
+                            valid,
+                            TileAbsStarts[row] + offset - RowStarts[row],
+                            -1,
+                        )
+                        v = T.if_then_else(
+                            is_best,
+                            BestScores[row, best_pos],
+                            tile_v,
+                        )
+                        out_index = T.if_then_else(
+                            is_best,
+                            BestIndices[row, best_pos],
+                            tile_index,
+                        )
+                        bits = T.reinterpret(T.uint32, v)
+                        mask = T.if_then_else(
+                            (bits & T.uint32(0x80000000)) != T.uint32(0),
+                            T.uint32(0xFFFFFFFF),
+                            T.uint32(0x80000000),
+                        )
+                        key = bits ^ mask
+                        hi0 = (
+                            (key >> T.uint32(24)) & T.uint32(0xFF)
+                        ).astype(T.int32)
+                        hi1 = (
+                            (key >> T.uint32(16)) & T.uint32(0xFF)
+                        ).astype(T.int32)
+                        hi2 = (
+                            (key >> T.uint32(8)) & T.uint32(0xFF)
+                        ).astype(T.int32)
+                        hi3 = (key & T.uint32(0xFF)).astype(T.int32)
+                        if (
+                            (hi0 == tb0[0])
+                            & (hi1 == tb1[0])
+                            & (hi2 == tb2[0])
+                            & (hi3 == tb3[0])
+                        ):
+                            out_pos = T.atomic_add(
+                                output_count[0], 1, return_prev=True
+                            )
+                            if out_pos < topk:
+                                NextScores[row, out_pos] = v
+                                NextIndices[row, out_pos] = out_index
+
+        return main
+
+    return build_fused_candidate_update_kernel
+
+
 def _build_final_indices_kernel_factory():
     import tilelang
     from tilelang import language as T
@@ -237,6 +650,22 @@ def _get_candidate_gather_kernel(topk: int, candidate_width: int, threads: int):
             threads=threads,
         )
     return _CANDIDATE_GATHER_CACHE[key]
+
+
+def _get_fused_candidate_update_kernel(topk: int, tile_keep: int, threads: int):
+    global _FUSED_CANDIDATE_UPDATE_FACTORY
+    if _FUSED_CANDIDATE_UPDATE_FACTORY is None:
+        _FUSED_CANDIDATE_UPDATE_FACTORY = (
+            _build_fused_candidate_update_kernel_factory()
+        )
+    key = (topk, tile_keep, threads)
+    if key not in _FUSED_CANDIDATE_UPDATE_CACHE:
+        _FUSED_CANDIDATE_UPDATE_CACHE[key] = _FUSED_CANDIDATE_UPDATE_FACTORY(
+            topk=topk,
+            tile_keep=tile_keep,
+            threads=threads,
+        )
+    return _FUSED_CANDIDATE_UPDATE_CACHE[key]
 
 
 def _get_final_indices_kernel(topk: int, threads: int):
@@ -411,20 +840,15 @@ def _update_best_candidates_tilelang(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows = best_scores.shape[0]
     tile_keep = tile_offsets.shape[1]
-    candidate_width = topk_tokens + tile_keep
-    candidate_scores = torch.empty(
-        (rows, candidate_width),
-        dtype=torch.float32,
-        device=best_scores.device,
-    )
-    candidate_indices = torch.empty(
-        (rows, candidate_width),
-        dtype=torch.int32,
-        device=best_scores.device,
-    )
     tile_abs_starts = (tile_row_starts + tile_start).to(torch.int32).contiguous()
-    fill_kernel = _get_candidate_buffer_kernel(topk_tokens, tile_keep, threads)
-    fill_kernel(
+    next_scores = torch.empty_like(best_scores)
+    next_indices = torch.empty_like(best_indices)
+    update_kernel = _get_fused_candidate_update_kernel(
+        topk_tokens,
+        tile_keep,
+        threads,
+    )
+    update_kernel(
         best_scores,
         best_indices,
         tile_logits.contiguous(),
@@ -432,42 +856,6 @@ def _update_best_candidates_tilelang(
         row_starts.contiguous(),
         tile_row_starts,
         tile_abs_starts,
-        candidate_scores,
-        candidate_indices,
-    )
-
-    merge_positions = torch.empty(
-        (rows, topk_tokens),
-        dtype=torch.int32,
-        device=best_scores.device,
-    )
-    candidate_row_starts = torch.zeros(
-        (rows,),
-        dtype=torch.int32,
-        device=best_scores.device,
-    )
-    candidate_lengths = torch.full(
-        (rows,),
-        candidate_width,
-        dtype=torch.int32,
-        device=best_scores.device,
-    )
-    prefill_topk_tilelang(
-        candidate_scores,
-        merge_positions,
-        candidate_lengths,
-        candidate_row_starts,
-        topk_tokens=topk_tokens,
-        threads=threads,
-    )
-
-    next_scores = torch.empty_like(best_scores)
-    next_indices = torch.empty_like(best_indices)
-    gather_kernel = _get_candidate_gather_kernel(topk_tokens, candidate_width, threads)
-    gather_kernel(
-        candidate_scores,
-        candidate_indices,
-        merge_positions,
         next_scores,
         next_indices,
     )

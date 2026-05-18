@@ -202,7 +202,7 @@ def test_streaming_topk_tile_logits_uses_sm70_fp8_hot_kernel(monkeypatch):
     )
 
 
-def test_streaming_topk_oracle_keeps_production_topk_on_chunked_torch(monkeypatch):
+def test_streaming_topk_oracle_uses_tilelang_for_benched_topk(monkeypatch):
     import vllm.v1.attention.ops.tilelang_prefill_streaming_topk as streaming_topk
 
     monkeypatch.setattr(streaming_topk, "is_tilelang_available", lambda: (True, None))
@@ -228,6 +228,42 @@ def test_streaming_topk_oracle_keeps_production_topk_on_chunked_torch(monkeypatc
 
     kwargs = _make_inputs()
     kwargs["topk_tokens"] = 512
+    kwargs["tile_k"] = 1024
+    kwargs["threads"] = 256
+    streaming_topk._prefill_streaming_topk_oracle(**kwargs)
+
+    assert calls == ["tilelang"]
+
+
+def test_streaming_topk_oracle_keeps_unbenched_topk_on_chunked_torch(
+    monkeypatch,
+):
+    import vllm.v1.attention.ops.tilelang_prefill_streaming_topk as streaming_topk
+
+    monkeypatch.setattr(streaming_topk, "is_tilelang_available", lambda: (True, None))
+    monkeypatch.setattr(streaming_topk, "_is_sm70_tensor_device", lambda q: True)
+    calls = []
+
+    def fake_torch(**kwargs):
+        calls.append("torch")
+
+    def fake_tilelang(**kwargs):
+        calls.append("tilelang")
+
+    monkeypatch.setattr(
+        streaming_topk,
+        "_prefill_streaming_topk_chunked_torch",
+        fake_torch,
+    )
+    monkeypatch.setattr(
+        streaming_topk,
+        "_prefill_streaming_topk_chunked_tilelang",
+        fake_tilelang,
+    )
+
+    kwargs = _make_inputs()
+    kwargs["out_indices"] = torch.empty((2, 1024), dtype=torch.int32)
+    kwargs["topk_tokens"] = 1024
     kwargs["tile_k"] = 1024
     kwargs["threads"] = 256
     streaming_topk._prefill_streaming_topk_oracle(**kwargs)
@@ -454,6 +490,73 @@ def test_streaming_topk_tilelang_candidate_merge_matches_torch_cuda():
     for row in range(best_scores.shape[0]):
         assert set(next_scores[row].tolist()) == set(expected_scores[row].tolist())
         assert set(next_indices[row].tolist()) == set(expected_indices[row].tolist())
+
+
+def test_streaming_topk_candidate_update_uses_single_fused_kernel(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_prefill_streaming_topk as streaming_topk
+
+    calls = []
+
+    def fake_get_fused_kernel(topk_tokens, tile_keep, threads):
+        calls.append(("get_fused", topk_tokens, tile_keep, threads))
+
+        def fake_kernel(*args):
+            calls.append(("run_fused", len(args)))
+            next_scores = args[-2]
+            next_indices = args[-1]
+            next_scores.fill_(1.0)
+            next_indices.fill_(2)
+
+        return fake_kernel
+
+    def fail_old_buffer(*args, **kwargs):
+        raise AssertionError("candidate buffer kernel should not run")
+
+    def fail_old_gather(*args, **kwargs):
+        raise AssertionError("candidate gather kernel should not run")
+
+    def fail_old_topk(*args, **kwargs):
+        raise AssertionError("prefill_topk_tilelang should not run in merge")
+
+    monkeypatch.setattr(
+        streaming_topk,
+        "_get_fused_candidate_update_kernel",
+        fake_get_fused_kernel,
+    )
+    monkeypatch.setattr(
+        streaming_topk,
+        "_get_candidate_buffer_kernel",
+        fail_old_buffer,
+    )
+    monkeypatch.setattr(
+        streaming_topk,
+        "_get_candidate_gather_kernel",
+        fail_old_gather,
+    )
+    monkeypatch.setattr(streaming_topk, "prefill_topk_tilelang", fail_old_topk)
+
+    best_scores = torch.zeros((2, 4), dtype=torch.float32)
+    best_indices = torch.zeros((2, 4), dtype=torch.int32)
+    tile_logits = torch.zeros((2, 8), dtype=torch.float32)
+    tile_offsets = torch.zeros((2, 4), dtype=torch.int32)
+    row_starts = torch.zeros((2,), dtype=torch.int32)
+    tile_row_starts = torch.zeros((2,), dtype=torch.int32)
+
+    next_scores, next_indices = streaming_topk._update_best_candidates_tilelang(
+        best_scores=best_scores,
+        best_indices=best_indices,
+        tile_logits=tile_logits,
+        tile_offsets=tile_offsets,
+        row_starts=row_starts,
+        tile_row_starts=tile_row_starts,
+        tile_start=100,
+        topk_tokens=4,
+        threads=256,
+    )
+
+    assert calls == [("get_fused", 4, 4, 256), ("run_fused", 9)]
+    assert torch.all(next_scores == 1.0)
+    assert torch.all(next_indices == 2)
 
 
 @pytest.mark.skipif(
