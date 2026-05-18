@@ -24,7 +24,7 @@ def test_sparse_flashmla_metadata_smoke():
 
     cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
 
-    tile_md, num_splits = fm.get_mla_metadata(
+    sched_meta, num_splits = fm.get_mla_metadata(
         cache_seqlens,
         q_seq_per_hk,
         num_heads_k,
@@ -32,8 +32,12 @@ def test_sparse_flashmla_metadata_smoke():
         topk=topk,
         is_fp8_kvcache=True,
     )
-    assert tile_md.dtype == torch.int32
-    assert num_splits.dtype == torch.int32
+    assert isinstance(sched_meta, fm.FlashMLASchedMeta)
+    assert num_splits is None
+    assert not sched_meta.have_initialized
+    assert sched_meta.config is None
+    assert sched_meta.tile_scheduler_metadata is None
+    assert sched_meta.num_splits is None
 
 
 def test_sparse_flashmla_decode_smoke():
