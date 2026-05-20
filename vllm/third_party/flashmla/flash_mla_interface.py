@@ -238,18 +238,38 @@ def flash_mla_sparse_fwd(
             if ok:
                 block_I = getattr(envs, "VLLM_SM70_TILELANG_SPARSE_PREFILL_BI",
                                   16)
+                num_stages = getattr(
+                    envs, "VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES", 1)
+                heads_per_block = getattr(
+                    envs,
+                    "VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK",
+                    64)
                 threads = getattr(
                     envs, "VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS", 128)
+                pv_gemm_policy = getattr(
+                    envs,
+                    "VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY",
+                    "full_row")
+                assume_valid_indices = getattr(
+                    envs,
+                    "VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES",
+                    False)
                 # Check cache before calling: if not cached, fall through to
                 # FlashMLA rather than JIT-stall inside a CUDA graph capture.
                 if is_tilelang_sparse_fwd_cached(
                         q, kv, indices, sm_scale, d_v,
                         attn_sink=attn_sink, topk_length=topk_length,
-                        out=out, block_I=block_I, threads=threads):
+                        out=out, block_I=block_I, num_stages=num_stages,
+                        heads_per_block=heads_per_block, threads=threads,
+                        pv_gemm_policy=pv_gemm_policy,
+                        assume_valid_indices=assume_valid_indices):
                     return flash_mla_sparse_fwd_tilelang(
                         q, kv, indices, sm_scale, d_v,
                         attn_sink=attn_sink, topk_length=topk_length, out=out,
-                        block_I=block_I, threads=threads)
+                        block_I=block_I, num_stages=num_stages,
+                        heads_per_block=heads_per_block, threads=threads,
+                        pv_gemm_policy=pv_gemm_policy,
+                        assume_valid_indices=assume_valid_indices)
                 import warnings
                 warnings.warn(
                     "TileLang sparse prefill cache miss for shape "

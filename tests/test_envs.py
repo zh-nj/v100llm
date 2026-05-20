@@ -113,19 +113,26 @@ def test_deepseek_v4_sm70_experimental_envs_are_registered() -> None:
         "VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE",
         "VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS",
         "VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT",
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY",
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES",
         "VLLM_SM70_HC_HEAD_CHUNK_MB",
         "VLLM_SM70_USE_SPARSE_PREFILL_V2",
+        "VLLM_SM70_USE_SPARSE_PREFILL_V2_MAPPED_FUSED",
+        "VLLM_SM70_USE_SPARSE_PREFILL_V2_CUDA_MAINLOOP",
+        "VLLM_SM70_USE_SPARSE_PREFILL_V2_MMA_MAINLOOP",
         "VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS",
         "VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE",
         "VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB",
         "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK",
         "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE",
+        "VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_TOPK",
+        "VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_BLOCK_K",
     }
 
     assert expected_envs.issubset(environment_variables)
 
 
-def test_sparse_indexer_streaming_topk_envs_default_off(
+def test_sparse_indexer_streaming_topk_envs_default_on(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv(
@@ -135,31 +142,62 @@ def test_sparse_indexer_streaming_topk_envs_default_off(
         "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE",
         raising=False,
     )
-
-    assert (
-        environment_variables["VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK"]()
-        is False
+    monkeypatch.delenv(
+        "VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_TOPK",
+        raising=False,
     )
+    monkeypatch.delenv(
+        "VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_BLOCK_K",
+        raising=False,
+    )
+
+    assert environment_variables["VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK"]()
     assert (
         environment_variables[
             "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE"
         ]()
         is False
     )
-
-
-def test_deepseek_v4_sparse_prefill_v2_envs_default_off(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("VLLM_SM70_USE_SPARSE_PREFILL_V2", raising=False)
-    monkeypatch.delenv("VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS", raising=False)
-    monkeypatch.delenv("VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE", raising=False)
-    monkeypatch.delenv(
-        "VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB",
-        raising=False,
+    assert (
+        environment_variables["VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_TOPK"]()
+        is False
+    )
+    assert (
+        environment_variables["VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_BLOCK_K"]()
+        == 128
     )
 
+
+def test_deepseek_v4_sparse_prefill_v2_envs_are_retired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "VLLM_SM70_USE_SPARSE_PREFILL_V2",
+        "VLLM_SM70_USE_SPARSE_PREFILL_V2_MAPPED_FUSED",
+        "VLLM_SM70_USE_SPARSE_PREFILL_V2_CUDA_MAINLOOP",
+        "VLLM_SM70_USE_SPARSE_PREFILL_V2_MMA_MAINLOOP",
+        "VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS",
+        "VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE",
+    ):
+        monkeypatch.setenv(name, "1")
+
     assert environment_variables["VLLM_SM70_USE_SPARSE_PREFILL_V2"]() is False
+    assert (
+        environment_variables["VLLM_SM70_USE_SPARSE_PREFILL_V2_MAPPED_FUSED"]()
+        is False
+    )
+    assert (
+        environment_variables[
+            "VLLM_SM70_USE_SPARSE_PREFILL_V2_CUDA_MAINLOOP"
+        ]()
+        is False
+    )
+    assert (
+        environment_variables[
+            "VLLM_SM70_USE_SPARSE_PREFILL_V2_MMA_MAINLOOP"
+        ]()
+        is False
+    )
     assert (
         environment_variables["VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS"]()
         is False
@@ -176,7 +214,23 @@ def test_deepseek_v4_sparse_prefill_v2_envs_default_off(
     monkeypatch.setenv("VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB", "32")
     assert (
         environment_variables["VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB"]()
-        == 32
+        == 64
+    )
+
+
+def test_tilelang_sparse_prefill_prewarm_uses_max_model_len_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT",
+        raising=False,
+    )
+
+    assert (
+        environment_variables[
+            "VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT"
+        ]()
+        == 0
     )
 
 

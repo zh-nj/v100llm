@@ -333,6 +333,358 @@ def test_streaming_topk_oracle_keeps_unbenched_topk_on_chunked_torch(
     assert calls == ["torch"]
 
 
+def test_streaming_topk_oracle_uses_fused_tile_path_when_enabled(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_prefill_streaming_topk as streaming_topk
+
+    monkeypatch.setattr(streaming_topk, "is_tilelang_available", lambda: (True, None))
+    monkeypatch.setattr(streaming_topk, "_is_sm70_tensor_device", lambda q: True)
+    monkeypatch.setattr(
+        streaming_topk.envs,
+        "VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_TOPK",
+        True,
+    )
+    monkeypatch.setattr(
+        streaming_topk.envs,
+        "VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_BLOCK_K",
+        128,
+    )
+    calls = []
+
+    def fake_blocked(**kwargs):
+        calls.append(("blocked", kwargs["block_k"]))
+
+    def fake_tilelang(**kwargs):
+        calls.append(("tilelang", None))
+
+    monkeypatch.setattr(
+        streaming_topk,
+        "_prefill_streaming_topk_blocked_tilelang",
+        fake_blocked,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        streaming_topk,
+        "_prefill_streaming_topk_chunked_tilelang",
+        fake_tilelang,
+    )
+
+    kwargs = _make_inputs()
+    kwargs["topk_tokens"] = 512
+    kwargs["tile_k"] = 1024
+    kwargs["threads"] = 256
+    streaming_topk._prefill_streaming_topk_oracle(**kwargs)
+
+    assert calls == [("blocked", 128)]
+
+
+def test_streaming_topk_blocked_path_does_not_materialize_full_tile_logits(
+    monkeypatch,
+):
+    import vllm.v1.attention.ops.tilelang_prefill_streaming_topk as streaming_topk
+
+    compute_spans = []
+
+    def fake_compute_tile_logits(
+        *,
+        q,
+        k_cache_values,
+        k_cache_scales,
+        weights,
+        row_starts,
+        row_ends,
+        tile_start,
+        tile_end,
+    ):
+        del q, k_cache_values, k_cache_scales, weights, row_starts, row_ends
+        compute_spans.append((tile_start, tile_end))
+        assert tile_end - tile_start <= 64
+        return torch.zeros((2, tile_end - tile_start), dtype=torch.float32)
+
+    def fake_update_from_scores(
+        *,
+        best_scores,
+        best_indices,
+        tile_scores,
+        row_starts,
+        tile_local_starts,
+        tile_abs_starts,
+        tile_lengths=None,
+        topk_tokens,
+        threads,
+    ):
+        del tile_scores, row_starts, tile_local_starts, tile_abs_starts
+        del tile_lengths
+        del topk_tokens, threads
+        return best_scores, best_indices
+
+    def fake_final_copy(**kwargs):
+        kwargs["out_indices"].fill_(-1)
+
+    def fail_tile_offsets(*args, **kwargs):
+        raise AssertionError("blocked fused path should not run tile logits top-k")
+
+    monkeypatch.setattr(streaming_topk, "_compute_tile_logits", fake_compute_tile_logits)
+    monkeypatch.setattr(
+        streaming_topk,
+        "_update_best_candidates_from_scores_tilelang",
+        fake_update_from_scores,
+        raising=False,
+    )
+    monkeypatch.setattr(streaming_topk, "_copy_final_indices_tilelang", fake_final_copy)
+    monkeypatch.setattr(streaming_topk, "_select_tile_offsets_tilelang", fail_tile_offsets)
+
+    kwargs = _make_inputs()
+    kwargs["k_cache_values"] = torch.empty((300, 16), dtype=torch.float16)
+    kwargs["k_cache_scales"] = torch.ones((300,), dtype=torch.float32)
+    kwargs["out_indices"] = torch.empty((2, 16), dtype=torch.int32)
+    kwargs["topk_tokens"] = 16
+
+    streaming_topk._prefill_streaming_topk_blocked_tilelang(
+        **kwargs,
+        tile_k=256,
+        block_k=64,
+        threads=256,
+    )
+
+    assert compute_spans == [
+        (0, 64),
+        (64, 128),
+        (128, 192),
+        (192, 256),
+        (256, 300),
+    ]
+
+
+def test_streaming_topk_blocked_fp16_path_uses_single_launch_block_update(
+    monkeypatch,
+):
+    import vllm.v1.attention.ops.tilelang_prefill_streaming_topk as streaming_topk
+
+    calls = []
+
+    def fail_compute_tile_logits(*args, **kwargs):
+        raise AssertionError("fp16 fused block path should not materialize logits")
+
+    def fail_update_from_scores(*args, **kwargs):
+        raise AssertionError("fp16 fused block path should not merge global logits")
+
+    def fake_block_update(**kwargs):
+        calls.append(
+            {
+                "span": (
+                    kwargs["block_start"],
+                    kwargs["block_start"] + kwargs["k_tile"].shape[0],
+                ),
+                "local_starts": kwargs["tile_local_starts"].clone(),
+                "lengths": kwargs["tile_lengths"].clone(),
+                "threads": kwargs["threads"],
+            }
+        )
+        return kwargs["best_scores"], kwargs["best_indices"]
+
+    def fake_final_copy(**kwargs):
+        kwargs["out_indices"].fill_(-1)
+
+    monkeypatch.setattr(
+        streaming_topk,
+        "_can_use_tilelang_block_candidate_update",
+        lambda q, k_cache_values: True,
+    )
+    monkeypatch.setattr(streaming_topk, "_compute_tile_logits", fail_compute_tile_logits)
+    monkeypatch.setattr(
+        streaming_topk,
+        "_update_best_candidates_from_scores_tilelang",
+        fail_update_from_scores,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        streaming_topk,
+        "_update_best_candidates_from_block_tilelang",
+        fake_block_update,
+        raising=False,
+    )
+    monkeypatch.setattr(streaming_topk, "_copy_final_indices_tilelang", fake_final_copy)
+
+    kwargs = _make_inputs()
+    kwargs["k_cache_values"] = torch.empty((300, 16), dtype=torch.float16)
+    kwargs["k_cache_scales"] = torch.ones((300,), dtype=torch.float32)
+    kwargs["row_starts"] = torch.tensor([0, 70], dtype=torch.int32)
+    kwargs["row_ends"] = torch.tensor([300, 190], dtype=torch.int32)
+    kwargs["out_indices"] = torch.empty((2, 16), dtype=torch.int32)
+    kwargs["topk_tokens"] = 16
+
+    streaming_topk._prefill_streaming_topk_blocked_tilelang(
+        **kwargs,
+        tile_k=256,
+        block_k=64,
+        threads=256,
+    )
+
+    assert [call["span"] for call in calls] == [
+        (0, 64),
+        (64, 128),
+        (128, 192),
+        (192, 256),
+        (256, 300),
+    ]
+    assert calls[0]["threads"] == 128
+    torch.testing.assert_close(
+        calls[1]["local_starts"],
+        torch.tensor([0, 6], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        calls[1]["lengths"],
+        torch.tensor([64, 58], dtype=torch.int32),
+    )
+
+
+def test_streaming_topk_dense_block_skips_tile_local_topk(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_prefill_streaming_topk as streaming_topk
+
+    calls = []
+
+    def fail_prefill_topk(*args, **kwargs):
+        raise AssertionError("dense block path should not run tile-local top-k")
+
+    def fake_update_kernel(topk_tokens, tile_keep, threads):
+        calls.append(("get_update", topk_tokens, tile_keep, threads))
+
+        def fake_kernel(*args):
+            calls.append(("run_update", len(args)))
+            next_scores = args[-2]
+            next_indices = args[-1]
+            next_scores.fill_(3.0)
+            next_indices.fill_(4)
+
+        return fake_kernel
+
+    def fake_dense_offsets(tile_keep, threads):
+        calls.append(("get_dense_offsets", tile_keep, threads))
+
+        def fake_kernel(tile_local_starts, tile_lengths, tile_offsets):
+            del tile_local_starts
+            calls.append(("run_dense_offsets", tuple(tile_lengths.tolist())))
+            tile_offsets.fill_(-1)
+            for row in range(tile_offsets.shape[0]):
+                length = int(tile_lengths[row].item())
+                tile_offsets[row, :length] = torch.arange(
+                    length,
+                    dtype=tile_offsets.dtype,
+                )
+
+        return fake_kernel
+
+    monkeypatch.setattr(streaming_topk, "prefill_topk_tilelang", fail_prefill_topk)
+    monkeypatch.setattr(
+        streaming_topk,
+        "_get_dense_tile_offsets_kernel",
+        fake_dense_offsets,
+    )
+    monkeypatch.setattr(
+        streaming_topk,
+        "_get_fused_candidate_update_kernel",
+        fake_update_kernel,
+    )
+
+    best_scores = torch.full((2, 16), -torch.inf, dtype=torch.float32)
+    best_indices = torch.full((2, 16), -1, dtype=torch.int32)
+    tile_scores = torch.zeros((2, 8), dtype=torch.float32)
+    row_starts = torch.tensor([0, 5], dtype=torch.int32)
+    tile_local_starts = torch.tensor([0, 3], dtype=torch.int32)
+    tile_abs_starts = torch.tensor([100, 103], dtype=torch.int32)
+    tile_lengths = torch.tensor([8, 5], dtype=torch.int32)
+
+    next_scores, next_indices = (
+        streaming_topk._update_best_candidates_from_scores_tilelang(
+            best_scores=best_scores,
+            best_indices=best_indices,
+            tile_scores=tile_scores,
+            row_starts=row_starts,
+            tile_local_starts=tile_local_starts,
+            tile_abs_starts=tile_abs_starts,
+            tile_lengths=tile_lengths,
+            topk_tokens=16,
+            threads=256,
+        )
+    )
+
+    assert calls == [
+        ("get_dense_offsets", 8, 256),
+        ("run_dense_offsets", (8, 5)),
+        ("get_update", 16, 8, 256),
+        ("run_update", 9),
+    ]
+    assert torch.all(next_scores == 3.0)
+    assert torch.all(next_indices == 4)
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch.float8_e4m3fn is required")
+def test_streaming_topk_fp8_blocked_path_uses_fused_block_update(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_prefill_streaming_topk as streaming_topk
+
+    calls = []
+
+    def fail_compute_tile_logits(*args, **kwargs):
+        raise AssertionError("fp8 blocked path should not materialize block logits")
+
+    def fake_block_update(**kwargs):
+        calls.append(
+            (
+                kwargs["block_start"],
+                kwargs["block_start"] + kwargs["k_tile"].shape[0],
+                kwargs["q"].shape[1],
+            )
+        )
+        return kwargs["best_scores"], kwargs["best_indices"]
+
+    def fake_final_copy(**kwargs):
+        kwargs["out_indices"].fill_(-1)
+
+    monkeypatch.setattr(streaming_topk, "_compute_tile_logits", fail_compute_tile_logits)
+    monkeypatch.setattr(
+        streaming_topk,
+        "_can_use_tilelang_block_candidate_update",
+        lambda q, k_cache_values: True,
+    )
+    monkeypatch.setattr(
+        streaming_topk,
+        "_update_best_candidates_from_block_tilelang",
+        fake_block_update,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        streaming_topk,
+        "sm70_fp8_mqa_block_candidate_update",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("TileLang tensorcore block update should handle fp8")
+        ),
+    )
+    monkeypatch.setattr(streaming_topk, "_copy_final_indices_tilelang", fake_final_copy)
+
+    kwargs = _make_inputs()
+    kwargs["q"] = torch.empty((2, 16, 16), dtype=torch.float8_e4m3fn)
+    kwargs["k_cache_values"] = torch.empty((300, 16), dtype=torch.float8_e4m3fn)
+    kwargs["k_cache_scales"] = torch.ones((300,), dtype=torch.float32)
+    kwargs["weights"] = torch.ones((2, 16), dtype=torch.float32)
+    kwargs["out_indices"] = torch.empty((2, 16), dtype=torch.int32)
+    kwargs["topk_tokens"] = 16
+
+    streaming_topk._prefill_streaming_topk_blocked_tilelang(
+        **kwargs,
+        tile_k=256,
+        block_k=64,
+        threads=256,
+    )
+
+    assert calls == [
+        (0, 64, 16),
+        (64, 128, 16),
+        (128, 192, 16),
+        (192, 256, 16),
+        (256, 300, 16),
+    ]
+
+
 def test_streaming_topk_chunked_torch_fills_short_rows_with_minus_one():
     from vllm.v1.attention.ops.tilelang_prefill_streaming_topk import (
         _prefill_streaming_topk_chunked_torch,
@@ -483,6 +835,550 @@ def test_streaming_topk_tilelang_candidate_loop_matches_full_logits_cuda():
         end = int(row_ends[row].item())
         expected = logits[row, start:end].topk(topk_tokens).indices.to(torch.int32)
         assert set(out_indices[row].tolist()) == set(expected.tolist())
+
+
+@pytest.mark.skipif(
+    not _has_sm70_cuda(),
+    reason="SM70 CUDA is required for blocked TileLang streaming top-k",
+)
+@torch.inference_mode()
+def test_streaming_topk_blocked_tilelang_matches_full_logits_cuda():
+    from vllm.v1.attention.ops.tilelang_prefill_topk import is_tilelang_available
+    from vllm.v1.attention.ops.tilelang_prefill_streaming_topk import (
+        _prefill_streaming_topk_blocked_tilelang,
+    )
+
+    ok, reason = is_tilelang_available()
+    if not ok:
+        pytest.skip(reason)
+
+    torch.manual_seed(20260521)
+    device = torch.device("cuda")
+    rows = 4
+    heads = 3
+    dim = 16
+    kv_tokens = 300
+    topk_tokens = 16
+    q = torch.randn((rows, heads, dim), dtype=torch.float16, device=device)
+    k_cache_values = torch.randn(
+        (kv_tokens, dim), dtype=torch.float16, device=device
+    )
+    k_cache_scales = torch.linspace(
+        0.75, 1.25, kv_tokens, dtype=torch.float32, device=device
+    )
+    weights = torch.randn((rows, heads), dtype=torch.float32, device=device)
+    row_starts = torch.tensor([0, 11, 93, 250], dtype=torch.int32, device=device)
+    row_ends = torch.tensor([129, 256, 127, 257], dtype=torch.int32, device=device)
+    out_indices = torch.empty((rows, topk_tokens), dtype=torch.int32, device=device)
+
+    _prefill_streaming_topk_blocked_tilelang(
+        q=q,
+        k_cache_values=k_cache_values,
+        k_cache_scales=k_cache_scales,
+        weights=weights,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        out_indices=out_indices,
+        topk_tokens=topk_tokens,
+        tile_k=128,
+        block_k=64,
+        threads=256,
+    )
+
+    k_f32 = k_cache_values.float() * k_cache_scales.view(-1, 1)
+    score = torch.einsum("mhd,nd->hmn", q.float(), k_f32)
+    logits = (
+        score.relu() * weights.float().transpose(0, 1).unsqueeze(-1)
+    ).sum(dim=0)
+
+    for row in range(rows):
+        start = int(row_starts[row].item())
+        end = int(row_ends[row].item())
+        valid_count = min(topk_tokens, end - start)
+        if valid_count:
+            expected_scores = logits[row, start:end].topk(valid_count).values
+            got = out_indices[row, :valid_count]
+            assert got.min().item() >= 0
+            assert got.max().item() < end - start
+            assert torch.unique(got).numel() == valid_count
+            got_scores = logits[row, start + got.to(torch.int64)]
+            threshold = expected_scores[-1]
+            assert torch.all(got_scores >= threshold - 1e-5)
+        assert torch.all(out_indices[row, valid_count:] == -1)
+
+
+@pytest.mark.skipif(
+    not _has_sm70_cuda() or not _HAS_FP8,
+    reason="SM70 CUDA with torch.float8_e4m3fn is required",
+)
+@torch.inference_mode()
+def test_streaming_topk_fp8_blocked_fused_path_matches_full_logits_cuda():
+    from vllm.v1.attention.ops.tilelang_prefill_topk import is_tilelang_available
+    from vllm.v1.attention.ops.tilelang_prefill_streaming_topk import (
+        _prefill_streaming_topk_blocked_tilelang,
+    )
+
+    ok, reason = is_tilelang_available()
+    if not ok:
+        pytest.skip(reason)
+
+    torch.manual_seed(20260523)
+    device = torch.device("cuda")
+    rows = 3
+    heads = 3
+    dim = 16
+    kv_tokens = 92
+    topk_tokens = 16
+    q = torch.randn((rows, heads, dim), dtype=torch.float16, device=device).to(
+        torch.float8_e4m3fn
+    )
+    k_cache_values = torch.randn(
+        (kv_tokens, dim), dtype=torch.float16, device=device
+    ).to(torch.float8_e4m3fn)
+    k_cache_scales = torch.linspace(
+        0.75,
+        1.25,
+        kv_tokens,
+        dtype=torch.float32,
+        device=device,
+    )
+    weights = torch.randn((rows, heads), dtype=torch.float32, device=device)
+    row_starts = torch.tensor([0, 11, 50], dtype=torch.int32, device=device)
+    row_ends = torch.tensor([80, 92, 58], dtype=torch.int32, device=device)
+    out_indices = torch.empty((rows, topk_tokens), dtype=torch.int32, device=device)
+
+    _prefill_streaming_topk_blocked_tilelang(
+        q=q,
+        k_cache_values=k_cache_values,
+        k_cache_scales=k_cache_scales,
+        weights=weights,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        out_indices=out_indices,
+        topk_tokens=topk_tokens,
+        tile_k=64,
+        block_k=16,
+        threads=256,
+    )
+
+    k_f32 = k_cache_values.float() * k_cache_scales.view(-1, 1)
+    score = torch.einsum("mhd,nd->hmn", q.float(), k_f32)
+    logits = (
+        score.relu() * weights.float().transpose(0, 1).unsqueeze(-1)
+    ).sum(dim=0)
+
+    for row in range(rows):
+        start = int(row_starts[row].item())
+        end = int(row_ends[row].item())
+        valid_count = min(topk_tokens, end - start)
+        if valid_count:
+            expected_scores = logits[row, start:end].topk(valid_count).values
+            got = out_indices[row, :valid_count]
+            assert got.min().item() >= 0
+            assert got.max().item() < end - start
+            assert torch.unique(got).numel() == valid_count
+            got_scores = logits[row, start + got.to(torch.int64)]
+            threshold = expected_scores[-1]
+            assert torch.all(got_scores >= threshold - 1e-5)
+        assert torch.all(out_indices[row, valid_count:] == -1)
+
+
+@pytest.mark.skipif(
+    not _has_sm70_cuda(),
+    reason="SM70 CUDA is required for TileLang block GEMM logits",
+)
+@torch.inference_mode()
+def test_streaming_topk_tilelang_block_logits_matches_torch_cuda():
+    from vllm.v1.attention.ops.tilelang_prefill_topk import is_tilelang_available
+    from vllm.v1.attention.ops.tilelang_prefill_streaming_topk import (
+        _compute_block_logits_tilelang,
+    )
+
+    ok, reason = is_tilelang_available()
+    if not ok:
+        pytest.skip(reason)
+
+    torch.manual_seed(20260526)
+    device = torch.device("cuda")
+    rows = 5
+    heads = 4
+    dim = 32
+    block_n = 16
+    q = torch.randn((rows, heads, dim), dtype=torch.float16, device=device)
+    k_tile = torch.randn((block_n, dim), dtype=torch.float16, device=device)
+    k_scales = torch.linspace(0.8, 1.2, block_n, dtype=torch.float32, device=device)
+    weights = torch.randn((rows, heads), dtype=torch.float32, device=device)
+    tile_local_starts = torch.tensor([0, 3, 7, 16, 2], dtype=torch.int32, device=device)
+    tile_lengths = torch.tensor([16, 9, 4, 0, 12], dtype=torch.int32, device=device)
+
+    logits = _compute_block_logits_tilelang(
+        q=q,
+        k_tile=k_tile,
+        k_scales=k_scales,
+        weights=weights,
+        tile_local_starts=tile_local_starts,
+        tile_lengths=tile_lengths,
+        block_m=8,
+        block_d=16,
+        threads=128,
+    )
+
+    k_f32 = k_tile.float() * k_scales.view(-1, 1)
+    score = torch.einsum("mhd,nd->hmn", q.float(), k_f32)
+    expected = (
+        score.relu() * weights.float().transpose(0, 1).unsqueeze(-1)
+    ).sum(dim=0)
+    cols = torch.arange(block_n, device=device).view(1, -1)
+    valid = (cols >= tile_local_starts.view(-1, 1)) & (
+        cols < (tile_local_starts + tile_lengths).view(-1, 1)
+    )
+    expected = expected.masked_fill(~valid, -torch.inf)
+
+    finite = torch.isfinite(expected)
+    torch.testing.assert_close(
+        logits[finite],
+        expected[finite],
+        rtol=3e-2,
+        atol=3e-2,
+    )
+    assert torch.isneginf(logits[~finite]).all()
+
+
+@pytest.mark.skipif(
+    not _has_sm70_cuda(),
+    reason="SM70 CUDA is required for TileLang fused block GEMM candidate update",
+)
+@torch.inference_mode()
+def test_streaming_topk_tilelang_block_gemm_candidate_update_matches_torch_cuda():
+    from vllm.v1.attention.ops.tilelang_prefill_topk import is_tilelang_available
+    from vllm.v1.attention.ops.tilelang_prefill_streaming_topk import (
+        _update_best_candidates_from_block_tilelang,
+    )
+
+    ok, reason = is_tilelang_available()
+    if not ok:
+        pytest.skip(reason)
+
+    torch.manual_seed(20260527)
+    device = torch.device("cuda")
+    rows = 5
+    heads = 4
+    dim = 32
+    block_n = 16
+    topk_tokens = 8
+    block_start = 32
+    q = torch.randn((rows, heads, dim), dtype=torch.float16, device=device)
+    k_tile = torch.randn((block_n, dim), dtype=torch.float16, device=device)
+    k_scales = torch.linspace(0.9, 1.1, block_n, dtype=torch.float32, device=device)
+    weights = torch.randn((rows, heads), dtype=torch.float32, device=device)
+    row_starts = torch.tensor([24, 30, 31, 40, 34], dtype=torch.int32, device=device)
+    tile_local_starts = torch.tensor(
+        [0, 0, 0, 8, 2], dtype=torch.int32, device=device
+    )
+    tile_lengths = torch.tensor(
+        [16, 15, 12, 4, 10], dtype=torch.int32, device=device
+    )
+    best_scores = torch.randn((rows, topk_tokens), dtype=torch.float32, device=device)
+    best_indices = torch.arange(
+        rows * topk_tokens,
+        dtype=torch.int32,
+        device=device,
+    ).view(rows, topk_tokens)
+
+    next_scores, next_indices = _update_best_candidates_from_block_tilelang(
+        q=q,
+        k_tile=k_tile,
+        k_scales=k_scales,
+        weights=weights,
+        best_scores=best_scores,
+        best_indices=best_indices,
+        row_starts=row_starts,
+        tile_local_starts=tile_local_starts,
+        tile_lengths=tile_lengths,
+        block_start=block_start,
+        topk_tokens=topk_tokens,
+        block_m=8,
+        block_d=16,
+        threads=128,
+    )
+
+    k_f32 = k_tile.float() * k_scales.view(-1, 1)
+    score = torch.einsum("mhd,nd->hmn", q.float(), k_f32)
+    block_logits = (
+        score.relu() * weights.float().transpose(0, 1).unsqueeze(-1)
+    ).sum(dim=0)
+
+    for row in range(rows):
+        start = int(tile_local_starts[row].item())
+        end = start + int(tile_lengths[row].item())
+        valid_scores = block_logits[row, start:end]
+        valid_indices = (
+            torch.arange(start, end, dtype=torch.int32, device=device)
+            + block_start
+            - row_starts[row]
+        )
+        merged_scores = torch.cat((best_scores[row], valid_scores), dim=0)
+        merged_indices = torch.cat((best_indices[row], valid_indices), dim=0)
+        expected_scores, keep = merged_scores.topk(topk_tokens)
+        expected_indices = merged_indices.gather(0, keep)
+        assert torch.all(next_scores[row] >= expected_scores[-1] - 1e-5)
+        assert set(next_indices[row].tolist()) == set(expected_indices.tolist())
+
+
+@pytest.mark.skipif(
+    not _has_sm70_cuda(),
+    reason="SM70 CUDA is required for TileLang fused block GEMM candidate update",
+)
+@torch.inference_mode()
+def test_streaming_topk_tilelang_block_candidate_update_topk_gt_threads_cuda():
+    from vllm.v1.attention.ops.tilelang_prefill_topk import is_tilelang_available
+    from vllm.v1.attention.ops.tilelang_prefill_streaming_topk import (
+        _update_best_candidates_from_block_tilelang,
+    )
+
+    ok, reason = is_tilelang_available()
+    if not ok:
+        pytest.skip(reason)
+
+    torch.manual_seed(20260530)
+    device = torch.device("cuda")
+    rows = 2
+    heads = 2
+    dim = 16
+    block_n = 16
+    topk_tokens = 512
+    block_start = 2048
+    q = torch.randn((rows, heads, dim), dtype=torch.float16, device=device)
+    k_tile = torch.randn((block_n, dim), dtype=torch.float16, device=device)
+    k_scales = torch.linspace(0.75, 1.25, block_n, dtype=torch.float32, device=device)
+    weights = torch.randn((rows, heads), dtype=torch.float32, device=device)
+    row_starts = torch.tensor([0, 1536], dtype=torch.int32, device=device)
+    tile_local_starts = torch.tensor([0, 4], dtype=torch.int32, device=device)
+    tile_lengths = torch.tensor([16, 8], dtype=torch.int32, device=device)
+    best_scores = torch.full(
+        (rows, topk_tokens),
+        -torch.inf,
+        dtype=torch.float32,
+        device=device,
+    )
+    best_indices = torch.full(
+        (rows, topk_tokens),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    next_scores, next_indices = _update_best_candidates_from_block_tilelang(
+        q=q,
+        k_tile=k_tile,
+        k_scales=k_scales,
+        weights=weights,
+        best_scores=best_scores,
+        best_indices=best_indices,
+        row_starts=row_starts,
+        tile_local_starts=tile_local_starts,
+        tile_lengths=tile_lengths,
+        block_start=block_start,
+        topk_tokens=topk_tokens,
+        block_m=8,
+        block_d=16,
+        threads=128,
+    )
+
+    k_f32 = k_tile.float() * k_scales.view(-1, 1)
+    score = torch.einsum("mhd,nd->hmn", q.float(), k_f32)
+    block_logits = (
+        score.relu() * weights.float().transpose(0, 1).unsqueeze(-1)
+    ).sum(dim=0)
+
+    for row in range(rows):
+        start = int(tile_local_starts[row].item())
+        end = start + int(tile_lengths[row].item())
+        valid_scores = block_logits[row, start:end]
+        valid_indices = (
+            torch.arange(start, end, dtype=torch.int32, device=device)
+            + block_start
+            - row_starts[row]
+        )
+        valid_count = end - start
+        assert set(next_indices[row, :valid_count].tolist()) == set(
+            valid_indices.tolist()
+        )
+        assert torch.all(next_indices[row, valid_count:] == -1)
+        got_scores = next_scores[row, :valid_count]
+        local_cols = (
+            next_indices[row, :valid_count].to(torch.int64)
+            - int(block_start - row_starts[row].item())
+        )
+        expected_scores = valid_scores[local_cols - start]
+        torch.testing.assert_close(
+            got_scores,
+            expected_scores,
+            rtol=3e-2,
+            atol=3e-2,
+        )
+
+
+@pytest.mark.skipif(
+    not _has_sm70_cuda() or not _HAS_FP8,
+    reason="SM70 CUDA with torch.float8_e4m3fn is required",
+)
+@torch.inference_mode()
+def test_streaming_topk_tilelang_fp8_block_candidate_update_matches_torch_cuda():
+    from vllm.v1.attention.ops.tilelang_prefill_topk import is_tilelang_available
+    from vllm.v1.attention.ops.tilelang_prefill_streaming_topk import (
+        _update_best_candidates_from_block_tilelang,
+    )
+
+    ok, reason = is_tilelang_available()
+    if not ok:
+        pytest.skip(reason)
+
+    torch.manual_seed(20260528)
+    device = torch.device("cuda")
+    rows = 3
+    heads = 12
+    dim = 32
+    block_n = 16
+    topk_tokens = 8
+    block_start = 64
+    q = torch.randn((rows, heads, dim), dtype=torch.float16, device=device).to(
+        torch.float8_e4m3fn
+    )
+    k_tile = torch.randn((block_n, dim), dtype=torch.float16, device=device).to(
+        torch.float8_e4m3fn
+    )
+    k_scales = torch.linspace(0.85, 1.15, block_n, dtype=torch.float32, device=device)
+    weights = torch.randn((rows, heads), dtype=torch.float32, device=device)
+    row_starts = torch.tensor([60, 64, 70], dtype=torch.int32, device=device)
+    tile_local_starts = torch.tensor([0, 0, 6], dtype=torch.int32, device=device)
+    tile_lengths = torch.tensor([16, 9, 7], dtype=torch.int32, device=device)
+    best_scores = torch.randn((rows, topk_tokens), dtype=torch.float32, device=device)
+    best_indices = torch.arange(
+        rows * topk_tokens,
+        dtype=torch.int32,
+        device=device,
+    ).view(rows, topk_tokens)
+
+    next_scores, next_indices = _update_best_candidates_from_block_tilelang(
+        q=q,
+        k_tile=k_tile,
+        k_scales=k_scales,
+        weights=weights,
+        best_scores=best_scores,
+        best_indices=best_indices,
+        row_starts=row_starts,
+        tile_local_starts=tile_local_starts,
+        tile_lengths=tile_lengths,
+        block_start=block_start,
+        topk_tokens=topk_tokens,
+        block_m=8,
+        block_d=16,
+        threads=128,
+    )
+
+    k_f32 = k_tile.float() * k_scales.view(-1, 1)
+    score = torch.einsum("mhd,nd->hmn", q.float(), k_f32)
+    block_logits = (
+        score.relu() * weights.float().transpose(0, 1).unsqueeze(-1)
+    ).sum(dim=0)
+
+    for row in range(rows):
+        start = int(tile_local_starts[row].item())
+        end = start + int(tile_lengths[row].item())
+        valid_scores = block_logits[row, start:end]
+        valid_indices = (
+            torch.arange(start, end, dtype=torch.int32, device=device)
+            + block_start
+            - row_starts[row]
+        )
+        merged_scores = torch.cat((best_scores[row], valid_scores), dim=0)
+        merged_indices = torch.cat((best_indices[row], valid_indices), dim=0)
+        expected_scores, keep = merged_scores.topk(topk_tokens)
+        expected_indices = merged_indices.gather(0, keep)
+        assert torch.all(next_scores[row] >= expected_scores[-1] - 5e-2)
+        assert set(next_indices[row].tolist()) == set(expected_indices.tolist())
+
+
+@pytest.mark.skipif(
+    not _has_sm70_cuda() or not _HAS_FP8,
+    reason="SM70 CUDA with torch.float8_e4m3fn is required",
+)
+@torch.inference_mode()
+def test_sm70_fp8_mqa_block_candidate_update_matches_torch_cuda():
+    from vllm.model_executor.layers.sm70_mqa_logits import (
+        sm70_fp8_mqa_block_candidate_update,
+    )
+
+    torch.manual_seed(20260522)
+    device = torch.device("cuda")
+    rows = 2
+    heads = 3
+    dim = 16
+    kv_tokens = 48
+    topk_tokens = 16
+    block_start = 17
+    block_end = 25
+    q = torch.randn((rows, heads, dim), dtype=torch.float16, device=device).to(
+        torch.float8_e4m3fn
+    )
+    k_cache_values = torch.randn(
+        (kv_tokens, dim), dtype=torch.float16, device=device
+    ).to(torch.float8_e4m3fn)
+    k_cache_scales = torch.linspace(
+        0.8,
+        1.2,
+        kv_tokens,
+        dtype=torch.float32,
+        device=device,
+    )
+    weights = torch.randn((rows, heads), dtype=torch.float32, device=device)
+    row_starts = torch.tensor([0, 19], dtype=torch.int32, device=device)
+    row_ends = torch.tensor([40, 24], dtype=torch.int32, device=device)
+    best_scores = torch.randn((rows, topk_tokens), dtype=torch.float32, device=device)
+    best_indices = torch.arange(
+        rows * topk_tokens,
+        dtype=torch.int32,
+        device=device,
+    ).view(rows, topk_tokens)
+
+    next_scores, next_indices = sm70_fp8_mqa_block_candidate_update(
+        q=q,
+        kv=(k_cache_values, k_cache_scales),
+        weights=weights,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        best_scores=best_scores,
+        best_indices=best_indices,
+        block_start=block_start,
+        block_end=block_end,
+        topk_tokens=topk_tokens,
+    )
+
+    k_f32 = k_cache_values.float() * k_cache_scales.view(-1, 1)
+    score = torch.einsum("mhd,nd->hmn", q.float(), k_f32[block_start:block_end])
+    block_logits = (
+        score.relu() * weights.float().transpose(0, 1).unsqueeze(-1)
+    ).sum(dim=0)
+
+    for row in range(rows):
+        local_start = max(0, int(row_starts[row].item()) - block_start)
+        local_end = min(block_end - block_start, int(row_ends[row].item()) - block_start)
+        valid_block_scores = block_logits[row, local_start:local_end]
+        valid_block_indices = (
+            torch.arange(local_start, local_end, dtype=torch.int32, device=device)
+            + block_start
+            - row_starts[row]
+        )
+        merged_scores = torch.cat((best_scores[row], valid_block_scores), dim=0)
+        merged_indices = torch.cat((best_indices[row], valid_block_indices), dim=0)
+        expected_scores, keep = merged_scores.topk(topk_tokens)
+        expected_indices = merged_indices.gather(0, keep)
+        got_scores = next_scores[row]
+        got_indices = next_indices[row]
+        threshold = expected_scores[-1]
+        assert torch.all(got_scores >= threshold - 1e-5)
+        assert set(got_indices.tolist()) == set(expected_indices.tolist())
 
 
 @pytest.mark.skipif(

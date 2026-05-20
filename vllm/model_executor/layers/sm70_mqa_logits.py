@@ -43,6 +43,27 @@ def _decode_fp8_e4m3fn(uint8_val):
 
 
 @triton.jit
+def _fp32_to_ordered_key(x):
+    bits = x.to(tl.uint32, bitcast=True)
+    mask = tl.where(
+        (bits & 0x80000000) != 0,
+        0xFFFFFFFF,
+        0x80000000,
+    )
+    return bits ^ mask
+
+
+@triton.jit
+def _ordered_key_to_fp32(key):
+    bits = key ^ tl.where(
+        (key & 0x80000000) == 0,
+        0xFFFFFFFF,
+        0x80000000,
+    )
+    return bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
 def _sm70_fp8_paged_mqa_logits_kernel(
     # Q: [B, next_n, H, D] as uint8 (fp8 e4m3fn)
     q_ptr,
@@ -286,6 +307,203 @@ def sm70_fp8_paged_mqa_logits(
         BLOCK_D=BLOCK_D,
     )
     return logits
+
+
+@triton.jit
+def _sm70_fp8_mqa_block_candidate_update_kernel(
+    # Q: [M, H, D] as uint8
+    q_ptr,
+    q_stride_m,
+    q_stride_h,
+    # K: [N, D] as uint8
+    k_ptr,
+    k_stride_n,
+    # K scale: [N] float32
+    k_scale_ptr,
+    # weights: [M, H] float32
+    weights_ptr,
+    weights_stride_m,
+    # row ranges: [M] int32
+    row_starts_ptr,
+    row_ends_ptr,
+    # previous/final candidates: [M, TOPK]
+    best_scores_ptr,
+    best_indices_ptr,
+    next_scores_ptr,
+    next_indices_ptr,
+    block_start,
+    M,
+    HEAD_DIM: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    TOPK: tl.constexpr,
+    CANDIDATE_PAD: tl.constexpr,
+):
+    """Fused fp8 MQA block logits + candidate merge.
+
+    This is the first single-launch building block for streaming prefill top-k:
+    one program computes all candidate scores for one query row and one KV block,
+    merges them with the existing per-row best candidates, and writes the next
+    candidate state.  It avoids materializing [rows, block_k] logits.
+    """
+    pid_m = tl.program_id(0)
+    if pid_m >= M:
+        return
+
+    cand = tl.arange(0, CANDIDATE_PAD)
+    is_best = cand < TOPK
+    block_offset_raw = cand - TOPK
+    in_block = (cand >= TOPK) & (block_offset_raw < BLOCK_N)
+    block_offset = tl.where(in_block, block_offset_raw, 0)
+    k_pos = block_start + block_offset
+
+    row_start = tl.load(row_starts_ptr + pid_m)
+    row_end = tl.load(row_ends_ptr + pid_m)
+    valid_block = in_block & (k_pos >= row_start) & (k_pos < row_end)
+
+    q_base_m = q_ptr + pid_m * q_stride_m
+    weights_base = weights_ptr + pid_m * weights_stride_m
+    block_logits = tl.zeros((CANDIDATE_PAD,), dtype=tl.float32)
+
+    NUM_D_CHUNKS: tl.constexpr = HEAD_DIM // BLOCK_D
+    for h in tl.static_range(NUM_HEADS):
+        h_score = tl.zeros((CANDIDATE_PAD,), dtype=tl.float32)
+        for d_chunk in tl.static_range(NUM_D_CHUNKS):
+            d_off = d_chunk * BLOCK_D
+            d_range = d_off + tl.arange(0, BLOCK_D)
+
+            k_u8 = tl.load(
+                k_ptr + k_pos[:, None] * k_stride_n + d_range[None, :],
+                mask=valid_block[:, None],
+                other=0,
+            )
+            k_scale = tl.load(k_scale_ptr + k_pos, mask=valid_block, other=0.0)
+            k_f32 = _decode_fp8_e4m3fn(k_u8) * k_scale[:, None]
+
+            q_u8 = tl.load(q_base_m + h * q_stride_h + d_range)
+            q_f32 = _decode_fp8_e4m3fn(q_u8)
+            h_score += tl.sum(k_f32 * q_f32[None, :], axis=1)
+
+        weight = tl.load(weights_base + h)
+        block_logits += tl.maximum(h_score, 0.0) * weight
+
+    block_logits = tl.where(valid_block, block_logits, float("-inf"))
+    best_scores = tl.load(
+        best_scores_ptr + pid_m * TOPK + cand,
+        mask=is_best,
+        other=float("-inf"),
+    )
+    candidate_scores = tl.where(is_best, best_scores, block_logits)
+
+    score_key = _fp32_to_ordered_key(candidate_scores)
+    # Tie-break toward lower candidate positions for deterministic tests. The
+    # low 16 bits are enough for the supported candidate widths.
+    pos_key = (CANDIDATE_PAD - cand).to(tl.uint64)
+    packed = (score_key.to(tl.uint64) << 16) | pos_key
+    sorted_packed = tl.sort(packed, descending=True)
+
+    rank = cand
+    selected_pos = CANDIDATE_PAD - (sorted_packed & 0xFFFF).to(tl.int32)
+    selected_score_key = (sorted_packed >> 16).to(tl.uint32)
+    selected_score = _ordered_key_to_fp32(selected_score_key)
+    selected_is_best = selected_pos < TOPK
+    selected_block_offset = selected_pos - TOPK
+    best_index = tl.load(
+        best_indices_ptr + pid_m * TOPK + selected_pos,
+        mask=selected_is_best,
+        other=-1,
+    )
+    block_index = block_start + selected_block_offset - row_start
+    selected_index = tl.where(selected_is_best, best_index, block_index)
+
+    tl.store(
+        next_scores_ptr + pid_m * TOPK + rank,
+        selected_score,
+        mask=rank < TOPK,
+    )
+    tl.store(
+        next_indices_ptr + pid_m * TOPK + rank,
+        selected_index,
+        mask=rank < TOPK,
+    )
+
+
+def _next_power_of_2(value: int) -> int:
+    return 1 << (value - 1).bit_length()
+
+
+def sm70_fp8_mqa_block_candidate_update(
+    *,
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    best_scores: torch.Tensor,
+    best_indices: torch.Tensor,
+    block_start: int,
+    block_end: int,
+    topk_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-launch fp8 MQA block logits + candidate merge for SM70."""
+    k_fp8, k_scale = kv
+    if not (
+        q.is_cuda
+        and k_fp8.is_cuda
+        and k_scale.is_cuda
+        and weights.is_cuda
+        and row_starts.is_cuda
+        and row_ends.is_cuda
+        and best_scores.is_cuda
+        and best_indices.is_cuda
+    ):
+        raise ValueError("sm70 fp8 block candidate update expects CUDA tensors")
+    if q.dtype not in (torch.float8_e4m3fn, getattr(torch, "float8_e4m3fnuz", None)):
+        raise ValueError("q must be fp8")
+    if k_fp8.dtype != q.dtype:
+        raise ValueError("k cache values must use the same fp8 dtype as q")
+    if best_scores.dtype is not torch.float32 or best_indices.dtype is not torch.int32:
+        raise ValueError("best candidates must be fp32 scores and int32 indices")
+    if topk_tokens != best_scores.shape[1] or topk_tokens != best_indices.shape[1]:
+        raise ValueError("topk_tokens must match best candidate width")
+    if block_end <= block_start:
+        raise ValueError("block_end must be greater than block_start")
+
+    rows, num_heads, head_dim = q.shape
+    block_n = block_end - block_start
+    candidate_pad = _next_power_of_2(topk_tokens + block_n)
+    block_d = min(_sm70_mqa_block_d(head_dim), 16)
+    next_scores = torch.empty_like(best_scores)
+    next_indices = torch.empty_like(best_indices)
+    q_u8 = q.view(torch.uint8)
+    k_u8 = k_fp8.view(torch.uint8)
+    _sm70_fp8_mqa_block_candidate_update_kernel[(rows,)](
+        q_u8,
+        q_u8.stride(0),
+        q_u8.stride(1),
+        k_u8,
+        k_u8.stride(0),
+        k_scale.reshape(-1),
+        weights,
+        weights.stride(0),
+        row_starts,
+        row_ends,
+        best_scores,
+        best_indices,
+        next_scores,
+        next_indices,
+        block_start,
+        rows,
+        HEAD_DIM=head_dim,
+        NUM_HEADS=num_heads,
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        TOPK=topk_tokens,
+        CANDIDATE_PAD=candidate_pad,
+        num_warps=8,
+    )
+    return next_scores, next_indices
 
 
 def _sm70_paged_mqa_logits_grid(num_rows: int, max_model_len: int) -> tuple[int]:

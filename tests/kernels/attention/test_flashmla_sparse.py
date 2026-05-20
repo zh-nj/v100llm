@@ -262,6 +262,78 @@ def test_tilelang_prefill_cache_key_uses_out_dtype(monkeypatch):
     assert captured["output_dtype_str"] == "bfloat16"
 
 
+def test_tilelang_prefill_cache_key_uses_heads_per_block(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    captured = {}
+
+    def fake_is_cached(**kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(tilelang_prefill, "_is_kernel_cached", fake_is_cached)
+
+    q = torch.zeros((1, 64, 576), dtype=torch.float16)
+    kv = torch.zeros((1, 1, 576), dtype=torch.float16)
+    indices = torch.zeros((1, 1, 128), dtype=torch.int32)
+
+    assert tilelang_prefill.is_tilelang_sparse_fwd_cached(
+        q, kv, indices, 1.0, 512, heads_per_block=32, threads=64
+    )
+    assert captured["heads_per_block"] == 32
+    assert captured["threads"] == 64
+
+
+def test_tilelang_prefill_cache_key_uses_pv_gemm_policy(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    captured = {}
+
+    def fake_is_cached(**kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(tilelang_prefill, "_is_kernel_cached", fake_is_cached)
+
+    q = torch.zeros((1, 64, 576), dtype=torch.float16)
+    kv = torch.zeros((1, 1, 576), dtype=torch.float16)
+    indices = torch.zeros((1, 1, 128), dtype=torch.int32)
+
+    assert tilelang_prefill.is_tilelang_sparse_fwd_cached(
+        q, kv, indices, 1.0, 512, pv_gemm_policy="full-col"
+    )
+    assert captured["pv_gemm_policy"] == "full_col"
+
+
+def test_tilelang_prefill_cache_key_uses_assume_valid_indices(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    captured = {}
+
+    def fake_is_cached(**kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(tilelang_prefill, "_is_kernel_cached", fake_is_cached)
+
+    q = torch.zeros((1, 64, 576), dtype=torch.float16)
+    kv = torch.zeros((1, 1, 576), dtype=torch.float16)
+    indices = torch.zeros((1, 1, 128), dtype=torch.int32)
+    topk_length = torch.ones((1,), dtype=torch.int32)
+
+    assert tilelang_prefill.is_tilelang_sparse_fwd_cached(
+        q,
+        kv,
+        indices,
+        1.0,
+        512,
+        topk_length=topk_length,
+        assume_valid_indices=True,
+    )
+    assert captured["assume_valid_indices"] is True
+    assert captured["has_topk_length"] is False
+
+
 def test_tilelang_prefill_prewarm_accepts_num_stages(monkeypatch):
     import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
 
@@ -296,6 +368,194 @@ def test_tilelang_prefill_prewarm_accepts_num_stages(monkeypatch):
     )
 
     assert captured["num_stages"] == 2
+
+
+def test_tilelang_prefill_prewarm_accepts_heads_per_block(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    captured = {}
+
+    def fake_flash_mla_sparse_fwd_tilelang(*args, **kwargs):
+        captured.update(kwargs)
+        q = args[0]
+        out = torch.empty((1, q.shape[1], 512), dtype=q.dtype, device=q.device)
+        max_logits = torch.zeros((1, q.shape[1]), dtype=torch.float32,
+                                 device=q.device)
+        lse = torch.zeros_like(max_logits)
+        return out, max_logits, lse
+
+    monkeypatch.setattr(
+        tilelang_prefill,
+        "flash_mla_sparse_fwd_tilelang",
+        fake_flash_mla_sparse_fwd_tilelang,
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    tilelang_prefill.prewarm_tilelang_sparse_fwd(
+        heads=64,
+        d_qk=576,
+        d_v=512,
+        topk=128,
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        block_I=16,
+        num_stages=2,
+        heads_per_block=32,
+        threads=64,
+    )
+
+    assert captured["heads_per_block"] == 32
+
+
+def test_tilelang_prefill_prewarm_accepts_pv_gemm_policy(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    captured = {}
+
+    def fake_flash_mla_sparse_fwd_tilelang(*args, **kwargs):
+        captured.update(kwargs)
+        q = args[0]
+        out = torch.empty((1, q.shape[1], 512), dtype=q.dtype, device=q.device)
+        max_logits = torch.zeros((1, q.shape[1]), dtype=torch.float32,
+                                 device=q.device)
+        lse = torch.zeros_like(max_logits)
+        return out, max_logits, lse
+
+    monkeypatch.setattr(
+        tilelang_prefill,
+        "flash_mla_sparse_fwd_tilelang",
+        fake_flash_mla_sparse_fwd_tilelang,
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    tilelang_prefill.prewarm_tilelang_sparse_fwd(
+        heads=64,
+        d_qk=576,
+        d_v=512,
+        topk=128,
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        pv_gemm_policy="square",
+    )
+
+    assert captured["pv_gemm_policy"] == "square"
+
+
+def test_tilelang_prefill_prewarm_accepts_assume_valid_indices(monkeypatch):
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    captured = {}
+
+    def fake_flash_mla_sparse_fwd_tilelang(*args, **kwargs):
+        captured.update(kwargs)
+        q = args[0]
+        out = torch.empty((1, q.shape[1], 512), dtype=q.dtype, device=q.device)
+        max_logits = torch.zeros((1, q.shape[1]), dtype=torch.float32,
+                                 device=q.device)
+        lse = torch.zeros_like(max_logits)
+        return out, max_logits, lse
+
+    monkeypatch.setattr(
+        tilelang_prefill,
+        "flash_mla_sparse_fwd_tilelang",
+        fake_flash_mla_sparse_fwd_tilelang,
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    tilelang_prefill.prewarm_tilelang_sparse_fwd(
+        heads=64,
+        d_qk=576,
+        d_v=512,
+        topk=128,
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        assume_valid_indices=True,
+    )
+
+    assert captured["assume_valid_indices"] is True
+
+
+def test_tilelang_prefill_rejects_invalid_heads_per_block():
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    q = torch.zeros((1, 64, 576), dtype=torch.float16)
+    kv = torch.zeros((1, 1, 576), dtype=torch.float16)
+    indices = torch.zeros((1, 1, 128), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="heads_per_block"):
+        tilelang_prefill.flash_mla_sparse_fwd_tilelang(
+            q, kv, indices, 1.0, 512, heads_per_block=48
+        )
+
+
+def test_tilelang_prefill_rejects_invalid_heads_per_block_threads():
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    q = torch.zeros((1, 64, 576), dtype=torch.float16)
+    kv = torch.zeros((1, 1, 576), dtype=torch.float16)
+    indices = torch.zeros((1, 1, 128), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="threads=64"):
+        tilelang_prefill.flash_mla_sparse_fwd_tilelang(
+            q, kv, indices, 1.0, 512, heads_per_block=32, threads=128
+        )
+
+
+def test_tilelang_prefill_rejects_invalid_pv_gemm_policy():
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    q = torch.zeros((1, 64, 576), dtype=torch.float16)
+    kv = torch.zeros((1, 1, 576), dtype=torch.float16)
+    indices = torch.zeros((1, 1, 128), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="pv_gemm_policy"):
+        tilelang_prefill.flash_mla_sparse_fwd_tilelang(
+            q, kv, indices, 1.0, 512, pv_gemm_policy="warp_magic"
+        )
+
+
+def test_tilelang_sm70_staged_region_patch_is_idempotent():
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    available, reason = tilelang_prefill.is_tilelang_available()
+    if not available:
+        pytest.skip(reason)
+
+    tilelang_prefill._patch_tilelang_sm70_staged_gemm_region()
+
+    from tilelang.intrinsics.mma_sm70_macro_generator import (
+        TensorCoreIntrinEmitter,
+    )
+
+    first_ldmatrix_b = TensorCoreIntrinEmitter.ldmatrix_b
+    assert getattr(
+        TensorCoreIntrinEmitter,
+        "_vllm_sm70_staged_region_patch",
+        False,
+    )
+
+    tilelang_prefill._patch_tilelang_sm70_staged_gemm_region()
+    assert TensorCoreIntrinEmitter.ldmatrix_b is first_ldmatrix_b
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_tilelang_prefill_hpb32_stages2_compiles():
+    import vllm.v1.attention.ops.tilelang_sparse_prefill as tilelang_prefill
+
+    tilelang_prefill._get_kernel(
+        heads=64,
+        dim=512,
+        tail_dim=64,
+        topk=256,
+        sm_scale=576**-0.5,
+        has_sink=True,
+        has_topk_length=True,
+        block_I=16,
+        num_stages=2,
+        heads_per_block=32,
+        threads=64,
+        output_dtype_str="bfloat16",
+    )
 
 
 def test_tilelang_prefill_writes_requested_out_dtype(monkeypatch):

@@ -863,8 +863,6 @@ def sm70_f16_gate_mul_out(
     gate_weight: torch.Tensor,
 ) -> None:
     torch.ops._C.sm70_f16_gate_mul_out(out, input, gate_weight)
-
-
 def sm70_gemm_import_cache(device_hint: torch.Tensor, path: str) -> int:
     return torch.ops._C.sm70_gemm_import_cache(device_hint, path)
 

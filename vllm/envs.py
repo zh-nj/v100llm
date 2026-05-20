@@ -114,18 +114,26 @@ if TYPE_CHECKING:
     VLLM_SM70_USE_TILELANG_SPARSE_PREFILL: bool = True
     VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO: bool = True
     VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS: bool = True
-    VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT: int = 65536
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT: int = 0
     VLLM_SM70_TILELANG_SPARSE_PREFILL_BI: int = 16
     VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES: int = 1
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK: int = 64
     VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS: int = 128
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY: str = "full_row"
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES: bool = False
     VLLM_SM70_TILELANG_SPARSE_PREFILL_OUTPUT_CHUNK_MB: int = 64
     VLLM_SM70_HC_HEAD_CHUNK_MB: int = 128
     VLLM_SM70_USE_SPARSE_PREFILL_V2: bool = False
+    VLLM_SM70_USE_SPARSE_PREFILL_V2_MAPPED_FUSED: bool = False
+    VLLM_SM70_USE_SPARSE_PREFILL_V2_CUDA_MAINLOOP: bool = False
+    VLLM_SM70_USE_SPARSE_PREFILL_V2_MMA_MAINLOOP: bool = False
     VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS: bool = False
     VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE: bool = False
     VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB: int = 64
-    VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK: bool = False
+    VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK: bool = True
     VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE: bool = False
+    VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_TOPK: bool = False
+    VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_BLOCK_K: int = 128
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -1003,12 +1011,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS": lambda: bool(
         int(os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS", "1"))
     ),
-    # Startup prewarm budget for C128A absolute-position buckets. 64k covers
-    # the common long-prefill benchmark shapes without compiling every 512k/1M
-    # bucket at service start. Larger contexts can still JIT on first use.
+    # Startup prewarm budget for C128A absolute-position buckets. 0 means
+    # cover the service max_model_len so long-context requests do not absorb
+    # TileLang sparse-prefill JIT misses in TTFT. Set a smaller positive value
+    # only for explicit compile-time debugging runs.
     "VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT": lambda: int(
         os.getenv(
-            "VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT", "65536"
+            "VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT", "0"
         )
     ),
     # TileLang sparse MLA tile width (per-tile KV rows). Only BI=16 is
@@ -1022,10 +1031,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES": lambda: max(
         1, int(os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES", "1"))
     ),
+    # Query heads computed by each TileLang sparse MLA CTA. 64 is the
+    # validated baseline. 32 is used for V100 double-buffer sweeps because it
+    # halves Q/shared and accumulator pressure while preserving BI=16.
+    "VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK": lambda: int(
+        os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK", "64")
+    ),
     # TileLang sparse MLA threads per block. 128 is the validated
     # setting on V100.
     "VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS": lambda: int(
         os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS", "128")
+    ),
+    # Warp partition policy for the PV GEMM inside the TileLang sparse prefill
+    # kernel. Keep the default on the validated FullRow lowering; use this as
+    # an explicit register/spill sweep knob for SM70.
+    "VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY": lambda: os.getenv(
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY", "full_row"
+    ).strip().lower().replace("-", "_"),
+    # Experimental sparse prefill fast path: skip per-BI topk_length / invalid
+    # index masking when the caller guarantees every supplied index is valid
+    # and every row attends to the full static topk width. Default stays safe.
+    "VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES": lambda: bool(
+        int(os.getenv(
+            "VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES", "0"))
     ),
     # Cap the per-call TileLang sparse prefill output temporary. The TileLang
     # adapter returns Output/Max/Lse tensors; for long chunked prefill a single
@@ -1040,32 +1068,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_HC_HEAD_CHUNK_MB": lambda: int(
         os.getenv("VLLM_SM70_HC_HEAD_CHUNK_MB", "128")
     ),
-    # Experimental SM70 sparse prefill v2: direct paged fp8_ds_mla cache
-    # loads in the sparse attention kernel. Default off until correctness and
-    # long-context A/B are both established.
-    "VLLM_SM70_USE_SPARSE_PREFILL_V2": lambda: bool(
-        int(os.getenv("VLLM_SM70_USE_SPARSE_PREFILL_V2", "0"))
-    ),
-    "VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS": lambda: bool(
-        int(os.getenv("VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS", "0"))
-    ),
-    "VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE": lambda: bool(
-        int(os.getenv("VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE", "0"))
-    ),
-    # Current sparse prefill v2 prototype still materializes selected KV before
-    # the TileLang attention call. Bound that temporary until the true fused
-    # direct-cache attention kernel replaces it.
-    "VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB": lambda: int(
-        os.getenv("VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB", "64")
-    ),
+    # Retired SM70 sparse prefill v2 knobs. Keep the names registered for
+    # compatibility with old scripts, but ignore user values so the slower
+    # prototype cannot enter the production request path.
+    "VLLM_SM70_USE_SPARSE_PREFILL_V2": lambda: False,
+    "VLLM_SM70_USE_SPARSE_PREFILL_V2_MAPPED_FUSED": lambda: False,
+    "VLLM_SM70_USE_SPARSE_PREFILL_V2_CUDA_MAINLOOP": lambda: False,
+    "VLLM_SM70_USE_SPARSE_PREFILL_V2_MMA_MAINLOOP": lambda: False,
+    "VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS": lambda: False,
+    "VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE": lambda: False,
+    "VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB": lambda: 64,
     # Streaming prefill indexer top-k computes tile logits and merges
     # candidates without materializing full [rows, kv_tokens] fp32 logits.
+    # It is enabled by default but still gated to SM70 fp8_ds_mla long rows
+    # in sparse_attn_indexer._should_use_streaming_topk_prefill().
     "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK": lambda: bool(
-        int(os.getenv("VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK", "0"))
+        int(os.getenv("VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK", "1"))
     ),
     "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE": lambda: bool(
         int(os.getenv(
             "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE", "0"))
+    ),
+    # Experimental step toward streaming GEMM+topk: split each logits tile into
+    # smaller blocks and merge block-local topk immediately, so the request path
+    # does not materialize a full [rows, tile_k] tensor.
+    "VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_TOPK": lambda: bool(
+        int(os.getenv("VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_TOPK", "0"))
+    ),
+    "VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_BLOCK_K": lambda: int(
+        os.getenv("VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_BLOCK_K", "128")
     ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (

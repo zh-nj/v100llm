@@ -754,6 +754,10 @@ def test_forward_prefill_fast_io_skips_q_bf16_trampoline_when_tilelang_cached(
         captured["output_dtype"] = kwargs["output_dtype"]
         captured["has_out"] = "out" in kwargs
         captured["out_dtype"] = kwargs["out"].dtype
+        captured["heads_per_block"] = kwargs["heads_per_block"]
+        captured["threads"] = kwargs["threads"]
+        captured["pv_gemm_policy"] = kwargs["pv_gemm_policy"]
+        captured["assume_valid_indices"] = kwargs["assume_valid_indices"]
         return (
             torch.full(output.shape, 9, dtype=torch.bfloat16),
             None,
@@ -788,6 +792,21 @@ def test_forward_prefill_fast_io_skips_q_bf16_trampoline_when_tilelang_cached(
         lambda **_kwargs: True,
     )
     monkeypatch.setattr(
+        d4a.envs,
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK",
+        32,
+    )
+    monkeypatch.setattr(
+        d4a.envs,
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS",
+        64,
+    )
+    monkeypatch.setattr(
+        d4a.envs,
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY",
+        "full_col",
+    )
+    monkeypatch.setattr(
         d4a,
         "_flashmla_bf16_io",
         lambda *_args: (_ for _ in ()).throw(
@@ -811,6 +830,10 @@ def test_forward_prefill_fast_io_skips_q_bf16_trampoline_when_tilelang_cached(
         "output_dtype": torch.bfloat16,
         "has_out": True,
         "out_dtype": torch.float16,
+        "heads_per_block": 32,
+        "threads": 64,
+        "pv_gemm_policy": "full_col",
+        "assume_valid_indices": False,
         "copy_from_dtype": torch.bfloat16,
         "copy_to_dtype": torch.float16,
     }
@@ -1018,6 +1041,70 @@ def test_tilelang_sparse_prefill_stage_env_default_and_override(monkeypatch):
     ]() == 2
 
 
+def test_tilelang_sparse_prefill_heads_per_block_env_default_and_override(
+    monkeypatch,
+):
+    import vllm.envs as env_module
+
+    monkeypatch.delenv(
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK",
+        raising=False,
+    )
+    assert env_module.environment_variables[
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK"
+    ]() == 64
+
+    monkeypatch.setenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK", "32")
+    assert env_module.environment_variables[
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK"
+    ]() == 32
+
+
+def test_tilelang_sparse_prefill_pv_policy_env_default_and_override(
+    monkeypatch,
+):
+    import vllm.envs as env_module
+
+    monkeypatch.delenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY",
+                       raising=False)
+    assert env_module.environment_variables[
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY"
+    ]() == "full_row"
+
+    monkeypatch.setenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY",
+                       "FULL-COL")
+    assert env_module.environment_variables[
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY"
+    ]() == "full_col"
+
+
+def test_tilelang_sparse_prefill_assume_valid_env_default_and_override(
+    monkeypatch,
+):
+    import vllm.envs as env_module
+
+    monkeypatch.delenv(
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES",
+        raising=False,
+    )
+    assert (
+        env_module.environment_variables[
+            "VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES"
+        ]()
+        is False
+    )
+
+    monkeypatch.setenv(
+        "VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES", "1"
+    )
+    assert (
+        env_module.environment_variables[
+            "VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES"
+        ]()
+        is True
+    )
+
+
 def test_sparse_prefill_v2_default_off(monkeypatch):
     monkeypatch.setattr(d4a.envs, "VLLM_SM70_USE_SPARSE_PREFILL_V2", False)
     q = torch.empty(1, 64, 576, dtype=torch.float16)
@@ -1032,19 +1119,19 @@ def test_sparse_prefill_v2_default_off(monkeypatch):
     )
 
 
-def test_sparse_prefill_v2_requires_supported_shape(monkeypatch):
+def test_sparse_prefill_v2_retired_even_when_env_enabled(monkeypatch):
     monkeypatch.setattr(d4a.envs, "VLLM_SM70_USE_SPARSE_PREFILL_V2", True)
     q = torch.empty(1, 64, 576, dtype=torch.float16)
     out = torch.empty(1, 64, 512, dtype=torch.float16)
 
-    assert d4a._should_use_sparse_prefill_v2(
+    assert not d4a._should_use_sparse_prefill_v2(
         q=q,
         output=out,
         padded_heads=64,
         compress_ratio=128,
         has_attn_metadata=True,
     )
-    assert d4a._should_use_sparse_prefill_v2(
+    assert not d4a._should_use_sparse_prefill_v2(
         q=torch.empty(1, 64, 512, dtype=torch.float16),
         output=out,
         padded_heads=64,
@@ -1117,7 +1204,7 @@ def _make_sparse_prefill_v2_metadata():
     return attn_metadata, swa_metadata
 
 
-def test_forward_prefill_v2_skips_full_gather_workspace(monkeypatch):
+def test_forward_prefill_retired_v2_env_uses_v1_workspace(monkeypatch):
     monkeypatch.setattr(d4a.envs, "VLLM_SM70_USE_SPARSE_PREFILL_V2", True)
     monkeypatch.setattr(
         d4a.envs, "VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE", False
@@ -1127,57 +1214,12 @@ def test_forward_prefill_v2_skips_full_gather_workspace(monkeypatch):
     q = torch.randn(2, 64, 512, dtype=torch.float16)
     output = torch.empty_like(q)
     calls = []
+    workspace_kv = torch.empty((1, 12, 512), dtype=torch.bfloat16)
 
-    class FailWorkspaceManager:
+    class FakeWorkspaceManager:
         def get_simultaneous(self, _spec):
-            raise AssertionError("v2 should skip full gathered kv workspace")
-
-    def fail_gather(*_args, **_kwargs):
-        raise AssertionError("v2 should skip v1 gather")
-
-    def fake_v2(**kwargs):
-        calls.append(kwargs)
-        kwargs["out"].fill_(5)
-        return kwargs["out"], None, None
-
-    import vllm.v1.attention.ops.tilelang_sparse_prefill_v2 as v2
-
-    monkeypatch.setattr(
-        d4a, "current_workspace_manager", lambda: FailWorkspaceManager()
-    )
-    monkeypatch.setattr(d4a, "dequantize_and_gather_k_cache", fail_gather)
-    monkeypatch.setattr(v2, "flash_mla_sparse_prefill_v2", fake_v2)
-
-    attn._forward_prefill(
-        q=q,
-        positions=torch.arange(2, dtype=torch.int64),
-        compressed_k_cache=torch.zeros(1, 4, 584, dtype=torch.uint8),
-        swa_k_cache=torch.zeros(2, 4, 584, dtype=torch.uint8),
-        output=output,
-        attn_metadata=attn_metadata,
-        swa_metadata=swa_metadata,
-    )
-
-    assert len(calls) == 1
-    assert calls[0]["q"].shape == (2, 64, 512)
-    torch.testing.assert_close(output, torch.full_like(output, 5))
-
-
-def test_forward_prefill_v2_debug_compare_falls_back_to_v1(monkeypatch):
-    monkeypatch.setattr(d4a.envs, "VLLM_SM70_USE_SPARSE_PREFILL_V2", True)
-    monkeypatch.setattr(
-        d4a.envs, "VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE", True
-    )
-    attn = _make_sparse_prefill_v2_attn()
-    attn_metadata, swa_metadata = _make_sparse_prefill_v2_metadata()
-    q = torch.randn(2, 64, 512, dtype=torch.float16)
-    output = torch.empty_like(q)
-    calls = []
-
-    def fake_v2(**kwargs):
-        calls.append("v2")
-        kwargs["out"].fill_(5)
-        return kwargs["out"], None, None
+            calls.append("workspace")
+            return (workspace_kv,)
 
     def fake_gather(out, *_args, **_kwargs):
         calls.append("gather")
@@ -1195,9 +1237,9 @@ def test_forward_prefill_v2_debug_compare_falls_back_to_v1(monkeypatch):
         kwargs["out"].fill_(7)
         return kwargs["out"], None, None
 
-    import vllm.v1.attention.ops.tilelang_sparse_prefill_v2 as v2
-
-    monkeypatch.setattr(v2, "flash_mla_sparse_prefill_v2", fake_v2)
+    monkeypatch.setattr(
+        d4a, "current_workspace_manager", lambda: FakeWorkspaceManager()
+    )
     monkeypatch.setattr(d4a, "dequantize_and_gather_k_cache", fake_gather)
     monkeypatch.setattr(d4a, "combine_topk_swa_indices", fake_combine)
     monkeypatch.setattr(d4a, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
@@ -1215,7 +1257,7 @@ def test_forward_prefill_v2_debug_compare_falls_back_to_v1(monkeypatch):
         swa_metadata=swa_metadata,
     )
 
-    assert calls.count("v2") == 1
+    assert calls.count("workspace") == 1
     assert calls.count("v1") == 1
     assert calls.count("gather") == 2
     assert "combine" in calls

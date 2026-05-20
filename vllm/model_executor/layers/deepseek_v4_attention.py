@@ -2246,19 +2246,10 @@ def _should_use_sparse_prefill_v2(
     compress_ratio: int,
     has_attn_metadata: bool,
 ) -> bool:
-    if not envs.VLLM_SM70_USE_SPARSE_PREFILL_V2:
-        return False
-    if q.dtype is not torch.float16 or output.dtype is not torch.float16:
-        return False
-    if q.ndim < 1 or q.shape[-1] not in (512, 576):
-        return False
-    if padded_heads != 64:
-        return False
-    if compress_ratio not in (4, 128):
-        return False
-    if not has_attn_metadata:
-        return False
-    return True
+    del q, output, padded_heads, compress_ratio, has_attn_metadata
+    # Sparse prefill v2 was a slower direct-cache prototype. It is retired;
+    # keep this helper only so older tests/imports fail closed.
+    return False
 
 
 def _should_use_tilelang_sparse_prefill_fast_io(
@@ -2297,7 +2288,16 @@ def _should_use_tilelang_sparse_prefill_fast_io(
             output_dtype=torch.bfloat16,
             block_I=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI,
             num_stages=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES,
+            heads_per_block=(
+                envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK
+            ),
             threads=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS,
+            pv_gemm_policy=(
+                envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY
+            ),
+            assume_valid_indices=(
+                envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES
+            ),
         )
         if cached:
             return True
@@ -3323,7 +3323,16 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                                     num_stages=(
                                         envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES
                                     ),
+                                    heads_per_block=(
+                                        envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK
+                                    ),
                                     threads=envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS,
+                                    pv_gemm_policy=(
+                                        envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY
+                                    ),
+                                    assume_valid_indices=(
+                                        envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES
+                                    ),
                                 )
                 except Exception as exc:  # pragma: no cover - best-effort
                     logger.warning(
@@ -3704,31 +3713,16 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             and self.prefix.endswith("layers.1.attn")
         )
 
-        use_sparse_prefill_v2 = (
-            not swa_only
-            and num_prefills == 1
-            and q.shape[-1] == 512
-            and _should_use_sparse_prefill_v2(
-                q=q,
-                output=output,
-                padded_heads=self.padded_heads,
-                compress_ratio=self.compress_ratio,
-                has_attn_metadata=attn_metadata is not None,
-            )
-        )
         block_table = None
         if not swa_only:
             assert attn_metadata is not None
             block_table = attn_metadata.block_table[num_decodes:]
         swa_block_table = swa_metadata.block_table[num_decodes:]
 
-        if use_sparse_prefill_v2:
-            kv = None
-        else:
-            workspace_manager = current_workspace_manager()
-            kv = workspace_manager.get_simultaneous(
-                ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-            )[0]
+        workspace_manager = current_workspace_manager()
+        kv = workspace_manager.get_simultaneous(
+            ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+        )[0]
         # Aux stream operations (KV-insert, compressor) launched via
         # maybe_execute_in_parallel in attention_impl have already completed
         # by the time we reach here — event synchronization in that helper
@@ -3747,165 +3741,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
             output_slice = output[query_start:query_end]
             num_chunk_tokens = query_end - query_start
-
-            if use_sparse_prefill_v2:
-                assert block_table is not None
-                q_slice = q[query_start:query_end]
-                with _profile_or_null(
-                    "prefill.flashmla_sparse_v2",
-                    q,
-                    extra={
-                        "chunk_idx": chunk_idx,
-                        "num_chunk_tokens": int(num_chunk_tokens),
-                    },
-                ):
-                    from vllm.v1.attention.ops.tilelang_sparse_prefill_v2 import (
-                        flash_mla_sparse_prefill_v2,
-                    )
-
-                    flash_output, max_logits, lse = flash_mla_sparse_prefill_v2(
-                        q=q_slice,
-                        compressed_k_cache=compressed_k_cache,
-                        swa_k_cache=swa_k_cache,
-                        compressed_block_table=block_table[chunk_start:chunk_end],
-                        swa_block_table=swa_block_table[chunk_start:chunk_end],
-                        topk_indices=topk_indices[query_start:query_end],
-                        query_start_loc=query_start_loc[
-                            num_decodes + chunk_start : num_decodes + chunk_end + 1
-                        ],
-                        seq_lens=seq_lens[chunk_start:chunk_end],
-                        gather_lens=gather_lens[chunk_start:chunk_end],
-                        window_size=self.window_size,
-                        compress_ratio=self.compress_ratio,
-                        top_k=top_k,
-                        sm_scale=self.scale,
-                        attn_sink=self.attn_sink,
-                        out=output_slice,
-                    )
-                    _copy_flashmla_output(flash_output, output_slice)
-                if envs.VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE:
-                    v2_output = output_slice.clone()
-                    debug_kv = torch.empty(
-                        (chunk_size, M, q.shape[-1]),
-                        dtype=torch.bfloat16,
-                        device=q.device,
-                    )
-                    assert compressed_k_cache is not None
-                    dequantize_and_gather_k_cache(
-                        debug_kv,
-                        compressed_k_cache,
-                        seq_lens=(
-                            seq_lens[chunk_start:chunk_end] // self.compress_ratio
-                        ),
-                        gather_lens=None,
-                        block_table=block_table[chunk_start:chunk_end],
-                        block_size=attn_metadata.block_size // self.compress_ratio,
-                        offset=0,
-                    )
-                    dequantize_and_gather_k_cache(
-                        debug_kv,
-                        swa_k_cache,
-                        seq_lens=seq_lens[chunk_start:chunk_end],
-                        gather_lens=gather_lens[chunk_start:chunk_end],
-                        block_table=swa_block_table[chunk_start:chunk_end],
-                        block_size=swa_metadata.block_size,
-                        offset=N,
-                    )
-                    combined_indices, combined_lens = combine_topk_swa_indices(
-                        topk_indices[query_start:query_end],
-                        query_start_loc[
-                            num_decodes + chunk_start : num_decodes + chunk_end + 1
-                        ],
-                        seq_lens[chunk_start:chunk_end],
-                        gather_lens[chunk_start:chunk_end],
-                        self.window_size,
-                        self.compress_ratio,
-                        top_k,
-                        M,
-                        N,
-                    )
-                    kv_flat = debug_kv.view(-1, 1, q.shape[-1])
-                    indices_3d = combined_indices.unsqueeze(1)
-                    if _should_use_tilelang_sparse_prefill_fast_io(
-                        q=q_slice,
-                        kv=kv_flat,
-                        indices=indices_3d,
-                        sm_scale=self.scale,
-                        d_v=self.head_dim,
-                        attn_sink=self.attn_sink,
-                        topk_length=combined_lens,
-                        output=output_slice,
-                    ):
-                        from vllm.v1.attention.ops import (  # noqa: PLC0415
-                            tilelang_sparse_prefill,
-                        )
-
-                        flash_output, max_logits, lse = (
-                            tilelang_sparse_prefill.flash_mla_sparse_fwd_tilelang(
-                                q=q_slice,
-                                kv=kv_flat,
-                                indices=indices_3d,
-                                sm_scale=self.scale,
-                                d_v=self.head_dim,
-                                attn_sink=self.attn_sink,
-                                topk_length=combined_lens,
-                                out=output_slice,
-                                output_dtype=torch.bfloat16,
-                                block_I=(
-                                    envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI
-                                ),
-                                num_stages=(
-                                    envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES
-                                ),
-                                threads=(
-                                    envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS
-                                ),
-                            )
-                        )
-                        _copy_flashmla_output(flash_output, output_slice)
-                    else:
-                        q_chunk_dbg, output_chunk_dbg = _flashmla_bf16_io(
-                            q_slice,
-                            output_slice,
-                        )
-                        flash_output, max_logits, lse = flash_mla_sparse_fwd(
-                            q=q_chunk_dbg,
-                            kv=kv_flat,
-                            indices=indices_3d,
-                            sm_scale=self.scale,
-                            attn_sink=self.attn_sink,
-                            topk_length=combined_lens,
-                            out=output_chunk_dbg,
-                        )
-                        _copy_flashmla_output(flash_output, output_slice)
-                    try:
-                        torch.testing.assert_close(
-                            v2_output.float(),
-                            output_slice.float(),
-                            atol=2e-2,
-                            rtol=2e-2,
-                        )
-                    except AssertionError as exc:
-                        logger.warning(
-                            "Sparse prefill v2 debug mismatch at %s chunk %d "
-                            "(tokens=%d): %s — using v1 output",
-                            self.prefix,
-                            chunk_idx,
-                            int(num_chunk_tokens),
-                            exc,
-                        )
-                    else:
-                        output_slice.copy_(v2_output)
-                        flash_output = output_slice
-                if trace_prefill:
-                    _trace_tensor_summary(
-                        f"{self.prefix}.prefill.flash_output", flash_output
-                    )
-                    _trace_tensor_summary(
-                        f"{self.prefix}.prefill.max_logits", max_logits
-                    )
-                    _trace_tensor_summary(f"{self.prefix}.prefill.lse", lse)
-                continue
 
             assert kv is not None
             if not swa_only:
@@ -4093,8 +3928,17 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                                 num_stages=(
                                     envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES
                                 ),
+                                heads_per_block=(
+                                    envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK
+                                ),
                                 threads=(
                                     envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS
+                                ),
+                                pv_gemm_policy=(
+                                    envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY
+                                ),
+                                assume_valid_indices=(
+                                    envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES
                                 ),
                             )
                         )

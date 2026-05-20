@@ -206,13 +206,13 @@ def test_tilelang_prefill_topk_targets_single_request_16k_chunks(monkeypatch):
     )
 
 
-def test_streaming_topk_prefill_default_off(monkeypatch):
+def test_streaming_topk_prefill_default_on_for_sm70_long_rows(monkeypatch):
     from vllm.model_executor.layers import sparse_attn_indexer
 
     monkeypatch.setattr(
         sparse_attn_indexer.envs,
         "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK",
-        False,
+        True,
         raising=False,
     )
     monkeypatch.setattr(sparse_attn_indexer.current_platform, "is_cuda", lambda: True)
@@ -225,7 +225,7 @@ def test_streaming_topk_prefill_default_off(monkeypatch):
     q = torch.empty((4, 4, 128), dtype=torch.float16)
     kv_cache = torch.empty((16, 128), dtype=torch.float16)
 
-    assert not sparse_attn_indexer._should_use_streaming_topk_prefill(
+    assert sparse_attn_indexer._should_use_streaming_topk_prefill(
         q=q,
         kv_cache=kv_cache,
         topk_tokens=512,
