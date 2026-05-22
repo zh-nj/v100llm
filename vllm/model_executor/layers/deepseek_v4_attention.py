@@ -3742,6 +3742,105 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             output_slice = output[query_start:query_end]
             num_chunk_tokens = query_end - query_start
 
+            # P5 experimental: direct-indexed prefill kernel that
+            # reads paged FP8 caches without the (CHUNK_SIZE, M,
+            # head_dim) BF16 workspace. Skips the
+            # dequantize_and_gather_k_cache + combine_topk_swa_indices
+            # chain. Gated OFF by default; enable with
+            # VLLM_DEEPSEEK_V4_PREFILL_INDEXED=1. Bit-exactness
+            # verified on synthetic caches; production wiring is
+            # experimental until P5-E real-model microtest passes.
+            if (
+                envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED
+                and not swa_only
+                and self.compress_ratio == 4
+                and compressed_k_cache is not None
+            ):
+                from vllm.v1.attention.ops.tilelang_sparse_prefill_indexed import (  # noqa: PLC0415, E501
+                    flash_mla_sparse_fwd_indexed_fp8,
+                )
+                # Per-query-token metadata for the chunk
+                # query_to_req[t] = req index within the chunk for
+                #   each query token t in [0, num_chunk_tokens)
+                # compressed_lens[t] = min((abs_pos + 1) // ratio, top_k)
+                # swa_lens[t]        = min(abs_pos + 1, window_size)
+                # where abs_pos = (seq_lens[req] - query_lens_in_chunk[req])
+                #                  + position-within-this-request
+                chunk_seq_lens = seq_lens[chunk_start:chunk_end]
+                chunk_qstart = (
+                    query_start_loc[num_decodes + chunk_start:
+                                    num_decodes + chunk_end + 1]
+                    - query_start_loc[num_decodes + chunk_start]
+                )
+                # Build query_to_req on device (each request contributes
+                # query_lens[r] entries equal to r).
+                query_lens_chunk = (chunk_qstart[1:] - chunk_qstart[:-1])
+                query_to_req = torch.repeat_interleave(
+                    torch.arange(chunk_size, device=q.device,
+                                 dtype=torch.int32),
+                    query_lens_chunk.to(torch.int32),
+                )
+                # Position of each query token within its request.
+                # abs_pos[t] = (seq_len[r] - query_len[r]) + offset_within_req
+                # = (seq_len[r] - query_len[r]) + (t - chunk_qstart[r])
+                # Compute abs_pos via cumulative offset trick.
+                start_pos_per_req = (
+                    chunk_seq_lens.to(torch.int32) - query_lens_chunk.to(torch.int32)
+                )
+                # Per-token query offset within its request.
+                t_idx = torch.arange(num_chunk_tokens, device=q.device,
+                                     dtype=torch.int32)
+                req_for_t = query_to_req
+                abs_pos = start_pos_per_req[req_for_t] + (
+                    t_idx - chunk_qstart[req_for_t]
+                )
+                compressed_lens = torch.minimum(
+                    (abs_pos + 1) // self.compress_ratio,
+                    torch.tensor(top_k, device=q.device,
+                                 dtype=torch.int32),
+                ).to(torch.int32)
+                swa_lens_chunk = torch.minimum(
+                    abs_pos + 1,
+                    torch.tensor(self.window_size, device=q.device,
+                                 dtype=torch.int32),
+                ).to(torch.int32)
+                # Topk indices for this chunk: rows [query_start, query_end)
+                # of the topk_indices buffer (which is per-prefill-token).
+                topk_local = topk_indices[query_start:query_end]
+                # The per-block size in the compressed cache is
+                # attn_metadata.block_size // compress_ratio.
+                comp_bs = attn_metadata.block_size // self.compress_ratio
+                swa_bs = swa_metadata.block_size
+
+                with _profile_or_null(
+                    "prefill.flashmla_sparse_fwd_indexed",
+                    q,
+                    extra={
+                        "chunk_idx": chunk_idx,
+                        "num_chunk_tokens": int(num_chunk_tokens),
+                        "top_k": int(top_k),
+                    },
+                ):
+                    flash_out, _, _ = flash_mla_sparse_fwd_indexed_fp8(
+                        q=q[query_start:query_end],
+                        comp_kv_bytes=compressed_k_cache,
+                        swa_kv_bytes=swa_k_cache,
+                        block_table=block_table[chunk_start:chunk_end],
+                        swa_block_table=swa_block_table[chunk_start:chunk_end],
+                        compressed_local_indices=topk_local,
+                        compressed_lens=compressed_lens,
+                        swa_lens=swa_lens_chunk,
+                        seq_lens=chunk_seq_lens.to(torch.int32),
+                        query_to_req=query_to_req,
+                        sm_scale=self.scale,
+                        attn_sink=self.attn_sink,
+                        comp_block_size=comp_bs,
+                        swa_block_size=swa_bs,
+                        output_dtype=torch.bfloat16,
+                    )
+                output_slice.copy_(flash_out)
+                continue
+
             assert kv is not None
             if not swa_only:
                 # Gather compressed KV

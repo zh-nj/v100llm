@@ -108,6 +108,10 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_NAN_TRACE: bool = False
     VLLM_DEEPSEEK_V4_INDEXER_TOPK: int = 0
     VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE: int = 4
+    # P5: experimental direct-indexed prefill kernel that reads paged
+    # FP8 cache directly without the (CHUNK_SIZE, M, head_dim) BF16
+    # workspace. Default OFF until P5-E/F/G validation completes.
+    VLLM_DEEPSEEK_V4_PREFILL_INDEXED: bool = False
     VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE: bool = True
     VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB: bool = True
     VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS: int = 4
@@ -975,6 +979,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE", "4")
+    ),
+    # P5 experimental indexed prefill kernel switch. When set to 1,
+    # _forward_prefill skips the dequantize_and_gather_k_cache +
+    # combine_topk_swa_indices steps and dispatches to
+    # flash_mla_sparse_fwd_indexed_fp8 which reads paged FP8 caches
+    # directly. Default OFF until validated end-to-end.
+    "VLLM_DEEPSEEK_V4_PREFILL_INDEXED": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_PREFILL_INDEXED", "0"))
     ),
     "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", "1"))
