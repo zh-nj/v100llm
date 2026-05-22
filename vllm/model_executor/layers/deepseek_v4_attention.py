@@ -133,13 +133,10 @@ _PREFILL_CUDAGRAPH_PERF_GATE = (
 # every chunk, then diff the outputs. The chunk uses the existing path's
 # output as the ground truth (production semantics unchanged); the indexed
 # output is dropped after the diff is logged. Used to validate P5 against
-# real-model paged caches before flipping the env default.
-_PREFILL_INDEXED_DEBUG = os.getenv(
-    "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG", "0") == "1"
-_PREFILL_INDEXED_DEBUG_LOG_EVERY = int(os.getenv(
-    "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_LOG_EVERY", "1"))
-_PREFILL_INDEXED_DEBUG_FAIL_ATOL = float(os.getenv(
-    "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_FAIL_ATOL", "1e-2"))
+# real-model paged caches before flipping the env default. The actual
+# value is read at use site via `envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG`
+# so toggling between server runs only requires changing the env, not
+# editing this file.
 _DEEPSEEK_V4_PROFILE_ENABLED = os.getenv("VLLM_DEEPSEEK_V4_PROFILE", "0") == "1"
 _DEEPSEEK_V4_PROFILE_NVTX = os.getenv("VLLM_DEEPSEEK_V4_PROFILE_NVTX", "0") == "1"
 _DEEPSEEK_V4_PROFILE_LOG_EVERY = int(
@@ -3767,6 +3764,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 and not swa_only
                 and self.compress_ratio == 4
                 and compressed_k_cache is not None
+                and q.shape[-1] == 576  # NoPE 512 + RoPE 64; the
+                                       # P5-C kernel is hardcoded to this
+                                       # head dim. Other shapes (e.g. dummy
+                                       # profile run with d_qk=512) fall
+                                       # through to the existing path.
             ):
                 from vllm.v1.attention.ops.tilelang_sparse_prefill_indexed import (  # noqa: PLC0415, E501
                     flash_mla_sparse_fwd_indexed_fp8,
@@ -3850,7 +3852,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         swa_block_size=swa_bs,
                         output_dtype=torch.bfloat16,
                     )
-                if _PREFILL_INDEXED_DEBUG:
+                if envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG:
                     # P5-E debug mode: save the indexed kernel's output
                     # for post-existing-path diff. Do NOT consume it as
                     # the canonical output; let the existing path run
@@ -4121,9 +4123,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             # output_slice); existing path ran here and wrote output_slice.
             # Diff the two and log MAE/maxAE.
             if (
-                _PREFILL_INDEXED_DEBUG
+                envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG
                 and indexed_debug_out is not None
-                and (chunk_idx % _PREFILL_INDEXED_DEBUG_LOG_EVERY == 0)
+                and (chunk_idx % envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_LOG_EVERY == 0)
             ):
                 e = indexed_debug_out.float() - output_slice.float()
                 mae = e.abs().mean().item()
@@ -4133,10 +4135,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     "MAE=%.4e maxAE=%.4e (indexed vs existing)",
                     self.prefix, chunk_idx, num_chunk_tokens, mae, max_ae,
                 )
-                if max_ae > _PREFILL_INDEXED_DEBUG_FAIL_ATOL:
+                if max_ae > envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_FAIL_ATOL:
                     logger.error(
                         "[P5E_DEBUG] FAIL: maxAE=%.4e exceeds atol=%.4e",
-                        max_ae, _PREFILL_INDEXED_DEBUG_FAIL_ATOL,
+                        max_ae,
+                        envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_FAIL_ATOL,
                     )
 
 

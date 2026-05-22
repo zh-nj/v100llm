@@ -112,6 +112,11 @@ if TYPE_CHECKING:
     # FP8 cache directly without the (CHUNK_SIZE, M, head_dim) BF16
     # workspace. Default OFF until P5-E/F/G validation completes.
     VLLM_DEEPSEEK_V4_PREFILL_INDEXED: bool = False
+    # P5-E debug switches: when both indexed=1 and debug=1 are set,
+    # _forward_prefill runs both paths and logs MAE/maxAE per chunk.
+    VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG: bool = False
+    VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_LOG_EVERY: int = 1
+    VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_FAIL_ATOL: float = 1e-2
     VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE: bool = True
     VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB: bool = True
     VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS: int = 4
@@ -987,6 +992,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # directly. Default OFF until validated end-to-end.
     "VLLM_DEEPSEEK_V4_PREFILL_INDEXED": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_PREFILL_INDEXED", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_LOG_EVERY": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_LOG_EVERY", "1")
+    ),
+    "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_FAIL_ATOL": lambda: float(
+        os.getenv("VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_FAIL_ATOL", "1e-2")
     ),
     "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", "1"))
