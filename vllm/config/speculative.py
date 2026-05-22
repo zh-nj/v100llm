@@ -46,6 +46,7 @@ MTPModelTypes = Literal[
     "mtp",
     "pangu_ultra_moe_mtp",
     "step3p5_mtp",
+    "gemma4_mtp",
 ]
 EagleModelTypes = Literal["eagle", "eagle3", "extract_hidden_states", MTPModelTypes]
 NgramGPUTypes = Literal["ngram_gpu"]
@@ -352,6 +353,20 @@ class SpeculativeConfig:
             hf_config.model_type = "step3p5_mtp"
             n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
             hf_config.update({"n_predict": n_predict, "architectures": ["Step3p5MTP"]})
+
+        if hf_config.model_type == "gemma4_assistant":
+            hf_config.model_type = "gemma4_mtp"
+            text_config = getattr(hf_config, "text_config", hf_config)
+            # Gemma4 assistant runs all draft decoder layers per forward and
+            # produces one draft token. Extra speculative tokens reuse the
+            # same module across multiple forwards.
+            text_config.n_predict = 1
+            hf_config.update(
+                {
+                    "n_predict": 1,
+                    "architectures": ["Gemma4MTPModel"],
+                }
+            )
 
         if initial_architecture == "MistralLarge3ForCausalLM":
             hf_config.update({"architectures": ["EagleMistralLarge3ForCausalLM"]})
@@ -863,6 +878,14 @@ class SpeculativeConfig:
             # Since we do not slice the draft tokens
             slots_per_req += 1
         return slots_per_req
+
+    def use_gemma4_mtp(self) -> bool:
+        return (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and getattr(self.draft_model_config.hf_config, "model_type", None)
+            == "gemma4_mtp"
+        )
 
     def use_eagle(self) -> bool:
         return self.method in ("eagle", "eagle3", "mtp")

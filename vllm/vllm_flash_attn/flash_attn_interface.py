@@ -1,5 +1,6 @@
 # Copyright (c) 2023, Tri Dao.
 
+from functools import cache
 from typing import Optional, Union, Tuple, List
 
 import torch
@@ -9,17 +10,21 @@ import torch.nn as nn
 # We need to import the CUDA kernels after importing torch
 # Use relative import to support build-from-source installation in vLLM
 
+
 try:
     from . import _vllm_fa2_C  # noqa: F401
     FA2_UNAVAILABLE_REASON = None
+    FA2_EXTENSION_SOURCE = "vendored"
     FA2_AVAILABLE = True
 except ImportError as e:
     try:
         import vllm_flash_attn._vllm_fa2_C as _vllm_fa2_C  # type: ignore[import-not-found]  # noqa: F401
         FA2_UNAVAILABLE_REASON = None
+        FA2_EXTENSION_SOURCE = "external"
         FA2_AVAILABLE = True
     except ImportError as fallback_e:
         FA2_UNAVAILABLE_REASON = f"{e}; fallback import failed: {fallback_e}"
+        FA2_EXTENSION_SOURCE = None
         FA2_AVAILABLE = False
 
 try:
@@ -106,6 +111,18 @@ def _get_fa2_kvcache_op():
     if not FA2_AVAILABLE:
         raise ImportError(FA2_UNAVAILABLE_REASON)
     return torch.ops._vllm_fa2_C.fwd_kvcache
+
+
+@cache
+def fa2_varlen_supports_s_aux() -> bool:
+    try:
+        schemas = torch.ops._vllm_fa2_C.varlen_fwd._schemas
+        return any(
+            any(arg.name == "s_aux" for arg in schema.arguments)
+            for schema in schemas.values()
+        )
+    except Exception:
+        return False
 
 
 def flash_attn_func(
@@ -374,10 +391,15 @@ def flash_attn_varlen_func(
                     "FA2 does not support scheduler_metadata, q_descale, "
                     "k_descale, v_descale"
                 )
+        supports_s_aux = fa2_varlen_supports_s_aux()
+        if s_aux is not None and not supports_s_aux:
+            raise NotImplementedError(
+                "The loaded FA2 varlen_fwd extension does not support s_aux"
+            )
         if s_aux is not None and s_aux.dtype != torch.float32:
             s_aux = s_aux.float()
         s_aux = maybe_contiguous(s_aux)
-        out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
+        varlen_fwd_args = [
             q, k, v,
             out,
             cu_seqlens_q,
@@ -399,9 +421,11 @@ def flash_attn_varlen_func(
             softcap,
             return_softmax_lse and dropout_p > 0,
             num_splits,
-            s_aux,
-            None,
-        )
+        ]
+        if supports_s_aux:
+            varlen_fwd_args.append(s_aux)
+        varlen_fwd_args.append(None)
+        out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(*varlen_fwd_args)
     elif fa_version == 3:
         assert alibi_slopes is None, "Alibi is not supported in FA3"
         out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(

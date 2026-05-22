@@ -56,6 +56,27 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _get_image_token_index_for_draft(target_model: nn.Module, model_name: str) -> int:
+    config = target_model.config
+    if model_name in [
+        "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+        "HunYuanVLForConditionalGeneration",
+        "GlmOcrForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    ]:
+        return config.image_token_id
+    if model_name == "PixtralForConditionalGeneration":
+        return config.vision_config.image_token_id
+    if model_name == "KimiK25ForConditionalGeneration":
+        return config.media_placeholder_token_id
+    if hasattr(config, "image_token_index"):
+        return config.image_token_index
+    return config.image_token_id
+
+
 class SpecDecodeBaseProposer:
     def __init__(
         self,
@@ -101,6 +122,7 @@ class SpecDecodeBaseProposer:
             1 if self.pass_hidden_states_to_model else 0
         )
         self.needs_extra_input_slots = self.net_num_new_slots_per_request > 0
+        self.constant_draft_positions: bool = False
 
         self.parallel_drafting_token_id: int = 0
         self.parallel_drafting_hidden_state_tensor: torch.Tensor | None = None
@@ -432,13 +454,9 @@ class SpecDecodeBaseProposer:
             )
         )
 
-        per_layer_attn_metadata: dict[str, object] = {}
-        for attn_group in self.draft_attn_groups:
-            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
-                common_attn_metadata=common_attn_metadata, draft_index=0
-            )
-            for layer_name in attn_group.layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
+        per_group_attn_metadata, per_layer_attn_metadata = (
+            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+        )
 
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(num_tokens)
@@ -497,7 +515,10 @@ class SpecDecodeBaseProposer:
             positions = self.positions[token_indices_to_sample]
         hidden_states = hidden_states[token_indices_to_sample]
 
-        if isinstance(attn_metadata, TreeAttentionMetadata):
+        if self.constant_draft_positions:
+            self.positions[:batch_size] = positions
+
+        if any(isinstance(md, TreeAttentionMetadata) for md in per_group_attn_metadata):
             # Draft using tree attention - requires full logits for top-k
             logits = self.model.compute_logits(sample_hidden_states)
             draft_token_ids_list = self.propose_tree(
@@ -513,15 +534,15 @@ class SpecDecodeBaseProposer:
 
         draft_token_ids = self._greedy_sample(sample_hidden_states)
 
-        if self.allowed_attn_types is not None and not isinstance(
-            attn_metadata, self.allowed_attn_types
-        ):
-            raise ValueError(
-                f"Unsupported attention metadata type for speculative "
-                "decoding with num_speculative_tokens > 1: "
-                f"{type(attn_metadata)}. Supported types are: "
-                f"{self.allowed_attn_types}"
-            )
+        if self.allowed_attn_types is not None:
+            for group_md in per_group_attn_metadata:
+                if not isinstance(group_md, self.allowed_attn_types):
+                    raise ValueError(
+                        f"Unsupported attention metadata type for speculative "
+                        "decoding with num_speculative_tokens > 1: "
+                        f"{type(group_md)}. Supported types are: "
+                        f"{self.allowed_attn_types}"
+                    )
 
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
@@ -601,14 +622,10 @@ class SpecDecodeBaseProposer:
             if common_attn_metadata._num_computed_tokens_cpu is not None:
                 common_attn_metadata._num_computed_tokens_cpu += 1
 
-            # Rebuild attention metadata
-            for attn_group in self.draft_attn_groups:
-                attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
-                    common_attn_metadata=common_attn_metadata,
-                    draft_index=token_index + 1,
-                )
-                for layer_name in attn_group.layer_names:
-                    per_layer_attn_metadata[layer_name] = attn_metadata
+            _, per_layer_attn_metadata = self.build_per_group_and_layer_attn_metadata(
+                common_attn_metadata,
+                draft_index=token_index + 1,
+            )
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
@@ -791,6 +808,23 @@ class SpecDecodeBaseProposer:
 
     def model_returns_tuple(self) -> bool:
         return self.method not in ("mtp", "draft_model")
+
+    def build_per_group_and_layer_attn_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int = 0,
+    ) -> tuple[list[object], dict[str, object]]:
+        per_group_attn_metadata: list[object] = []
+        per_layer_attn_metadata: dict[str, object] = {}
+        for attn_group in self.draft_attn_groups:
+            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
+                common_attn_metadata=common_attn_metadata,
+                draft_index=draft_index,
+            )
+            per_group_attn_metadata.append(attn_metadata)
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
+        return per_group_attn_metadata, per_layer_attn_metadata
 
     def prepare_next_token_ids_cpu(
         self,
@@ -1287,28 +1321,10 @@ class SpecDecodeBaseProposer:
         if supports_multimodal(target_model):
             # handle multimodality
             assert hasattr(target_model, "config")
-            if self.get_model_name(target_model) in [
-                "Qwen2_5_VLForConditionalGeneration",
-                "Qwen3VLForConditionalGeneration",
-                "Qwen3VLMoeForConditionalGeneration",
-                "HunYuanVLForConditionalGeneration",
-                "GlmOcrForConditionalGeneration",
-                "Qwen3_5ForConditionalGeneration",
-                "Qwen3_5MoeForConditionalGeneration",
-            ]:
-                self.model.config.image_token_index = target_model.config.image_token_id
-            elif self.get_model_name(target_model) == "PixtralForConditionalGeneration":
-                self.model.config.image_token_index = (
-                    target_model.config.vision_config.image_token_id
-                )
-            elif self.get_model_name(target_model) == "KimiK25ForConditionalGeneration":
-                self.model.config.image_token_index = (
-                    target_model.config.media_placeholder_token_id
-                )
-            else:
-                self.model.config.image_token_index = (
-                    target_model.config.image_token_index
-                )
+            self.model.config.image_token_index = _get_image_token_index_for_draft(
+                target_model,
+                self.get_model_name(target_model),
+            )
             target_language_model = cast(
                 SupportsMultiModal, target_model
             ).get_language_model()

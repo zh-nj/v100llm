@@ -75,8 +75,9 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLEX_ATTENTION,
             ]
         elif device_capability.major == 7:
-            # SM70 (V100): Prefer standard FlashAttention when available,
-            # keep the V100-specific backend as a fallback.
+            # SM70 (V100): Prefer standard FlashAttention when available.
+            # Keep the V100-specific TileLang backend available as a fallback
+            # and for explicit --attention-backend FLASH_ATTN_V100 runs.
             return [
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.FLASH_ATTN_V100,

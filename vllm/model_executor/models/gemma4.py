@@ -62,6 +62,7 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Backend
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
@@ -107,11 +108,18 @@ def _select_gemma4_text_attention_backend(
         to_int = getattr(capability, "to_int", None)
         return callable(to_int) and to_int() == 70
 
-    if user_backend is not None:
-        return None
     if kv_transfer_enabled:
         return None
     if not is_sm70(capability):
+        return None
+
+    if user_backend == AttentionBackendEnum.FLASH_ATTN_V100:
+        if layer_type in ("sliding_attention", "full_attention"):
+            if FlashAttnV100Backend.supports_head_size(head_dim):
+                return FlashAttnV100Backend
+        return None
+
+    if user_backend is not None:
         return None
 
     if layer_type in ("sliding_attention", "full_attention"):

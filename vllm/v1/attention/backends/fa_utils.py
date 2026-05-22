@@ -18,6 +18,7 @@ _ROCM_FLASH_ATTN_AVAILABLE = False
 if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
     from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+        fa2_varlen_supports_s_aux,
         flash_attn_decode_paged,
         flash_attn_varlen_func,
         get_scheduler_metadata,
@@ -176,8 +177,10 @@ def flash_attn_supports_fp8() -> bool:
 def flash_attn_supports_sinks() -> bool:
     if current_platform.is_xpu():
         return True
-    else:
-        return get_flash_attn_version() in (2, 3)
+    version = get_flash_attn_version()
+    if version == 2:
+        return fa2_varlen_supports_s_aux()
+    return version == 3
 
 
 def flash_attn_supports_mla():

@@ -8,6 +8,9 @@ Decode uses a paged Flash V100 kernel that reads vLLM's KV cache directly.
 
 from __future__ import annotations
 
+import os
+import sys
+
 import torch
 
 from vllm.logger import init_logger
@@ -21,16 +24,77 @@ from vllm.v1.attention.backends.triton_attn import (
 
 logger = init_logger(__name__)
 
+_TILELANG_ENABLE_ENV = "VLLM_TILELANG_FA_V100"
+_TILELANG_SRC_DIR_ENV = "VLLM_TILELANG_FA_V100_SRC_DIR"
+
 # Lazy imports: only resolve optional CUDA extensions when needed.
+_tilelang_paged_forward = None
+_tilelang_decode_forward = None
+_tilelang_unavailable_reason = None
 _flash_attn_func = None
 _flash_attn_decode_paged = None
 _paged_kv_utils = None
+_warned_tilelang_unavailable = False
 _warned_prefill_fallback = False
 _warned_feature_fallback = False
 _warned_decode_fallback = False
 _warned_missing_flash_ops = False
 _logged_prefill_flash = False
 _logged_decode_flash = False
+_logged_tilelang_prefill = False
+_logged_tilelang_decode = False
+
+
+def _tilelang_enabled() -> bool:
+    value = os.environ.get(_TILELANG_ENABLE_ENV, "1").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
+def _maybe_add_tilelang_src_dir() -> None:
+    src_dir = os.environ.get(_TILELANG_SRC_DIR_ENV)
+    if src_dir and src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+
+
+def _get_tilelang_ops():
+    """Lazy-load TileLang FA-V100 ops when the package/source is available."""
+    global _tilelang_decode_forward, _tilelang_paged_forward
+    global _tilelang_unavailable_reason
+
+    if not _tilelang_enabled():
+        _tilelang_unavailable_reason = f"{_TILELANG_ENABLE_ENV}=0"
+        return None, None
+
+    if _tilelang_paged_forward is None or _tilelang_decode_forward is None:
+        try:
+            from tilelang_fa_v100 import (
+                tilelang_decode_forward,
+                tilelang_paged_forward,
+            )
+        except ImportError as first_error:
+            _maybe_add_tilelang_src_dir()
+            try:
+                from tilelang_fa_v100 import (
+                    tilelang_decode_forward,
+                    tilelang_paged_forward,
+                )
+            except ImportError as second_error:
+                _tilelang_unavailable_reason = (
+                    f"{first_error}; retry with {_TILELANG_SRC_DIR_ENV} "
+                    f"failed: {second_error}"
+                )
+                _tilelang_paged_forward = None
+                _tilelang_decode_forward = None
+            else:
+                _tilelang_paged_forward = tilelang_paged_forward
+                _tilelang_decode_forward = tilelang_decode_forward
+                _tilelang_unavailable_reason = None
+        else:
+            _tilelang_paged_forward = tilelang_paged_forward
+            _tilelang_decode_forward = tilelang_decode_forward
+            _tilelang_unavailable_reason = None
+
+    return _tilelang_paged_forward, _tilelang_decode_forward
 
 
 def _get_flash_ops():
@@ -70,6 +134,19 @@ def _get_paged_kv_utils():
     return _paged_kv_utils
 
 
+def _split_kv_cache(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(kv_cache, (list, tuple)):
+        return kv_cache[0], kv_cache[1]
+    if kv_cache.ndim >= 2 and kv_cache.shape[1] == 2:
+        return kv_cache.unbind(1)
+    if kv_cache.shape[0] == 2:
+        return kv_cache.unbind(0)
+    raise ValueError(
+        f"Unexpected KV cache shape {tuple(kv_cache.shape)}; "
+        "expected dimension 2 at axis 0 or 1"
+    )
+
+
 def _has_prefix_context(attn_metadata: TritonAttentionMetadata) -> bool:
     """Return True if any sequence has KV context before current query tokens."""
     query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
@@ -92,18 +169,7 @@ def _extract_contiguous_kv_from_paged_cache(
 
     paged_kv_utils = _get_paged_kv_utils()
 
-    if isinstance(kv_cache, (list, tuple)):
-        key_cache, value_cache = kv_cache[0], kv_cache[1]
-    else:
-        if kv_cache.shape[0] == 2:
-            key_cache, value_cache = kv_cache.unbind(0)
-        elif kv_cache.shape[1] == 2:
-            key_cache, value_cache = kv_cache.unbind(1)
-        else:
-            raise ValueError(
-                f"Unexpected KV cache shape {tuple(kv_cache.shape)}; "
-                "expected dimension 2 at axis 0 or 1"
-            )
+    key_cache, value_cache = _split_kv_cache(kv_cache)
 
     if paged_kv_utils is not None:
         k_cont = paged_kv_utils.paged_to_contiguous(key_cache, block_table, seq_lens)
@@ -165,9 +231,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.tilelang_paged_forward, self.tilelang_decode_forward = _get_tilelang_ops()
+        self.use_tilelang_v100 = (
+            self.tilelang_paged_forward is not None
+            and self.tilelang_decode_forward is not None
+        )
         self.flash_attn_func, self.flash_attn_decode_paged = _get_flash_ops()
-        self.use_flash_v100 = self.flash_attn_func is not None
-        self.use_flash_v100_decode = self.flash_attn_decode_paged is not None
+        self.use_flash_v100 = self.use_tilelang_v100 or self.flash_attn_func is not None
+        self.use_flash_v100_decode = (
+            self.use_tilelang_v100 or self.flash_attn_decode_paged is not None
+        )
         self._decode_cache_k: torch.Tensor | None = None
         self._decode_cache_v: torch.Tensor | None = None
         self._decode_cache_len = 0
@@ -295,6 +368,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         """Check whether current layer/config can run Flash V100 safely."""
         return (
             self.use_flash_v100
+            and (self.head_size <= 256 or self.use_tilelang_v100)
             and self.attn_type == AttentionType.DECODER
             and self.alibi_slopes is None
             and self.logits_soft_cap == 0
@@ -317,22 +391,38 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> torch.Tensor:
         """Forward path.
 
-        - Prefill: use dense Flash V100 only when there is no prefix context.
-        - Decode: use paged Flash V100 when available, otherwise fall back.
+        - Prefill: prefer TileLang paged FA-V100, otherwise dense Flash V100,
+          only when there is no prefix context.
+        - Decode: prefer TileLang paged decode, otherwise Flash V100 decode.
         """
         global _logged_decode_flash, _logged_prefill_flash
+        global _logged_tilelang_decode, _logged_tilelang_prefill
         global _warned_decode_fallback, _warned_prefill_fallback
         global _warned_feature_fallback, _warned_missing_flash_ops
+        global _warned_tilelang_unavailable
 
         if attn_metadata is None:
             assert output is not None
             return output.fill_(0)
 
+        if (
+            not self.use_tilelang_v100
+            and self.flash_attn_func is not None
+            and not _warned_tilelang_unavailable
+            and _tilelang_enabled()
+        ):
+            logger.warning(
+                "TileLang FA-V100 is unavailable (%s). Using flash_attn_v100 "
+                "compatibility path.",
+                _tilelang_unavailable_reason,
+            )
+            _warned_tilelang_unavailable = True
+
         if not self.use_flash_v100 and not _warned_missing_flash_ops:
             logger.warning(
                 "FLASH_ATTN_V100 backend selected, but optional module "
-                "'flash_attn_v100' is unavailable. Falling back to Triton "
-                "attention paths."
+                "'tilelang_fa_v100'/'flash_attn_v100' is unavailable. "
+                "Falling back to Triton attention paths."
             )
             _warned_missing_flash_ops = True
 
@@ -401,7 +491,31 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 )
                 _logged_prefill_flash = True
             self._reset_decode_cache()
+            if self.use_tilelang_v100:
+                if not _logged_tilelang_prefill:
+                    logger.info(
+                        "FLASH_ATTN_V100 TileLang prefill path active "
+                        "(paged KV kernel)."
+                    )
+                    _logged_tilelang_prefill = True
+                return self._tilelang_v100_prefill(
+                    query, kv_cache, attn_metadata, output
+                )
             return self._flash_v100_prefill(query, key, value, attn_metadata, output)
+
+        if self.use_tilelang_v100:
+            if not _logged_tilelang_decode:
+                logger.info(
+                    "FLASH_ATTN_V100 TileLang decode path active "
+                    "(paged KV kernel)."
+                )
+                _logged_tilelang_decode = True
+            return self._tilelang_v100_decode(
+                query,
+                kv_cache,
+                attn_metadata,
+                output,
+            )
 
         if not self.use_flash_v100_decode:
             if self.use_flash_v100 and not _warned_decode_fallback:
@@ -474,6 +588,73 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         return output
 
+    def _tilelang_v100_prefill(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prefill path using TileLang directly over vLLM's paged KV cache."""
+        assert self.tilelang_paged_forward is not None
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        query = query[:num_actual_tokens]
+        out_view = output[:num_actual_tokens]
+
+        if query.shape[0] == 0:
+            return output
+
+        key_cache, value_cache = _split_kv_cache(kv_cache)
+        query_start_loc = attn_metadata.query_start_loc
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        prefix_kv_lens = attn_metadata.seq_lens - query_lens
+
+        self.tilelang_paged_forward(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            query_start_loc,
+            prefix_kv_lens,
+            out=out_view,
+            block_size=key_cache.shape[1],
+            num_kv_heads=self.num_kv_heads,
+            softmax_scale=self.scale,
+            causal=True,
+        )
+        return output
+
+    def _tilelang_v100_decode(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode path using TileLang directly over vLLM's paged KV cache."""
+        assert self.tilelang_decode_forward is not None
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        query = query[:num_actual_tokens]
+        out_view = output[:num_actual_tokens]
+
+        if query.shape[0] == 0:
+            return output
+
+        key_cache, value_cache = _split_kv_cache(kv_cache)
+        result = self.tilelang_decode_forward(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            block_size=key_cache.shape[1],
+            num_kv_heads=self.num_kv_heads,
+            softmax_scale=self.scale,
+        )
+        out_view.copy_(result)
+        return output
+
     def _flash_v100_decode(
         self,
         query: torch.Tensor,
@@ -491,10 +672,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if query.shape[0] == 0:
             return output
 
-        if kv_cache.shape[0] == 2:
-            key_cache, value_cache = kv_cache.unbind(0)
-        else:
-            key_cache, value_cache = kv_cache.unbind(1)
+        key_cache, value_cache = _split_kv_cache(kv_cache)
 
         self.flash_attn_decode_paged(
             query,
@@ -529,4 +707,8 @@ class FlashAttnV100Backend(TritonAttentionBackend):
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         # Flash Attention V100 requires head_dim % 8 == 0.
-        return [64, 80, 96, 112, 128, 256]
+        return [64, 80, 96, 112, 128, 256, 512]
+
+    @classmethod
+    def supports_head_size(cls, head_size: int) -> bool:
+        return head_size in cls.get_supported_head_sizes()

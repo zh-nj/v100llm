@@ -5,6 +5,7 @@ from .flash_attn_interface import (
     flash_attn_decode_paged,
     flash_attn_func,
     flash_attn_varlen_func,
+    fa2_varlen_supports_s_aux,
     get_scheduler_metadata,
     sparse_attn_func,
     sparse_attn_varlen_func,

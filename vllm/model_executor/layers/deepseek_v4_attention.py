@@ -3751,7 +3751,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     q,
                     extra={
                         "chunk_idx": chunk_idx,
-                        "num_chunk_tokens": int(chunk_size),
+                        "chunk_size_reqs": int(chunk_size),
+                        "num_chunk_tokens": int(num_chunk_tokens),
+                        "prefill_chunk_size_reqs": int(PREFILL_CHUNK_SIZE),
+                        "M": int(M),
+                        "N": int(N),
                     },
                 ):
                     dequantize_and_gather_k_cache(
@@ -3770,7 +3774,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 q,
                 extra={
                     "chunk_idx": chunk_idx,
-                    "num_chunk_tokens": int(chunk_size),
+                    "chunk_size_reqs": int(chunk_size),
+                    "num_chunk_tokens": int(num_chunk_tokens),
+                    "prefill_chunk_size_reqs": int(PREFILL_CHUNK_SIZE),
+                    "M": int(M),
+                    "N": int(N),
                 },
             ):
                 dequantize_and_gather_k_cache(
@@ -3801,7 +3809,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 q,
                 extra={
                     "chunk_idx": chunk_idx,
-                    "num_chunk_tokens": int(chunk_size),
+                    "chunk_size_reqs": int(chunk_size),
+                    "num_chunk_tokens": int(num_chunk_tokens),
+                    "prefill_chunk_size_reqs": int(PREFILL_CHUNK_SIZE),
+                    "top_k": int(top_k),
+                    "M": int(M),
+                    "N": int(N),
                 },
             ):
                 combined_indices, combined_lens = combine_topk_swa_indices(
@@ -3886,8 +3899,21 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     q,
                     extra={
                         "chunk_idx": chunk_idx,
+                        "chunk_size_reqs": int(chunk_size),
                         "num_chunk_tokens": int(num_chunk_tokens),
                         "combined_lens_max": combined_lens_max,
+                        "top_k": int(top_k),
+                        "M": int(M),
+                        "N": int(N),
+                        "tilelang_bi": int(
+                            envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_BI
+                        ),
+                        "tilelang_stages": int(
+                            envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES
+                        ),
+                        "tilelang_heads_per_block": int(
+                            envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK
+                        ),
                     },
                 ):
                     q_slice = q[query_start:query_end]

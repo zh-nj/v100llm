@@ -161,7 +161,18 @@ class FlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        return head_size % 8 == 0 and head_size <= 512
+        if head_size % 8 != 0:
+            return False
+        if head_size <= 256:
+            return True
+        try:
+            from vllm.vllm_flash_attn import is_fa_version_supported
+
+            return head_size <= 512 and (
+                is_fa_version_supported(2) or is_fa_version_supported(4)
+            )
+        except (ImportError, AssertionError, RuntimeError):
+            return False
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
@@ -683,6 +694,7 @@ class FlashAttentionImpl(AttentionImpl):
         return (
             current_platform.is_cuda()
             and self.vllm_flash_attn_version == 2
+            and self.head_size <= 256
             and self.dcp_world_size == 1
             and attn_metadata.causal
             and attn_metadata.max_query_len == 2

@@ -9,6 +9,7 @@ from vllm.model_executor.models.gemma4 import (
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Backend
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
@@ -46,6 +47,26 @@ def test_gemma4_mixed_attention_respects_user_backend_override() -> None:
     )
 
     assert backend is None
+
+
+def test_gemma4_sm70_respects_flash_attn_v100_override() -> None:
+    sliding_backend = _select_gemma4_text_attention_backend(
+        layer_type="sliding_attention",
+        head_dim=256,
+        capability=DeviceCapability(7, 0),
+        user_backend=AttentionBackendEnum.FLASH_ATTN_V100,
+        kv_transfer_enabled=False,
+    )
+    full_backend = _select_gemma4_text_attention_backend(
+        layer_type="full_attention",
+        head_dim=512,
+        capability=DeviceCapability(7, 0),
+        user_backend=AttentionBackendEnum.FLASH_ATTN_V100,
+        kv_transfer_enabled=False,
+    )
+
+    assert sliding_backend is FlashAttnV100Backend
+    assert full_backend is FlashAttnV100Backend
 
 
 def test_gemma4_mixed_attention_disables_itself_for_kv_transfer() -> None:
