@@ -128,6 +128,18 @@ _PREFILL_CUDAGRAPH_DEBUG = os.getenv("VLLM_PREFILL_CUDAGRAPH_DEBUG", "0") == "1"
 _PREFILL_CUDAGRAPH_PERF_GATE = (
     os.getenv("VLLM_PREFILL_CUDAGRAPH_PERF_GATE", "0") == "1"
 )
+# P5-E debug: when set with VLLM_DEEPSEEK_V4_PREFILL_INDEXED=1, run BOTH
+# the existing path (gather + sparse_fwd) AND the new indexed kernel for
+# every chunk, then diff the outputs. The chunk uses the existing path's
+# output as the ground truth (production semantics unchanged); the indexed
+# output is dropped after the diff is logged. Used to validate P5 against
+# real-model paged caches before flipping the env default.
+_PREFILL_INDEXED_DEBUG = os.getenv(
+    "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG", "0") == "1"
+_PREFILL_INDEXED_DEBUG_LOG_EVERY = int(os.getenv(
+    "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_LOG_EVERY", "1"))
+_PREFILL_INDEXED_DEBUG_FAIL_ATOL = float(os.getenv(
+    "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_FAIL_ATOL", "1e-2"))
 _DEEPSEEK_V4_PROFILE_ENABLED = os.getenv("VLLM_DEEPSEEK_V4_PROFILE", "0") == "1"
 _DEEPSEEK_V4_PROFILE_NVTX = os.getenv("VLLM_DEEPSEEK_V4_PROFILE_NVTX", "0") == "1"
 _DEEPSEEK_V4_PROFILE_LOG_EVERY = int(
@@ -3838,8 +3850,17 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         swa_block_size=swa_bs,
                         output_dtype=torch.bfloat16,
                     )
-                output_slice.copy_(flash_out)
-                continue
+                if _PREFILL_INDEXED_DEBUG:
+                    # P5-E debug mode: save the indexed kernel's output
+                    # for post-existing-path diff. Do NOT consume it as
+                    # the canonical output; let the existing path run
+                    # below and write to output_slice. We compare after.
+                    indexed_debug_out = flash_out.clone()
+                else:
+                    output_slice.copy_(flash_out)
+                    continue
+            else:
+                indexed_debug_out = None
 
             assert kv is not None
             if not swa_only:
@@ -4094,6 +4115,29 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         f"{self.prefix}.prefill.max_logits", max_logits
                     )
                     _trace_tensor_summary(f"{self.prefix}.prefill.lse", lse)
+
+            # P5-E debug-mode comparison: indexed kernel ran above (its
+            # output was saved into indexed_debug_out without overwriting
+            # output_slice); existing path ran here and wrote output_slice.
+            # Diff the two and log MAE/maxAE.
+            if (
+                _PREFILL_INDEXED_DEBUG
+                and indexed_debug_out is not None
+                and (chunk_idx % _PREFILL_INDEXED_DEBUG_LOG_EVERY == 0)
+            ):
+                e = indexed_debug_out.float() - output_slice.float()
+                mae = e.abs().mean().item()
+                max_ae = e.abs().max().item()
+                logger.warning(
+                    "[P5E_DEBUG] %s chunk=%d num_tokens=%d "
+                    "MAE=%.4e maxAE=%.4e (indexed vs existing)",
+                    self.prefix, chunk_idx, num_chunk_tokens, mae, max_ae,
+                )
+                if max_ae > _PREFILL_INDEXED_DEBUG_FAIL_ATOL:
+                    logger.error(
+                        "[P5E_DEBUG] FAIL: maxAE=%.4e exceeds atol=%.4e",
+                        max_ae, _PREFILL_INDEXED_DEBUG_FAIL_ATOL,
+                    )
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
