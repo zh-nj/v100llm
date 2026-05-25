@@ -3859,6 +3859,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         comp_block_size=comp_bs,
                         swa_block_size=swa_bs,
                         output_dtype=torch.bfloat16,
+                        # Empirical (P5-H autotune at T_q=4096): num_stages=2
+                        # gives ~2% better median time vs ns=1 on
+                        # large chunks. For small T_q (decode, 1
+                        # request short prefill) ns=1 may be marginally
+                        # better but the gap is well within noise.
+                        num_stages=(
+                            2 if num_chunk_tokens >= 1024 else 1
+                        ),
                     )
                 if envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG:
                     # P5-E debug mode: save the indexed kernel's output
