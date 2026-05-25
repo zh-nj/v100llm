@@ -117,6 +117,17 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG: bool = False
     VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_LOG_EVERY: int = 1
     VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_FAIL_ATOL: float = 1e-2
+
+    # P6: stateful frontier prototype. When enabled, V4 SWA ring blocks
+    # are snapshotted on completion and looked up by full-MLA BlockHash
+    # to enable prefix caching for sparse SWA layers.
+    # Default OFF until P6 task 41a-41e validation completes (commit-and-
+    # stabilize policy mirrors P5).
+    VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE: bool = False
+    # Snapshot pool byte budget per layer. 60 SWA layers × this byte cap
+    # = total snapshot memory upper bound. Default 32 MiB per layer
+    # gives ~1.9 GiB total (about 80 cached prefixes at 16k tokens).
+    VLLM_DEEPSEEK_V4_SWA_SNAPSHOT_BYTES: int = 32 * 1024 * 1024
     VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE: bool = True
     VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB: bool = True
     VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS: int = 4
@@ -1001,6 +1012,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_FAIL_ATOL": lambda: float(
         os.getenv("VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_FAIL_ATOL", "1e-2")
+    ),
+    # P6 task 41: SWA prefix caching opt-in. When 1, the
+    # RingSlidingWindowMLAManager consults SWARingSnapshotPool and the
+    # worker copies snapshot blocks into fresh request rings on cache hit.
+    # Default 0 (= upstream behavior, prefix cache disabled for SWA ring).
+    "VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE", "0"))
+    ),
+    # P6 task 41: per-layer snapshot pool byte cap.
+    "VLLM_DEEPSEEK_V4_SWA_SNAPSHOT_BYTES": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_SWA_SNAPSHOT_BYTES",
+                  str(32 * 1024 * 1024))
     ),
     "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", "1"))

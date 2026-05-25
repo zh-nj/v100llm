@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
+from vllm import envs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -641,8 +642,18 @@ class RingSlidingWindowMLAManager(SlidingWindowManager):
 
     The worker maps logical block positions to request-local physical ring
     slots, so this manager must not consume IDs from the shared BlockPool.
-    Prefix cache is disabled for the ring group because per-request rings are
-    not populated when a new request reuses cached full-MLA blocks.
+
+    Prefix cache opt-in (P6 task 41b): when env
+    `VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE` is set, this manager will consult
+    the per-layer `SWARingSnapshotPool` (populated by the worker via
+    `DeepseekV4SWACache.snapshot_finished_block`) and report cache hits
+    on prefixes whose last `sliding_window` tokens are in the snapshot
+    pool. Worker hook for replaying snapshots into a fresh ring is
+    task 41c.
+
+    When the env var is not set, behavior is identical to the upstream
+    "always return []" path: prefix cache stays disabled for the ring
+    group.
     """
 
     def get_num_blocks_to_allocate(
@@ -708,7 +719,89 @@ class RingSlidingWindowMLAManager(SlidingWindowManager):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
     ) -> tuple[list[KVCacheBlock], ...]:
-        return tuple([] for _ in range(len(kv_cache_group_ids)))
+        # Default path: prefix cache disabled for the ring group.
+        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE:
+            return tuple([] for _ in range(len(kv_cache_group_ids)))
+
+        # Opt-in path (P6 task 41b): consult the SWARingSnapshotPool
+        # registry. The pool is keyed by SWA-block-size BlockHash chain
+        # already (BlockHashListWithBlockSize converts upstream).
+        from vllm.v1.attention.backends.mla.swa_ring_snapshot_pool import (
+            SWARingSnapshotPoolRegistry,
+        )
+
+        registry = SWARingSnapshotPoolRegistry.get()
+        layer_prefixes = registry.all_layers()
+        if not layer_prefixes:
+            return tuple([] for _ in range(len(kv_cache_group_ids)))
+
+        assert isinstance(kv_cache_spec, SlidingWindowSpec), (
+            "RingSlidingWindowMLAManager requires SlidingWindowSpec"
+        )
+        block_size = kv_cache_spec.block_size
+
+        # We mirror SlidingWindowManager's right-to-left scan, but
+        # check the snapshot pool instead of block_pool.get_cached_block.
+        # Pick the first registered layer as the canonical source of
+        # truth — all SWA layers share the same hash chain because
+        # registration happens per-block-completion which is synchronized
+        # across layers via the same per-step rotation.
+        canonical_layer = layer_prefixes[0]
+        canonical_pool = registry.lookup_layer(canonical_layer)
+        assert canonical_pool is not None
+
+        sliding_window_contiguous_blocks = cdiv(
+            kv_cache_spec.sliding_window - 1, block_size
+        )
+        if use_eagle:
+            sliding_window_contiguous_blocks += 1
+
+        max_num_blocks = max_length // block_size
+        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            [block_pool.null_block] * max_num_blocks
+            for _ in range(len(kv_cache_group_ids))
+        )
+
+        num_contiguous_blocks = 0
+        match_found = False
+        for i in range(max_num_blocks - 1, -1, -1):
+            block_hash = block_hashes[i]
+            # Pool returns a tensor or None; the actual tensor is unused
+            # at this stage — we just need to know whether it exists.
+            # The worker re-fetches it via lookup() during admission.
+            if canonical_pool.lookup(block_hash) is not None:
+                if num_contiguous_blocks == 0 and block_size != alignment_tokens:
+                    post_pop_blocks = i if use_eagle else i + 1
+                    if (post_pop_blocks * block_size) % alignment_tokens != 0:
+                        continue
+                num_contiguous_blocks += 1
+                if num_contiguous_blocks >= sliding_window_contiguous_blocks:
+                    for computed in computed_blocks:
+                        del computed[i + num_contiguous_blocks :]
+                    match_found = True
+                    break
+            else:
+                num_contiguous_blocks = 0
+
+        if not match_found:
+            for computed in computed_blocks:
+                del computed[num_contiguous_blocks:]
+            while (
+                block_size != alignment_tokens
+                and len(computed_blocks[0]) * block_size % alignment_tokens != 0
+            ):
+                for computed in computed_blocks:
+                    computed.pop()
+        if use_eagle and computed_blocks[0]:
+            for computed in computed_blocks:
+                computed.pop()
+            while (
+                block_size != alignment_tokens
+                and len(computed_blocks[0]) * block_size % alignment_tokens != 0
+            ):
+                for computed in computed_blocks:
+                    computed.pop()
+        return computed_blocks
 
 
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
