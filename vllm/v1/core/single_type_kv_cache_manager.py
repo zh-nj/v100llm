@@ -723,16 +723,15 @@ class RingSlidingWindowMLAManager(SlidingWindowManager):
         if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE:
             return tuple([] for _ in range(len(kv_cache_group_ids)))
 
-        # Opt-in path (P6 task 41b): consult the SWARingSnapshotPool
-        # registry. The pool is keyed by SWA-block-size BlockHash chain
-        # already (BlockHashListWithBlockSize converts upstream).
+        # Opt-in path (P6 task 41b): consult the engine-core
+        # SWARingSnapshotIndex. The index is populated by per-rank
+        # ack messages from worker prefill snapshot copy-out (task 41c).
         from vllm.v1.attention.backends.mla.swa_ring_snapshot_pool import (
-            SWARingSnapshotPoolRegistry,
+            SWARingSnapshotIndex,
         )
 
-        registry = SWARingSnapshotPoolRegistry.get()
-        layer_prefixes = registry.all_layers()
-        if not layer_prefixes:
+        index = SWARingSnapshotIndex.get()
+        if index.stats["available_entries"] == 0:
             return tuple([] for _ in range(len(kv_cache_group_ids)))
 
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
@@ -741,15 +740,8 @@ class RingSlidingWindowMLAManager(SlidingWindowManager):
         block_size = kv_cache_spec.block_size
 
         # We mirror SlidingWindowManager's right-to-left scan, but
-        # check the snapshot pool instead of block_pool.get_cached_block.
-        # Pick the first registered layer as the canonical source of
-        # truth — all SWA layers share the same hash chain because
-        # registration happens per-block-completion which is synchronized
-        # across layers via the same per-step rotation.
-        canonical_layer = layer_prefixes[0]
-        canonical_pool = registry.lookup_layer(canonical_layer)
-        assert canonical_pool is not None
-
+        # check the engine-core SWARingSnapshotIndex instead of
+        # block_pool.get_cached_block.
         sliding_window_contiguous_blocks = cdiv(
             kv_cache_spec.sliding_window - 1, block_size
         )
@@ -766,10 +758,7 @@ class RingSlidingWindowMLAManager(SlidingWindowManager):
         match_found = False
         for i in range(max_num_blocks - 1, -1, -1):
             block_hash = block_hashes[i]
-            # Pool returns a tensor or None; the actual tensor is unused
-            # at this stage — we just need to know whether it exists.
-            # The worker re-fetches it via lookup() during admission.
-            if canonical_pool.lookup(block_hash) is not None:
+            if index.is_available(bytes(block_hash)):
                 if num_contiguous_blocks == 0 and block_size != alignment_tokens:
                     post_pop_blocks = i if use_eagle else i + 1
                     if (post_pop_blocks * block_size) % alignment_tokens != 0:

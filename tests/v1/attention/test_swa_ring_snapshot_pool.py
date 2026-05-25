@@ -218,3 +218,135 @@ def test_registry_singleton():
     a = SWARingSnapshotPoolRegistry.get()
     b = SWARingSnapshotPoolRegistry.get()
     assert a is b
+
+
+
+# ---------------- Index tests -----------------
+
+
+def _fresh_index():
+    from vllm.v1.attention.backends.mla.swa_ring_snapshot_pool import (
+        SWARingSnapshotIndex,
+    )
+    SWARingSnapshotIndex._instance = None
+    return SWARingSnapshotIndex.get()
+
+
+def test_index_singleton():
+    from vllm.v1.attention.backends.mla.swa_ring_snapshot_pool import (
+        SWARingSnapshotIndex,
+    )
+    SWARingSnapshotIndex._instance = None
+    a = SWARingSnapshotIndex.get()
+    b = SWARingSnapshotIndex.get()
+    assert a is b
+
+
+def test_index_promotes_when_all_ranks_ack():
+    idx = _fresh_index()
+    h = b"hash_promo"
+    # rank 0 ack only — pending.
+    idx.add_ack(h, rank=0)
+    assert not idx.is_available(h)
+    promoted = idx.mark_available_if_ack_complete(h, expected_ranks=2)
+    assert promoted is False
+
+    # rank 1 ack — now eligible.
+    idx.add_ack(h, rank=1)
+    promoted = idx.mark_available_if_ack_complete(h, expected_ranks=2)
+    assert promoted is True
+    assert idx.is_available(h)
+
+
+def test_index_idempotent_promotion():
+    idx = _fresh_index()
+    h = b"hash_idem"
+    idx.add_ack(h, rank=0)
+    idx.mark_available_if_ack_complete(h, expected_ranks=1)
+    # Promoting again returns False; already available.
+    again = idx.mark_available_if_ack_complete(h, expected_ranks=1)
+    assert again is False
+
+
+def test_index_redundant_ack_after_promotion():
+    """Ack arriving after promotion should not corrupt state."""
+    idx = _fresh_index()
+    h = b"hash_redundant"
+    idx.add_ack(h, rank=0)
+    idx.mark_available_if_ack_complete(h, expected_ranks=1)
+    # Late ack from same/different rank: just refreshes LRU position.
+    idx.add_ack(h, rank=1)
+    assert idx.is_available(h)
+
+
+def test_index_lookup_miss():
+    idx = _fresh_index()
+    assert not idx.is_available(b"missing")
+
+
+def test_index_eviction_caps_size():
+    from vllm.v1.attention.backends.mla.swa_ring_snapshot_pool import (
+        SWARingSnapshotIndex,
+    )
+    SWARingSnapshotIndex._instance = None
+    idx = SWARingSnapshotIndex(max_entries=3)
+    for i in range(5):
+        h = f"h{i}".encode()
+        idx.add_ack(h, rank=0)
+        idx.mark_available_if_ack_complete(h, expected_ranks=1)
+    assert idx.stats["available_entries"] == 3
+    # Oldest two evicted.
+    assert not idx.is_available(b"h0")
+    assert not idx.is_available(b"h1")
+    assert idx.is_available(b"h2")
+    assert idx.is_available(b"h3")
+    assert idx.is_available(b"h4")
+
+
+def test_index_lookup_refreshes_lru():
+    from vllm.v1.attention.backends.mla.swa_ring_snapshot_pool import (
+        SWARingSnapshotIndex,
+    )
+    SWARingSnapshotIndex._instance = None
+    idx = SWARingSnapshotIndex(max_entries=3)
+    for i in range(3):
+        h = f"h{i}".encode()
+        idx.add_ack(h, rank=0)
+        idx.mark_available_if_ack_complete(h, expected_ranks=1)
+    # touch h0 to refresh.
+    assert idx.is_available(b"h0")
+    # add h3 → should evict h1 (now LRU).
+    idx.add_ack(b"h3", rank=0)
+    idx.mark_available_if_ack_complete(b"h3", expected_ranks=1)
+    assert idx.is_available(b"h0")
+    assert not idx.is_available(b"h1")
+    assert idx.is_available(b"h2")
+    assert idx.is_available(b"h3")
+
+
+def test_index_stats_track_lookups_and_hits():
+    idx = _fresh_index()
+    idx.add_ack(b"a", rank=0)
+    idx.mark_available_if_ack_complete(b"a", expected_ranks=1)
+    idx.is_available(b"a")
+    idx.is_available(b"a")
+    idx.is_available(b"miss")
+    s = idx.stats
+    assert s["acks"] == 1
+    assert s["promotions"] == 1
+    assert s["lookups"] == 3
+    assert s["hits"] == 2
+
+
+def test_index_reset_clears_state():
+    idx = _fresh_index()
+    idx.add_ack(b"a", rank=0)
+    idx.mark_available_if_ack_complete(b"a", expected_ranks=1)
+    idx.add_ack(b"b", rank=0)  # pending only
+    assert idx.stats["available_entries"] == 1
+    assert idx.stats["pending_entries"] == 1
+
+    idx.reset()
+    assert idx.stats["available_entries"] == 0
+    assert idx.stats["pending_entries"] == 0
+    assert not idx.is_available(b"a")
