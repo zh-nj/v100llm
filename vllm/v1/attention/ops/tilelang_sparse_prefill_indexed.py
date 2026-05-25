@@ -82,6 +82,7 @@ def flash_mla_sparse_fwd_indexed_fp8(
     threads: int = 128,
     pv_gemm_policy: str = "full_row",
     output_dtype: torch.dtype = torch.bfloat16,
+    rows_per_chunk: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Production wrapper for the P5-C indexed FP8 prefill kernel.
 
@@ -114,6 +115,7 @@ def flash_mla_sparse_fwd_indexed_fp8(
         threads=threads,
         pv_gemm_policy=pv_gemm_policy,
         output_dtype=output_dtype,
+        rows_per_chunk=rows_per_chunk,
     )
 
 
