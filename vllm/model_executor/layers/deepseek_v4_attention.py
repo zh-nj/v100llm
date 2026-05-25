@@ -3764,12 +3764,20 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 and not swa_only
                 and self.compress_ratio == 4
                 and compressed_k_cache is not None
-                and q.shape[-1] == 576  # NoPE 512 + RoPE 64; the
-                                       # P5-C kernel is hardcoded to this
-                                       # head dim. Other shapes (e.g. dummy
-                                       # profile run with d_qk=512) fall
-                                       # through to the existing path.
+                and q.shape[-1] in (512, 576)  # P5-C kernel internally
+                                              # operates on a 512-dim
+                                              # KV (NoPE 448 + RoPE 64).
+                                              # q can be 512 (production
+                                              # prefill) or 576 (some
+                                              # legacy paths).
             ):
+                if envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG:
+                    logger.warning(
+                        "[P5E_DEBUG] DISPATCH ENTERED %s chunk=%d num_tokens=%d "
+                        "compress_ratio=%d q.shape=%s",
+                        self.prefix, chunk_idx, num_chunk_tokens,
+                        self.compress_ratio, tuple(q.shape),
+                    )
                 from vllm.v1.attention.ops.tilelang_sparse_prefill_indexed import (  # noqa: PLC0415, E501
                     flash_mla_sparse_fwd_indexed_fp8,
                 )
@@ -3844,7 +3852,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         compressed_local_indices=topk_local,
                         compressed_lens=compressed_lens,
                         swa_lens=swa_lens_chunk,
-                        seq_lens=chunk_seq_lens.to(torch.int32),
+                        abs_pos=abs_pos.to(torch.int32),
                         query_to_req=query_to_req,
                         sm_scale=self.scale,
                         attn_sink=self.attn_sink,
@@ -3863,6 +3871,18 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     continue
             else:
                 indexed_debug_out = None
+                if (
+                    envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED
+                    and envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG
+                ):
+                    logger.warning(
+                        "[P5E_DEBUG] DISPATCH SKIPPED %s chunk=%d num_tokens=%d "
+                        "swa_only=%s compress_ratio=%d compressed_k_cache_is_none=%s "
+                        "q.shape=%s",
+                        self.prefix, chunk_idx, num_chunk_tokens,
+                        swa_only, self.compress_ratio,
+                        compressed_k_cache is None, tuple(q.shape),
+                    )
 
             assert kv is not None
             if not swa_only:
