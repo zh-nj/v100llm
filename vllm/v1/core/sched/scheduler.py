@@ -3,7 +3,7 @@
 import itertools
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -36,13 +36,18 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.attention.backends.mla.swa_ring_snapshot_pool import (
+    SWARingSnapshotIndex,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashListWithBlockSize
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
     NewRequestData,
+    SWARingSnapshotData,
     SchedulerOutput,
 )
 from vllm.v1.core.sched.request_queue import (
@@ -52,7 +57,12 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    SlidingWindowMLASpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -62,6 +72,50 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _swa_snapshot_hashes_for_token_range(
+    *,
+    block_hashes: Sequence[BlockHash],
+    start_tokens: int,
+    end_tokens: int,
+    hash_block_size: int,
+    swa_block_size: int,
+) -> SWARingSnapshotData | None:
+    """Return SWA snapshot block hashes for full blocks crossed by a token range.
+
+    The range is half-open: [start_tokens, end_tokens). A SWA block becomes
+    snapshot-eligible when its end boundary is <= end_tokens and was not already
+    fully covered before start_tokens.
+    """
+    if end_tokens <= start_tokens:
+        return None
+    if swa_block_size % hash_block_size != 0:
+        # Cannot derive per-SWA-block hashes from coarser request hashes.
+        return None
+
+    first_block_idx = start_tokens // swa_block_size
+    end_block_idx = end_tokens // swa_block_size
+    if end_block_idx <= first_block_idx:
+        return None
+
+    if hash_block_size == swa_block_size:
+        swa_hashes: Sequence[BlockHash] = block_hashes
+    else:
+        swa_hashes = BlockHashListWithBlockSize(
+            list(block_hashes),
+            hash_block_size,
+            swa_block_size,
+        )
+
+    end_block_idx = min(end_block_idx, len(swa_hashes))
+    if end_block_idx <= first_block_idx:
+        return None
+
+    return SWARingSnapshotData(
+        start_block_idx=first_block_idx,
+        block_hashes=[bytes(h) for h in swa_hashes[first_block_idx:end_block_idx]],
+    )
 
 
 class Scheduler(SchedulerInterface):
@@ -225,6 +279,7 @@ class Scheduler(SchedulerInterface):
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
+        self.hash_block_size = hash_block_size
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -299,6 +354,52 @@ class Scheduler(SchedulerInterface):
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
+    def _get_deepseek_v4_swa_block_size(self) -> int | None:
+        for group in self.kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            specs = (
+                spec.kv_cache_specs.values()
+                if isinstance(spec, UniformTypeKVCacheSpecs)
+                else (spec,)
+            )
+            for spec_i in specs:
+                if (
+                    isinstance(spec_i, SlidingWindowMLASpec)
+                    and spec_i.model_version == "deepseek_v4"
+                    and spec_i.compress_ratio == 1
+                ):
+                    return spec_i.block_size
+        return None
+
+    def _make_swa_snapshot_data(
+        self,
+        request: Request,
+        start_tokens: int,
+        end_tokens: int,
+    ) -> SWARingSnapshotData | None:
+        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE:
+            return None
+        swa_block_size = self._get_deepseek_v4_swa_block_size()
+        if swa_block_size is None:
+            return None
+        return _swa_snapshot_hashes_for_token_range(
+            block_hashes=request.block_hashes,
+            start_tokens=start_tokens,
+            end_tokens=end_tokens,
+            hash_block_size=self.hash_block_size,
+            swa_block_size=swa_block_size,
+        )
+
+    def _mark_swa_snapshot_available(
+        self,
+        snapshot_data: SWARingSnapshotData | None,
+    ) -> None:
+        if snapshot_data is None:
+            return
+        index = SWARingSnapshotIndex.get()
+        for block_hash in snapshot_data.block_hashes:
+            index.add_available(block_hash)
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -368,6 +469,7 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        swa_snapshot_in_by_req: dict[str, SWARingSnapshotData | None] = {}
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -616,6 +718,11 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
+                    swa_snapshot_in_by_req[request_id] = self._make_swa_snapshot_data(
+                        request,
+                        start_tokens=0,
+                        end_tokens=num_new_local_computed_tokens,
+                    )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -652,6 +759,7 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+                    swa_snapshot_in_by_req[request_id] = None
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -885,13 +993,28 @@ class Scheduler(SchedulerInterface):
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
+                    swa_snapshot_in=swa_snapshot_in_by_req.get(req.request_id),
+                    swa_snapshot_out=self._make_swa_snapshot_data(
+                        req,
+                        start_tokens=req.num_computed_tokens,
+                        end_tokens=req.num_computed_tokens
+                        + num_scheduled_tokens[req.request_id],
+                    ),
                 )
                 for req in scheduled_new_reqs
             ]
         else:
             new_reqs_data = [
                 NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    swa_snapshot_in=swa_snapshot_in_by_req.get(req.request_id),
+                    swa_snapshot_out=self._make_swa_snapshot_data(
+                        req,
+                        start_tokens=req.num_computed_tokens,
+                        end_tokens=req.num_computed_tokens
+                        + num_scheduled_tokens[req.request_id],
+                    ),
                 )
                 for req in scheduled_new_reqs
             ]
@@ -904,6 +1027,11 @@ class Scheduler(SchedulerInterface):
                 scheduled_spec_decode_tokens,
                 req_to_new_blocks,
             )
+
+        for req_data in new_reqs_data:
+            self._mark_swa_snapshot_available(req_data.swa_snapshot_out)
+        for req_data in cached_reqs_data.swa_snapshot_out:
+            self._mark_swa_snapshot_available(req_data)
 
         # Record the request ids that were scheduled in this step.
         self.prev_step_scheduled_req_ids.clear()
@@ -1070,6 +1198,8 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        swa_snapshot_in: list[SWARingSnapshotData | None] = []
+        swa_snapshot_out: list[SWARingSnapshotData | None] = []
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1098,12 +1228,28 @@ class Scheduler(SchedulerInterface):
                 resumed_req_ids.add(req_id)
             if not scheduled_in_prev_step:
                 all_token_ids[req_id] = req.all_token_ids.copy()
+                swa_snapshot_in.append(
+                    self._make_swa_snapshot_data(
+                        req,
+                        start_tokens=0,
+                        end_tokens=req.num_computed_tokens,
+                    )
+                )
+            else:
+                swa_snapshot_in.append(None)
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
             )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
+            )
+            swa_snapshot_out.append(
+                self._make_swa_snapshot_data(
+                    req,
+                    start_tokens=req.num_computed_tokens,
+                    end_tokens=req.num_computed_tokens + num_scheduled_tokens[req_id],
+                )
             )
 
         return CachedRequestData(
@@ -1114,6 +1260,8 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            swa_snapshot_in=swa_snapshot_in,
+            swa_snapshot_out=swa_snapshot_out,
         )
 
     def _try_schedule_encoder_inputs(

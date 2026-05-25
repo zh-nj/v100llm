@@ -121,6 +121,9 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.mla.swa_ring_snapshot_pool import (
+    get_swa_snapshot_physical_block_ids,
+)
 from vllm.v1.attention.backends.utils import (
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
@@ -1387,6 +1390,8 @@ class GPUModelRunner(
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
+        self._apply_swa_snapshot_copyin(scheduler_output)
+
         # Incrementally update ngram_gpu tensors after batch is stable
         if is_ngram_gpu:
             update_ngram_gpu_tensors_incremental(
@@ -1432,6 +1437,92 @@ class GPUModelRunner(
             return correct_spec_decode_token_counts
         else:
             return None
+
+    def _iter_deepseek_v4_swa_snapshot_layers(self):
+        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE:
+            return
+        if not hasattr(self, "kv_cache_config") or self.kv_cache_config is None:
+            return
+        static_context = self.compilation_config.static_forward_context
+        for kv_cache_gid, kv_cache_group in enumerate(
+            self.kv_cache_config.kv_cache_groups
+        ):
+            for layer_name in kv_cache_group.layer_names:
+                layer = static_context.get(layer_name)
+                if layer is None:
+                    continue
+                if hasattr(layer, "snapshot_copy_in") and hasattr(
+                    layer, "snapshot_copy_out"
+                ):
+                    yield kv_cache_gid, layer
+
+    def _apply_swa_snapshot_copyin(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE:
+            return
+
+        snapshot_by_req = {
+            req.req_id: req.swa_snapshot_in
+            for req in scheduler_output.scheduled_new_reqs
+            if req.swa_snapshot_in is not None
+        }
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id, snapshot_data in zip(cached.req_ids, cached.swa_snapshot_in):
+            if snapshot_data is not None:
+                snapshot_by_req[req_id] = snapshot_data
+        if not snapshot_by_req:
+            return
+
+        for kv_cache_gid, layer in self._iter_deepseek_v4_swa_snapshot_layers():
+            block_table_np = self.input_batch.block_table[
+                kv_cache_gid
+            ].get_numpy_array()
+            for req_id, snapshot_data in snapshot_by_req.items():
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is None:
+                    continue
+                physical_block_ids = get_swa_snapshot_physical_block_ids(
+                    block_table_np,
+                    req_index,
+                    snapshot_data,
+                )
+                layer.snapshot_copy_in(snapshot_data.block_hashes, physical_block_ids)
+
+    def _apply_swa_snapshot_copyout(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE:
+            return
+
+        snapshot_by_req = {
+            req.req_id: req.swa_snapshot_out
+            for req in scheduler_output.scheduled_new_reqs
+            if req.swa_snapshot_out is not None
+        }
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id, snapshot_data in zip(cached.req_ids, cached.swa_snapshot_out):
+            if snapshot_data is not None:
+                snapshot_by_req[req_id] = snapshot_data
+        if not snapshot_by_req:
+            return
+
+        for kv_cache_gid, layer in self._iter_deepseek_v4_swa_snapshot_layers():
+            block_table_np = self.input_batch.block_table[
+                kv_cache_gid
+            ].get_numpy_array()
+            for req_id, snapshot_data in snapshot_by_req.items():
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is None:
+                    continue
+                physical_block_ids = get_swa_snapshot_physical_block_ids(
+                    block_table_np,
+                    req_index,
+                    snapshot_data,
+                )
+                layer.snapshot_copy_out(snapshot_data.block_hashes, physical_block_ids)
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
@@ -4059,6 +4150,9 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        with record_function_or_nullcontext("gpu_model_runner: swa_snapshot_copyout"):
+            self._apply_swa_snapshot_copyout(scheduler_output)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

@@ -279,6 +279,20 @@ def test_index_redundant_ack_after_promotion():
     assert idx.is_available(h)
 
 
+def test_index_add_available_promotes_directly_and_clears_pending():
+    idx = _fresh_index()
+    h = b"hash_direct"
+    idx.add_ack(h, rank=0)
+    assert idx.stats["pending_entries"] == 1
+
+    idx.add_available(h)
+
+    assert idx.is_available(h)
+    assert idx.stats["pending_entries"] == 0
+    assert idx.stats["available_entries"] == 1
+    assert idx.stats["promotions"] == 1
+
+
 def test_index_lookup_miss():
     idx = _fresh_index()
     assert not idx.is_available(b"missing")
@@ -350,3 +364,61 @@ def test_index_reset_clears_state():
     assert idx.stats["available_entries"] == 0
     assert idx.stats["pending_entries"] == 0
     assert not idx.is_available(b"a")
+
+
+def test_deepseek_v4_swa_cache_snapshot_copy_out_and_in(monkeypatch):
+    from vllm import envs
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+
+    monkeypatch.setattr(envs, "VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE", True)
+    monkeypatch.setattr(envs, "VLLM_DEEPSEEK_V4_SWA_SNAPSHOT_BYTES", 1 << 20)
+
+    layer = object.__new__(DeepseekV4SWACache)
+    layer.prefix = "model.layers.0.self_attn.swa"
+    layer.block_size = 64
+    layer.kv_cache = (
+        torch.arange(2 * 64 * 584, dtype=torch.int64)
+        .to(torch.uint8)
+        .reshape(2, 64, 584)
+    )
+
+    expected = layer.kv_cache[1].clone()
+    layer.snapshot_copy_out([b"h0"], [1])
+    layer.kv_cache[0].zero_()
+    layer.snapshot_copy_in([b"h0"], [0])
+
+    assert torch.equal(layer.kv_cache[0], expected)
+
+
+def test_deepseek_v4_swa_cache_snapshot_copy_in_missing_raises(monkeypatch):
+    from vllm import envs
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+
+    monkeypatch.setattr(envs, "VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE", True)
+    monkeypatch.setattr(envs, "VLLM_DEEPSEEK_V4_SWA_SNAPSHOT_BYTES", 1 << 20)
+
+    layer = object.__new__(DeepseekV4SWACache)
+    layer.prefix = "model.layers.1.self_attn.swa"
+    layer.block_size = 64
+    layer.kv_cache = torch.zeros((1, 64, 584), dtype=torch.uint8)
+
+    with pytest.raises(RuntimeError, match="missing SWA snapshot"):
+        layer.snapshot_copy_in([b"missing"], [0])
+
+
+def test_snapshot_physical_block_ids_from_worker_block_table():
+    from vllm.v1.attention.backends.mla.swa_ring_snapshot_pool import (
+        get_swa_snapshot_physical_block_ids,
+    )
+    from vllm.v1.core.sched.output import SWARingSnapshotData
+
+    block_table = torch.tensor(
+        [
+            [10, 11, 12, 13, 14],
+            [20, 21, 22, 23, 24],
+        ],
+        dtype=torch.int32,
+    ).numpy()
+    data = SWARingSnapshotData(start_block_idx=1, block_hashes=[b"a", b"b", b"c"])
+
+    assert get_swa_snapshot_physical_block_ids(block_table, 1, data) == [21, 22, 23]

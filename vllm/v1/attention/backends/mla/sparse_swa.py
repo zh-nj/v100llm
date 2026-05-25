@@ -5,9 +5,14 @@ from typing import ClassVar, cast
 
 import torch
 
+from vllm import envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.mla.swa_ring_snapshot_pool import (
+    SWARingSnapshotPool,
+    SWARingSnapshotPoolRegistry,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -22,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+from vllm.v1.core.kv_cache_utils import BlockHash
 
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
 # (topk, extra_topk, extra_page_block_size) config, so they cannot share a
@@ -73,6 +79,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         # TODO(yifan): make SWA block size automatically determined and configurable.
         self.block_size = 64
         assert self.dtype == torch.uint8
+        self._swa_snapshot_pool: SWARingSnapshotPool | None = None
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return SlidingWindowMLASpec(
@@ -90,6 +97,76 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return DeepseekSparseSWABackend
+
+    def _ensure_snapshot_pool(self) -> SWARingSnapshotPool | None:
+        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE:
+            return None
+        if self.kv_cache.numel() == 0:
+            return None
+        pool = getattr(self, "_swa_snapshot_pool", None)
+        per_token_bytes = int(self.kv_cache.shape[-1])
+        if (
+            pool is not None
+            and pool.device == self.kv_cache.device
+            and pool.dtype == self.kv_cache.dtype
+            and pool.per_token_bytes == per_token_bytes
+        ):
+            return pool
+
+        pool = SWARingSnapshotPool(
+            layer_prefix=self.prefix,
+            block_size_tokens=self.block_size,
+            per_token_bytes=per_token_bytes,
+            device=self.kv_cache.device,
+            dtype=self.kv_cache.dtype,
+            max_bytes=envs.VLLM_DEEPSEEK_V4_SWA_SNAPSHOT_BYTES,
+        )
+        self._swa_snapshot_pool = pool
+        SWARingSnapshotPoolRegistry.get().register_layer(pool)
+        return pool
+
+    def snapshot_copy_in(
+        self,
+        block_hashes: list[bytes],
+        physical_block_ids: list[int],
+    ) -> None:
+        pool = self._ensure_snapshot_pool()
+        if pool is None:
+            return
+        if len(block_hashes) != len(physical_block_ids):
+            raise ValueError(
+                f"{self.prefix}: SWA snapshot copy-in got "
+                f"{len(block_hashes)} hashes but {len(physical_block_ids)} blocks"
+            )
+
+        for block_hash, physical_block_id in zip(block_hashes, physical_block_ids):
+            snapshot = pool.lookup(BlockHash(block_hash))
+            if snapshot is None:
+                raise RuntimeError(
+                    f"{self.prefix}: missing SWA snapshot for hash "
+                    f"{block_hash.hex()[:16]}"
+                )
+            self.kv_cache[int(physical_block_id)].copy_(snapshot, non_blocking=True)
+
+    def snapshot_copy_out(
+        self,
+        block_hashes: list[bytes],
+        physical_block_ids: list[int],
+    ) -> None:
+        pool = self._ensure_snapshot_pool()
+        if pool is None:
+            return
+        if len(block_hashes) != len(physical_block_ids):
+            raise ValueError(
+                f"{self.prefix}: SWA snapshot copy-out got "
+                f"{len(block_hashes)} hashes but {len(physical_block_ids)} blocks"
+            )
+
+        for block_hash, physical_block_id in zip(block_hashes, physical_block_ids):
+            pool.register(
+                BlockHash(block_hash),
+                self.kv_cache[int(physical_block_id)],
+            )
 
 
 class DeepseekSparseSWABackend(AttentionBackend):

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -28,6 +28,12 @@ else:
 
 
 @dataclass
+class SWARingSnapshotData:
+    start_block_idx: int
+    block_hashes: list[bytes]
+
+
+@dataclass
 class NewRequestData:
     req_id: str
     prompt_token_ids: list[int] | None
@@ -42,12 +48,21 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # DeepSeek V4 SWA ring prefix-cache prototype (env-gated in scheduler).
+    # copyin: snapshots to restore into this request's per-request SWA ring
+    # before forward. copyout: blocks this step will finish and snapshot after
+    # forward. Hashes are raw bytes so scheduler/worker IPC stays pickle-simple.
+    swa_snapshot_in: SWARingSnapshotData | None = None
+    swa_snapshot_out: SWARingSnapshotData | None = None
+
     @classmethod
     def from_request(
         cls,
         request: Request,
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
+        swa_snapshot_in: SWARingSnapshotData | None = None,
+        swa_snapshot_out: SWARingSnapshotData | None = None,
     ) -> "NewRequestData":
         return cls(
             req_id=request.request_id,
@@ -60,6 +75,8 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
+            swa_snapshot_in=swa_snapshot_in,
+            swa_snapshot_out=swa_snapshot_out,
         )
 
     def __repr__(self) -> str:
@@ -76,7 +93,11 @@ class NewRequestData:
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
-            f"prompt_embeds_shape={prompt_embeds_shape}"
+            f"prompt_embeds_shape={prompt_embeds_shape},"
+            f"swa_snapshot_in_blocks="
+            f"{len(self.swa_snapshot_in.block_hashes) if self.swa_snapshot_in else 0},"
+            f"swa_snapshot_out_blocks="
+            f"{len(self.swa_snapshot_out.block_hashes) if self.swa_snapshot_out else 0}"
             ")"
         )
 
@@ -101,7 +122,11 @@ class NewRequestData:
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
-            f"prompt_embeds_shape={prompt_embeds_shape}"
+            f"prompt_embeds_shape={prompt_embeds_shape},"
+            f"swa_snapshot_in_blocks="
+            f"{len(self.swa_snapshot_in.block_hashes) if self.swa_snapshot_in else 0},"
+            f"swa_snapshot_out_blocks="
+            f"{len(self.swa_snapshot_out.block_hashes) if self.swa_snapshot_out else 0}"
             ")"
         )
 
@@ -122,6 +147,8 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    swa_snapshot_in: list[SWARingSnapshotData | None] = field(default_factory=list)
+    swa_snapshot_out: list[SWARingSnapshotData | None] = field(default_factory=list)
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -137,7 +164,11 @@ class CachedRequestData:
             f"all_token_ids_lens={all_token_ids_lens},"
             f"new_block_ids={self.new_block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
-            f"num_output_tokens={self.num_output_tokens}"
+            f"num_output_tokens={self.num_output_tokens},"
+            f"swa_snapshot_in_blocks="
+            f"{[len(x.block_hashes) if x else 0 for x in self.swa_snapshot_in]},"
+            f"swa_snapshot_out_blocks="
+            f"{[len(x.block_hashes) if x else 0 for x in self.swa_snapshot_out]}"
             f")"
         )
 
@@ -172,6 +203,8 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            swa_snapshot_in=[],
+            swa_snapshot_out=[],
         )
 
 

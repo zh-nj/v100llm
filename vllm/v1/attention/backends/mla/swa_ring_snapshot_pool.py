@@ -21,7 +21,7 @@ Design choices:
 - One snapshot pool **per layer**. Each DeepseekV4 SWA layer owns
   its own ring tensor of shape `(num_blocks, block_size, 584)`.
 - LRU eviction with a configurable byte budget (`max_bytes`),
-  default 2 GiB across all layers.
+  default 32 MiB per layer (~1.9 GiB across 60 SWA layers).
 - Returned snapshots are *views* into the pool's storage; copying
   must happen before the slot can be evicted, or we copy on read
   and refcount manually. We choose **copy on register and copy on
@@ -35,6 +35,7 @@ from __future__ import annotations
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -42,6 +43,17 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import BlockHash
 
 logger = init_logger(__name__)
+
+
+def get_swa_snapshot_physical_block_ids(
+    block_table_np: Any,
+    req_index: int,
+    snapshot_data: Any,
+) -> list[int]:
+    """Map logical SWA snapshot block indices to worker physical ring blocks."""
+    start = int(snapshot_data.start_block_idx)
+    end = start + len(snapshot_data.block_hashes)
+    return [int(x) for x in block_table_np[int(req_index), start:end]]
 
 
 @dataclass
@@ -311,6 +323,24 @@ class SWARingSnapshotIndex:
                 self._available.move_to_end(block_hash)
                 return
             self._pending_acks.setdefault(block_hash, set()).add(rank)
+
+    def add_available(self, block_hash: bytes) -> None:
+        """Write-through: mark a hash directly available without
+        per-rank ack tracking. Use this when the scheduler issues a
+        snapshot instruction to all workers in lockstep and trusts
+        them to execute deterministically (the simple model used by
+        P6 task 41c).
+        """
+        with self._inner_lock:
+            self._stats_acks += 1
+            if block_hash in self._available:
+                self._available.move_to_end(block_hash)
+                return
+            # Drop any pending acks; they're now redundant.
+            self._pending_acks.pop(block_hash, None)
+            self._available[block_hash] = None
+            self._stats_promotions += 1
+            self._evict_to_cap()
 
     def mark_available_if_ack_complete(
         self,
