@@ -147,8 +147,13 @@ def _classify_turbomind_prefill(name: str) -> str | None:
 def _classify_turbomind_decode(name: str) -> str | None:
     if "turbomind::gemm::gemm_kernel" not in name and not name.startswith("gemm_kernel"):
         return None
+    # MMA_Map<8,...> is the decode-shape micro-shape (single-row Q across
+    # MLA proj wq/wkv/wo and MTP/aux paths). It is *not* exclusively wo_a/wo_b
+    # — the previous label conflated several proj GEMMs. Keep it as a single
+    # bucket but name it honestly so downstream readers don't assume only
+    # the output projection is here.
     if "MMA_Map<(int)8," in name or "MMA_Map<\\(int\\)8," in name:
-        return "decode GEMM wo_a/wo_b"
+        return "decode proj GEMM (turbomind FP8 dense)"
     if "fp4_e2m1" in name:
         return "MoE GEMM (FP4)"
     if "__nv_fp8_e4m3" in name:
@@ -333,6 +338,8 @@ def classify_decode(row: KernelRow) -> str:
         return "o_inv_rope_fp8_quant"
     if "_fp8_a_dequant_to_fp16_kernel" in name:
         return "fp8 dequant"
+    if "_fp8_weight_predequant_to_fp16_kernel" in name or "predequant_to_fp16" in name:
+        return "fp8_weight_predequant"
     if "volta_sgemm" in name:
         return "cuBLAS_sgemm_fallback"
     if "gemv2T_kernel_val" in name or "gemv2t" in lower:
@@ -635,7 +642,8 @@ _CATEGORY_STAGE: dict[str, str] = {
     # Projection / dense GEMM
     "turbomind GEMM (FP8 dense)": _STAGE_GEMM_PROJ,
     "turbomind GEMM": _STAGE_GEMM_PROJ,
-    "decode GEMM wo_a/wo_b": _STAGE_GEMM_PROJ,
+    "decode proj GEMM (turbomind FP8 dense)": _STAGE_GEMM_PROJ,
+    "decode GEMM wo_a/wo_b": _STAGE_GEMM_PROJ,  # legacy label, kept for reading old SQLite
     "volta s884 GEMM (FP16)": _STAGE_GEMM_PROJ,
     "cuBLAS Kernel2": _STAGE_GEMM_PROJ,
     "cuBLAS GEMV": _STAGE_GEMM_PROJ,
@@ -667,6 +675,7 @@ _CATEGORY_STAGE: dict[str, str] = {
     "rope_inv_quant": _STAGE_NORM_KV,
     "o_inv_rope_fp8_quant": _STAGE_NORM_KV,
     "fp8 dequant": _STAGE_NORM_KV,
+    "fp8_weight_predequant": _STAGE_NORM_KV,
     "compressor.kv_insert": _STAGE_NORM_KV,
     "rmsnorm": _STAGE_NORM_KV,
     "softmax": _STAGE_NORM_KV,
@@ -736,6 +745,71 @@ def _fmt_float(value: float | None, digits: int = 1) -> str:
     if value is None:
         return ""
     return f"{value:.{digits}f}"
+
+
+def print_decode_step_rollup(
+    rows: list[KernelRow],
+    wall_ns: int,
+    decode_steps: float | None,
+    mode: str,
+) -> None:
+    """One-table per-step rollup for decode runs.
+
+    Surface ms/step, %step, and call counts by pipeline stage so the
+    reader can read the bottleneck order without scanning every section
+    that follows. Auto-skips for prefill or when decode step count is
+    unknown.
+    """
+    if mode != "decode" or not decode_steps:
+        return
+
+    stage_calls: dict[str, int] = defaultdict(int)
+    stage_time: dict[str, int] = defaultdict(int)
+    for row in rows:
+        cat = classify(row, mode)
+        stage = _stage_for(cat)
+        stage_calls[stage] += row.count
+        stage_time[stage] += row.total_ns
+
+    if not stage_time:
+        return
+
+    total_busy = sum(stage_time.values())
+    step_wall_ms = wall_ns / decode_steps / 1e6
+    step_busy_ms = total_busy / decode_steps / 1e6
+
+    print("## Decode Step Roll-up (per scheduler step)")
+    print()
+    print(
+        f"- Steps: {_fmt_float(decode_steps, 2)}; "
+        f"wall/step: {step_wall_ms:.3f} ms; "
+        f"GPU-busy/step: {step_busy_ms:.3f} ms"
+    )
+    print(
+        "- Use this table as the single source of truth for which stage to "
+        "attack first; subsequent sections drill into individual kernels."
+    )
+    print()
+    print("| stage | ms/step | %step (busy) | calls/step |")
+    print("|---|---:|---:|---:|")
+    ordered = sorted(_STAGE_ORDER, key=lambda s: -stage_time.get(s, 0))
+    for stage in ordered:
+        if stage not in stage_time:
+            continue
+        ms_step = stage_time[stage] / decode_steps / 1e6
+        pct = 100.0 * stage_time[stage] / total_busy if total_busy else 0.0
+        calls_step = stage_calls[stage] / decode_steps if decode_steps else 0.0
+        print(
+            f"| {stage} | {ms_step:.3f} | {pct:.1f}% | {calls_step:.1f} |"
+        )
+    idle_ns = max(0, wall_ns - total_busy)
+    if idle_ns:
+        idle_ms_step = idle_ns / decode_steps / 1e6
+        print(
+            f"| _idle/bubble (host-side)_ | {idle_ms_step:.3f} | "
+            f"{100.0*idle_ns/wall_ns:.1f}% (of wall) | — |"
+        )
+    print()
 
 
 def print_device_table(
@@ -944,12 +1018,16 @@ def print_stage_summary(
 
 def _kernel_idle_gaps(
     conn: sqlite3.Connection, device: int, gap_threshold_us: float
-) -> tuple[int, int, int, list[tuple[float, float]]]:
-    """Return (n_gaps, total_idle_ns, n_big_gaps, big_gap_samples).
+) -> tuple[int, int, int, list[tuple[float, float]], dict[str, tuple[int, int]]]:
+    """Return (n_gaps, total_idle_ns, n_big_gaps, big_gap_samples, hist).
 
     A gap is the time between the end of one kernel and the start of the
     next on the same device. Big gaps (>= ``gap_threshold_us``) are
     candidates for host-side stalls or scheduling bubbles.
+
+    ``hist`` maps a coarse bucket label ("<10us", "10-50us", "50-200us",
+    ">=200us") to ``(count, total_ns)`` so the report can distinguish
+    launch-overhead noise from real synchronization waits.
     """
     cur = conn.execute(
         """
@@ -964,18 +1042,33 @@ def _kernel_idle_gaps(
     n_big = 0
     threshold_ns = int(gap_threshold_us * 1000)
     samples: list[tuple[float, float]] = []
+    bucket_keys = ("<10us", "10-50us", "50-200us", ">=200us")
+    bucket_counts = {k: 0 for k in bucket_keys}
+    bucket_ns = {k: 0 for k in bucket_keys}
     for start, end in cur:
         if prev_end is not None and start > prev_end:
             gap = start - prev_end
             n_gaps += 1
             total_idle += gap
+            gap_us = gap / 1000.0
+            if gap_us < 10:
+                bucket = "<10us"
+            elif gap_us < 50:
+                bucket = "10-50us"
+            elif gap_us < 200:
+                bucket = "50-200us"
+            else:
+                bucket = ">=200us"
+            bucket_counts[bucket] += 1
+            bucket_ns[bucket] += gap
             if gap >= threshold_ns:
                 n_big += 1
                 if len(samples) < 8:
                     samples.append((prev_end / 1e6, gap / 1e3))
         if prev_end is None or end > prev_end:
             prev_end = end
-    return n_gaps, total_idle, n_big, samples
+    hist = {k: (bucket_counts[k], bucket_ns[k]) for k in bucket_keys}
+    return n_gaps, total_idle, n_big, samples, hist
 
 
 def print_idle_gap_summary(
@@ -991,7 +1084,7 @@ def print_idle_gap_summary(
     metadata builds, NCCL coordination) that the per-category table
     cannot expose because they happen outside any kernel.
     """
-    n_gaps, idle_ns, n_big, samples = _kernel_idle_gaps(
+    n_gaps, idle_ns, n_big, samples, hist = _kernel_idle_gaps(
         conn, device, gap_threshold_us
     )
     print("## Idle-Gap Analysis (selected device)")
@@ -1008,8 +1101,29 @@ def print_idle_gap_summary(
     )
     avg_gap_us = idle_ns / 1e3 / n_gaps if n_gaps else 0.0
     print(f"- Average gap: {avg_gap_us:.1f} us")
+    print()
+    print("### Gap-Duration Histogram")
+    print()
+    print(
+        "Buckets separate launch-overhead noise (`<10us` per gap) from real "
+        "synchronization waits (`>=200us`). A high `>=200us` total relative "
+        "to wall time usually means the host CPU is the bottleneck (Python "
+        "scheduling, metadata build, NCCL coordination)."
+    )
+    print()
+    print("| bucket | gaps | %gaps | total ms | %wall |")
+    print("|---|---:|---:|---:|---:|")
+    for bucket in ("<10us", "10-50us", "50-200us", ">=200us"):
+        cnt, tot_ns = hist[bucket]
+        if cnt == 0 and tot_ns == 0:
+            continue
+        print(
+            f"| {bucket} | {cnt} | "
+            f"{100.0*cnt/n_gaps:.1f}% | {tot_ns/1e6:.1f} | "
+            f"{100.0*tot_ns/wall_ns:.1f}% |"
+        )
+    print()
     if samples:
-        print()
         print("First few large idle bubbles (timeline-relative):")
         print()
         print("| t (ms) | gap (us) |")
@@ -1662,6 +1776,7 @@ def print_hot_kernel_duration_distribution(
         "p99 | max |"
     )
     print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    jitter_flags: list[str] = []
     for cat in hot_cats:
         durs = durs_by_cat.get(cat) or []
         if not durs:
@@ -1669,15 +1784,34 @@ def print_hot_kernel_duration_distribution(
         durs_sorted = sorted(durs)
         mean = sum(durs) / len(durs)
         std = _stddev_us(durs)
+        p50 = _percentile(durs_sorted, 0.50)
+        p99 = _percentile(durs_sorted, 0.99)
         print(
             f"| {cat} | {len(durs)} | {mean:.1f} | {std:.1f} | "
             f"{durs_sorted[0]:.1f} | "
-            f"{_percentile(durs_sorted, 0.50):.1f} | "
+            f"{p50:.1f} | "
             f"{_percentile(durs_sorted, 0.90):.1f} | "
-            f"{_percentile(durs_sorted, 0.99):.1f} | "
+            f"{p99:.1f} | "
             f"{durs_sorted[-1]:.1f} |"
         )
+        # Flag categories where p99 / p50 >= 1.5 — these are the per-call
+        # outliers that drag the critical-rank wall time and are usually
+        # the right place to look for kernel-level skew or NCCL stragglers.
+        if p50 > 0 and p99 / p50 >= 1.5:
+            jitter_flags.append(f"`{cat}` p99/p50={p99/p50:.2f}")
     print()
+    if jitter_flags:
+        print(
+            "**Per-call jitter flags (p99 / p50 ≥ 1.5×):** "
+            + "; ".join(jitter_flags)
+            + "."
+        )
+        print(
+            "  These are the categories where the long tail dominates the "
+            "per-step wall time more than the mean implies (e.g. NCCL "
+            "stragglers, MTP-shape mixing, chunked-prefill skew)."
+        )
+        print()
 
 
 
@@ -1748,6 +1882,7 @@ def summarize_sqlite(
                 )
         print()
         print_device_table(summaries, wall_ns, device)
+        print_decode_step_rollup(rows, wall_ns, decode_info.steps, mode)
         cat_rows = print_category_table(
             rows,
             wall_ns,
