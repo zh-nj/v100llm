@@ -81,14 +81,19 @@ def _swa_snapshot_hashes_for_token_range(
     end_tokens: int,
     hash_block_size: int,
     swa_block_size: int,
+    max_blocks: int | None = None,
 ) -> SWARingSnapshotData | None:
     """Return SWA snapshot block hashes for full blocks crossed by a token range.
 
     The range is half-open: [start_tokens, end_tokens). A SWA block becomes
     snapshot-eligible when its end boundary is <= end_tokens and was not already
-    fully covered before start_tokens.
+    fully covered before start_tokens. `max_blocks`, when set, keeps only the
+    tail of the selected range. This is used for copy-in: a resumed SWA ring
+    only needs the local-attention tail, not the full cached prefix.
     """
     if end_tokens <= start_tokens:
+        return None
+    if max_blocks is not None and max_blocks <= 0:
         return None
     if swa_block_size % hash_block_size != 0:
         # Cannot derive per-SWA-block hashes from coarser request hashes.
@@ -111,11 +116,29 @@ def _swa_snapshot_hashes_for_token_range(
     end_block_idx = min(end_block_idx, len(swa_hashes))
     if end_block_idx <= first_block_idx:
         return None
+    if max_blocks is not None:
+        first_block_idx = max(first_block_idx, end_block_idx - max_blocks)
 
     return SWARingSnapshotData(
         start_block_idx=first_block_idx,
         block_hashes=[bytes(h) for h in swa_hashes[first_block_idx:end_block_idx]],
     )
+
+
+def _deepseek_v4_prefill_budget_cap(
+    num_computed_tokens: int,
+    num_new_tokens: int,
+) -> int:
+    """Optionally lower chunked-prefill budget after a long-context threshold."""
+    cap_after_tokens = envs.VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_AFTER_TOKENS
+    cap_tokens = envs.VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_TOKENS
+    if num_new_tokens <= 0 or cap_after_tokens <= 0 or cap_tokens <= 0:
+        return num_new_tokens
+    if num_computed_tokens >= cap_after_tokens:
+        return min(num_new_tokens, cap_tokens)
+    if num_computed_tokens + num_new_tokens > cap_after_tokens:
+        return cap_after_tokens - num_computed_tokens
+    return num_new_tokens
 
 
 class Scheduler(SchedulerInterface):
@@ -354,7 +377,7 @@ class Scheduler(SchedulerInterface):
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
-    def _get_deepseek_v4_swa_block_size(self) -> int | None:
+    def _get_deepseek_v4_swa_spec(self) -> tuple[int, int] | None:
         for group in self.kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
             specs = (
@@ -368,7 +391,7 @@ class Scheduler(SchedulerInterface):
                     and spec_i.model_version == "deepseek_v4"
                     and spec_i.compress_ratio == 1
                 ):
-                    return spec_i.block_size
+                    return spec_i.block_size, spec_i.sliding_window
         return None
 
     def _make_swa_snapshot_data(
@@ -376,18 +399,25 @@ class Scheduler(SchedulerInterface):
         request: Request,
         start_tokens: int,
         end_tokens: int,
+        *,
+        copyin_tail_only: bool = False,
     ) -> SWARingSnapshotData | None:
         if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE:
             return None
-        swa_block_size = self._get_deepseek_v4_swa_block_size()
-        if swa_block_size is None:
+        swa_spec = self._get_deepseek_v4_swa_spec()
+        if swa_spec is None:
             return None
+        swa_block_size, sliding_window = swa_spec
+        max_blocks = None
+        if copyin_tail_only:
+            max_blocks = max(1, (sliding_window + swa_block_size - 1) // swa_block_size)
         return _swa_snapshot_hashes_for_token_range(
             block_hashes=request.block_hashes,
             start_tokens=start_tokens,
             end_tokens=end_tokens,
             hash_block_size=self.hash_block_size,
             swa_block_size=swa_block_size,
+            max_blocks=max_blocks,
         )
 
     def _mark_swa_snapshot_available(
@@ -514,6 +544,10 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            num_new_tokens = _deepseek_v4_prefill_budget_cap(
+                request.num_computed_tokens,
+                num_new_tokens,
+            )
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -722,6 +756,7 @@ class Scheduler(SchedulerInterface):
                         request,
                         start_tokens=0,
                         end_tokens=num_new_local_computed_tokens,
+                        copyin_tail_only=True,
                     )
 
                     # Get externally-cached tokens if using a KVConnector.
@@ -778,6 +813,10 @@ class Scheduler(SchedulerInterface):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                    num_new_tokens = _deepseek_v4_prefill_budget_cap(
+                        num_computed_tokens,
+                        num_new_tokens,
+                    )
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1233,6 +1272,7 @@ class Scheduler(SchedulerInterface):
                         req,
                         start_tokens=0,
                         end_tokens=req.num_computed_tokens,
+                        copyin_tail_only=True,
                     )
                 )
             else:

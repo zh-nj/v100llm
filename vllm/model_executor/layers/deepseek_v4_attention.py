@@ -748,6 +748,28 @@ def _profile_phase(
             torch.cuda.nvtx.range_pop()
 
 
+def _flush_profile_queue_if_needed() -> None:
+    try:
+        if torch.compiler.is_compiling():
+            return
+    except Exception:
+        pass
+    if (
+        _DEEPSEEK_V4_PROFILE_ENABLED
+        and _DEEPSEEK_V4_PROFILE_MODE == "queue"
+        and torch.cuda.is_available()
+        and not _is_cuda_stream_capturing()
+    ):
+        try:
+            _flush_event_queue()
+        except Exception:
+            logger.warning(
+                "DeepSeek V4 profile: queue flush failed",
+                exc_info=True,
+            )
+            _DEEPSEEK_V4_PHASE_CONTEXT.event_queue.clear()
+
+
 @contextmanager
 def _profile_step(
     step_idx: int | None = None,
@@ -783,20 +805,7 @@ def _profile_step(
     try:
         yield
     finally:
-        if (
-            _DEEPSEEK_V4_PROFILE_ENABLED
-            and _DEEPSEEK_V4_PROFILE_MODE == "queue"
-            and torch.cuda.is_available()
-            and not _is_cuda_stream_capturing()
-        ):
-            try:
-                _flush_event_queue()
-            except Exception:
-                logger.warning(
-                    "DeepSeek V4 profile: queue flush failed",
-                    exc_info=True,
-                )
-                ctx.event_queue.clear()
+        _flush_profile_queue_if_needed()
         if pushed_nvtx:
             try:
                 torch.cuda.nvtx.range_pop()
@@ -2786,6 +2795,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         with _profile_or_null("impl.mla_attn_total", q):
             self.mla_attn(q, kv, positions, output=out)
         _trace_nonfinite_tensor(f"{self.prefix}.impl.mla_out", out)
+        _flush_profile_queue_if_needed()
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -4333,17 +4343,22 @@ class DeepseekV4Indexer(nn.Module):
         hidden_states = ensure_boundary_dtype(
             hidden_states, self.weights_proj.weight.dtype
         )
-        q, _ = self.wq_b(qr)
+        with _profile_or_null("indexer.wq_b", qr):
+            q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        k = self.compressor(hidden_states, positions, rotary_emb)
-        weights, _ = self.weights_proj(hidden_states)
-        q_quant, weights = fused_indexer_q_rope_quant(
-            positions,
-            q,
-            rotary_emb.cos_sin_cache,
-            weights,
-            self.softmax_scale,
-            self.n_head**-0.5,
-            use_fp4=self.use_fp4_kv,
-        )
-        return self.indexer_op(hidden_states, q_quant, k, weights)
+        with _profile_or_null("indexer.compressor", hidden_states):
+            k = self.compressor(hidden_states, positions, rotary_emb)
+        with _profile_or_null("indexer.weights_proj", hidden_states):
+            weights, _ = self.weights_proj(hidden_states)
+        with _profile_or_null("indexer.q_rope_quant", q):
+            q_quant, weights = fused_indexer_q_rope_quant(
+                positions,
+                q,
+                rotary_emb.cos_sin_cache,
+                weights,
+                self.softmax_scale,
+                self.n_head**-0.5,
+                use_fp4=self.use_fp4_kv,
+            )
+        with _profile_or_null("indexer.indexer_op", q_quant):
+            return self.indexer_op(hidden_states, q_quant, k, weights)

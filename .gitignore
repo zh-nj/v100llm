@@ -204,6 +204,11 @@ cython_debug/
 # Results
 *.csv
 
+# Profiling artifacts
+*.nsys-rep
+*.sqlite
+*.sqlite-*
+
 # Python pickle files
 *.pkl
 
@@ -240,10 +245,7 @@ vllm/grpc/vllm_engine_pb2.py
 vllm/grpc/vllm_engine_pb2_grpc.py
 vllm/grpc/vllm_engine_pb2.pyi
 
-<<<<<<< HEAD
-=======
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
 
->>>>>>> 6bb704931 (upstream(vllm): import v0.19.0 root baseline)
 .worktrees/

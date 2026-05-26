@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -1359,6 +1360,110 @@ def test_deepseek_v4_phase_profiler_exports_raw_trace(monkeypatch, tmp_path):
     assert row["elapsed_us"] == 42.0
     assert "pid" in row
     assert "cuda_device" in row
+
+
+def test_deepseek_v4_queue_profile_flushes_when_enabled(monkeypatch):
+    calls = []
+    monkeypatch.setattr(d4a, "_DEEPSEEK_V4_PROFILE_ENABLED", True)
+    monkeypatch.setattr(d4a, "_DEEPSEEK_V4_PROFILE_MODE", "queue")
+    monkeypatch.setattr(d4a.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(d4a, "_is_cuda_stream_capturing", lambda: False)
+    monkeypatch.setattr(d4a, "_flush_event_queue", lambda: calls.append("flush"))
+
+    d4a._flush_profile_queue_if_needed()
+
+    assert calls == ["flush"]
+
+
+def test_deepseek_v4_queue_profile_flush_skips_non_queue(monkeypatch):
+    calls = []
+    monkeypatch.setattr(d4a, "_DEEPSEEK_V4_PROFILE_ENABLED", True)
+    monkeypatch.setattr(d4a, "_DEEPSEEK_V4_PROFILE_MODE", "eager")
+    monkeypatch.setattr(d4a.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(d4a, "_is_cuda_stream_capturing", lambda: False)
+    monkeypatch.setattr(d4a, "_flush_event_queue", lambda: calls.append("flush"))
+
+    d4a._flush_profile_queue_if_needed()
+
+    assert calls == []
+
+
+def test_deepseek_v4_queue_profile_flush_skips_dynamo_compile(monkeypatch):
+    calls = []
+    monkeypatch.setattr(d4a, "_DEEPSEEK_V4_PROFILE_ENABLED", True)
+    monkeypatch.setattr(d4a, "_DEEPSEEK_V4_PROFILE_MODE", "queue")
+    monkeypatch.setattr(d4a.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(d4a.torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        d4a,
+        "_is_cuda_stream_capturing",
+        lambda: (_ for _ in ()).throw(AssertionError("should not be traced")),
+    )
+    monkeypatch.setattr(d4a, "_flush_event_queue", lambda: calls.append("flush"))
+
+    d4a._flush_profile_queue_if_needed()
+
+    assert calls == []
+
+
+def test_deepseek_v4_indexer_forward_profiles_internal_phases(monkeypatch):
+    labels = []
+
+    @contextmanager
+    def fake_profile(label, ref, *, extra=None):
+        labels.append(label)
+        yield
+
+    class FakeLinear:
+        def __init__(self, output):
+            self.output = output
+            self.weight = SimpleNamespace(dtype=output.dtype)
+
+        def __call__(self, _x):
+            return self.output, None
+
+    class FakeCompressor:
+        def __call__(self, _hidden_states, _positions, _rotary_emb):
+            return torch.full((2, 4, 8), 3, dtype=torch.uint8)
+
+    class FakeIndexerOp:
+        def __call__(self, _hidden_states, q_quant, _k, weights):
+            return q_quant.to(torch.float32).sum() + weights.sum()
+
+    monkeypatch.setattr(d4a, "_profile_or_null", fake_profile)
+    monkeypatch.setattr(
+        d4a,
+        "fused_indexer_q_rope_quant",
+        lambda positions, q, cos_sin_cache, weights, *_, **__: (q.to(torch.uint8), weights),
+    )
+
+    fake = SimpleNamespace(
+        weights_proj=FakeLinear(torch.ones((2, 4), dtype=torch.float16)),
+        wq_b=FakeLinear(torch.ones((2, 4 * 8), dtype=torch.float16)),
+        n_head=4,
+        head_dim=8,
+        compressor=FakeCompressor(),
+        softmax_scale=1.0,
+        use_fp4_kv=False,
+        indexer_op=FakeIndexerOp(),
+    )
+    rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty(1, dtype=torch.float16))
+
+    d4a.DeepseekV4Indexer.forward(
+        fake,
+        hidden_states=torch.ones((2, 16), dtype=torch.float16),
+        qr=torch.ones((2, 4), dtype=torch.float16),
+        positions=torch.arange(2, dtype=torch.int64),
+        rotary_emb=rotary_emb,
+    )
+
+    assert labels == [
+        "indexer.wq_b",
+        "indexer.compressor",
+        "indexer.weights_proj",
+        "indexer.q_rope_quant",
+        "indexer.indexer_op",
+    ]
 
 
 def test_deepseek_v4_copy_source_trace_emits_nvtx_during_graph_capture(

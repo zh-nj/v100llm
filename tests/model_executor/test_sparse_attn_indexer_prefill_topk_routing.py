@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Routing tests for sparse indexer prefill top-k selection."""
 
+import inspect
+from types import SimpleNamespace
+
 import torch
 
 
@@ -270,6 +273,13 @@ def test_streaming_topk_prefill_requires_sm70_fp8_and_long_rows(monkeypatch):
     assert not sparse_attn_indexer._should_use_streaming_topk_prefill(
         q=q,
         kv_cache=kv_cache,
+        topk_tokens=128,
+        use_fp4_cache=False,
+        max_row_len=16384,
+    )
+    assert not sparse_attn_indexer._should_use_streaming_topk_prefill(
+        q=q,
+        kv_cache=kv_cache,
         topk_tokens=512,
         use_fp4_cache=True,
         max_row_len=16384,
@@ -348,6 +358,55 @@ def test_try_streaming_topk_prefill_calls_streaming_wrapper(monkeypatch):
     assert captured["out_indices"] is out_indices
     assert captured["topk_tokens"] == 512
     assert torch.all(out_indices == 23)
+
+
+def test_try_streaming_topk_prefill_handles_noncontiguous_output(monkeypatch):
+    from vllm.model_executor.layers import sparse_attn_indexer
+    from vllm.v1.attention.ops import tilelang_prefill_streaming_topk
+
+    monkeypatch.setattr(
+        sparse_attn_indexer,
+        "_should_use_streaming_topk_prefill",
+        lambda **kwargs: True,
+    )
+    captured = {}
+
+    def fake_streaming_topk(**kwargs):
+        captured["is_contiguous"] = kwargs["out_indices"].is_contiguous()
+        kwargs["out_indices"].fill_(17)
+
+    monkeypatch.setattr(
+        tilelang_prefill_streaming_topk,
+        "prefill_streaming_topk_tilelang",
+        fake_streaming_topk,
+    )
+
+    q = torch.empty((2, 4, 16), dtype=torch.float16)
+    k_cache_values = torch.empty((128, 16), dtype=torch.float16)
+    k_cache_scales = torch.ones((128,), dtype=torch.float32)
+    weights = torch.ones((2, 4), dtype=torch.float32)
+    row_starts = torch.zeros((2,), dtype=torch.int32)
+    row_ends = torch.full((2,), 128, dtype=torch.int32)
+    out_storage = torch.empty((2, 512), dtype=torch.int32)
+    out_indices = out_storage[:, :256]
+    assert not out_indices.is_contiguous()
+
+    handled = sparse_attn_indexer._try_prefill_streaming_topk_indices(
+        q=q,
+        k_cache_values=k_cache_values,
+        k_cache_scales=k_cache_scales,
+        weights=weights,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        out_indices=out_indices,
+        topk_tokens=256,
+        use_fp4_cache=False,
+        max_row_len=16384,
+    )
+
+    assert handled
+    assert captured == {"is_contiguous": True}
+    assert torch.all(out_indices == 17)
 
 
 def test_try_streaming_topk_prefill_returns_false_when_disabled(monkeypatch):
@@ -662,3 +721,260 @@ def test_prefill_topk_routes_to_legacy_prefill_kernel(monkeypatch):
     torch.testing.assert_close(captured["row_ends"], row_ends)
     assert captured["topk_tokens"] == 2048
     assert torch.all(indices == 3)
+
+
+def test_sparse_attn_indexer_prefill_internal_profile_labels_present():
+    from vllm.model_executor.layers import sparse_attn_indexer
+
+    source = inspect.getsource(sparse_attn_indexer.sparse_attn_indexer)
+    source += inspect.getsource(
+        sparse_attn_indexer._allocate_gathered_k_prefix_entry
+    )
+    source += inspect.getsource(
+        sparse_attn_indexer._try_gather_indexer_k_with_prefix_cache
+    )
+
+    for label in (
+        "indexer.prefill.k_gather",
+        "indexer.prefill.k_gather_tail",
+        "indexer.prefill.k_gather_full_snapshot",
+        "indexer.prefill.k_prefix_grow_copy",
+        "indexer.prefill.streaming_topk",
+        "indexer.prefill.mqa_logits",
+        "indexer.prefill.topk",
+        "indexer.decode.mqa_logits",
+        "indexer.decode.topk",
+    ):
+        assert label in source
+
+
+def _make_gathered_k_chunk(total_seq_lens: int, block_ids: list[int]):
+    return SimpleNamespace(
+        total_seq_lens=total_seq_lens,
+        block_table=torch.tensor([block_ids], dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, total_seq_lens], dtype=torch.int32),
+        num_reqs=1,
+        skip_kv_gather=False,
+    )
+
+
+def _make_gathered_k_buffers(total_tokens: int = 256):
+    k_quant = torch.empty((total_tokens, 128), dtype=torch.uint8)
+    k_scale = torch.empty((total_tokens, 4), dtype=torch.uint8)
+    kv_cache = torch.empty((16, 64, 132), dtype=torch.uint8)
+    return kv_cache, k_quant, k_scale
+
+
+def test_gathered_k_prefix_cache_explicitly_disabled(monkeypatch):
+    from vllm.model_executor.layers import sparse_attn_indexer
+
+    sparse_attn_indexer._reset_gathered_k_prefix_cache_for_tests()
+    monkeypatch.setattr(
+        sparse_attn_indexer.envs,
+        "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE",
+        False,
+        raising=False,
+    )
+    calls = []
+    monkeypatch.setattr(
+        sparse_attn_indexer.ops,
+        "cp_gather_indexer_k_quant_cache",
+        lambda *args: calls.append(args),
+    )
+    kv_cache, k_quant, k_scale = _make_gathered_k_buffers()
+
+    result = sparse_attn_indexer._try_gather_indexer_k_with_prefix_cache(
+        kv_cache=kv_cache,
+        fallback_k_quant=k_quant,
+        fallback_k_scale=k_scale,
+        chunk=_make_gathered_k_chunk(128, [5, 6]),
+        k_cache_prefix="layer.2.indexer",
+        use_fp4_cache=False,
+    )
+
+    assert result is None
+    assert calls == []
+
+
+def test_gathered_k_prefix_cache_appends_only_tail(monkeypatch):
+    from vllm.model_executor.layers import sparse_attn_indexer
+
+    sparse_attn_indexer._reset_gathered_k_prefix_cache_for_tests()
+    monkeypatch.setattr(
+        sparse_attn_indexer.envs,
+        "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sparse_attn_indexer.envs,
+        "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE_BYTES",
+        1 << 20,
+        raising=False,
+    )
+
+    calls = []
+
+    def fake_gather(kv_cache, dst_k, dst_scale, block_table, cu_seq_lens):
+        calls.append(
+            {
+                "rows": dst_k.shape[0],
+                "block_table": block_table.tolist(),
+                "cu_seq_lens": cu_seq_lens.tolist(),
+            }
+        )
+        fill = 11 if dst_k.shape[0] == 128 else 22
+        dst_k.fill_(fill)
+        dst_scale.fill_(fill + 1)
+
+    monkeypatch.setattr(
+        sparse_attn_indexer.ops,
+        "cp_gather_indexer_k_quant_cache",
+        fake_gather,
+    )
+    kv_cache, k_quant, k_scale = _make_gathered_k_buffers()
+
+    first = sparse_attn_indexer._try_gather_indexer_k_with_prefix_cache(
+        kv_cache=kv_cache,
+        fallback_k_quant=k_quant,
+        fallback_k_scale=k_scale,
+        chunk=_make_gathered_k_chunk(128, [5, 6]),
+        k_cache_prefix="layer.2.indexer",
+        use_fp4_cache=False,
+    )
+    assert first is not None
+    first_k, first_scale = first
+    assert torch.all(first_k == 11)
+    assert torch.all(first_scale == 12)
+
+    second = sparse_attn_indexer._try_gather_indexer_k_with_prefix_cache(
+        kv_cache=kv_cache,
+        fallback_k_quant=k_quant,
+        fallback_k_scale=k_scale,
+        chunk=_make_gathered_k_chunk(192, [5, 6, 9]),
+        k_cache_prefix="layer.2.indexer",
+        use_fp4_cache=False,
+    )
+    assert second is not None
+    second_k, second_scale = second
+
+    assert calls == [
+        {"rows": 128, "block_table": [[5, 6]], "cu_seq_lens": [0, 128]},
+        {"rows": 64, "block_table": [[9]], "cu_seq_lens": [0, 64]},
+    ]
+    assert torch.all(second_k[:128] == 11)
+    assert torch.all(second_k[128:192] == 22)
+    assert torch.all(second_scale[:128] == 12)
+    assert torch.all(second_scale[128:192] == 23)
+
+
+def test_gathered_k_prefix_cache_exact_hit_skips_gather(monkeypatch):
+    from vllm.model_executor.layers import sparse_attn_indexer
+
+    sparse_attn_indexer._reset_gathered_k_prefix_cache_for_tests()
+    monkeypatch.setattr(
+        sparse_attn_indexer.envs,
+        "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sparse_attn_indexer.envs,
+        "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE_BYTES",
+        1 << 20,
+        raising=False,
+    )
+    calls = []
+
+    def fake_gather(kv_cache, dst_k, dst_scale, block_table, cu_seq_lens):
+        calls.append(dst_k.shape[0])
+        dst_k.fill_(31)
+        dst_scale.fill_(32)
+
+    monkeypatch.setattr(
+        sparse_attn_indexer.ops,
+        "cp_gather_indexer_k_quant_cache",
+        fake_gather,
+    )
+    kv_cache, k_quant, k_scale = _make_gathered_k_buffers()
+    chunk = _make_gathered_k_chunk(128, [1, 2])
+
+    sparse_attn_indexer._try_gather_indexer_k_with_prefix_cache(
+        kv_cache=kv_cache,
+        fallback_k_quant=k_quant,
+        fallback_k_scale=k_scale,
+        chunk=chunk,
+        k_cache_prefix="layer.2.indexer",
+        use_fp4_cache=False,
+    )
+    cached = sparse_attn_indexer._try_gather_indexer_k_with_prefix_cache(
+        kv_cache=kv_cache,
+        fallback_k_quant=k_quant,
+        fallback_k_scale=k_scale,
+        chunk=chunk,
+        k_cache_prefix="layer.2.indexer",
+        use_fp4_cache=False,
+    )
+
+    assert calls == [128]
+    assert cached is not None
+    assert torch.all(cached[0] == 31)
+    assert torch.all(cached[1] == 32)
+
+
+def test_gathered_k_prefix_cache_mismatch_falls_back_to_full_gather(monkeypatch):
+    from vllm.model_executor.layers import sparse_attn_indexer
+
+    sparse_attn_indexer._reset_gathered_k_prefix_cache_for_tests()
+    monkeypatch.setattr(
+        sparse_attn_indexer.envs,
+        "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sparse_attn_indexer.envs,
+        "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE_BYTES",
+        1 << 20,
+        raising=False,
+    )
+    calls = []
+
+    def fake_gather(kv_cache, dst_k, dst_scale, block_table, cu_seq_lens):
+        calls.append(
+            {
+                "rows": dst_k.shape[0],
+                "block_table": block_table.tolist(),
+            }
+        )
+        dst_k.fill_(41)
+        dst_scale.fill_(42)
+
+    monkeypatch.setattr(
+        sparse_attn_indexer.ops,
+        "cp_gather_indexer_k_quant_cache",
+        fake_gather,
+    )
+    kv_cache, k_quant, k_scale = _make_gathered_k_buffers()
+
+    sparse_attn_indexer._try_gather_indexer_k_with_prefix_cache(
+        kv_cache=kv_cache,
+        fallback_k_quant=k_quant,
+        fallback_k_scale=k_scale,
+        chunk=_make_gathered_k_chunk(128, [5, 6]),
+        k_cache_prefix="layer.2.indexer",
+        use_fp4_cache=False,
+    )
+    sparse_attn_indexer._try_gather_indexer_k_with_prefix_cache(
+        kv_cache=kv_cache,
+        fallback_k_quant=k_quant,
+        fallback_k_scale=k_scale,
+        chunk=_make_gathered_k_chunk(192, [8, 6, 9]),
+        k_cache_prefix="layer.2.indexer",
+        use_fp4_cache=False,
+    )
+
+    assert calls == [
+        {"rows": 128, "block_table": [[5, 6]]},
+        {"rows": 192, "block_table": [[8, 6, 9]]},
+    ]

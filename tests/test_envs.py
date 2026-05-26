@@ -107,10 +107,16 @@ def test_deepseek_v4_sm70_experimental_envs_are_registered() -> None:
         "VLLM_DEEPSEEK_V4_PROFILE_RAW_PATH",
         "VLLM_DEEPSEEK_V4_NAN_TRACE",
         "VLLM_DEEPSEEK_V4_INDEXER_TOPK",
+        "VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE",
+        "VLLM_DEEPSEEK_V4_SWA_SNAPSHOT_BYTES",
         "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE",
         "VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB",
         "VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS",
         "VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE",
+        "VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_AFTER_TOKENS",
+        "VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_TOKENS",
+        "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE",
+        "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE_BYTES",
         "VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS",
         "VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT",
         "VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY",
@@ -130,6 +136,68 @@ def test_deepseek_v4_sm70_experimental_envs_are_registered() -> None:
     }
 
     assert expected_envs.issubset(environment_variables)
+
+
+def test_deepseek_v4_prefill_budget_cap_envs_default_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        "VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_AFTER_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv("VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_TOKENS", raising=False)
+
+    assert (
+        environment_variables["VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_AFTER_TOKENS"]()
+        == 0
+    )
+    assert environment_variables["VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_TOKENS"]() == 0
+
+
+def test_deepseek_v4_swa_prefix_cache_envs_default_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE", raising=False)
+    monkeypatch.delenv("VLLM_DEEPSEEK_V4_SWA_SNAPSHOT_BYTES", raising=False)
+
+    assert environment_variables["VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE"]() is True
+    assert (
+        environment_variables["VLLM_DEEPSEEK_V4_SWA_SNAPSHOT_BYTES"]()
+        == 32 * 1024 * 1024
+    )
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE", "0")
+    assert environment_variables["VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE"]() is False
+
+
+def test_sparse_indexer_gathered_k_prefix_cache_envs_default_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE_BYTES",
+        raising=False,
+    )
+
+    assert (
+        environment_variables["VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE"]()
+        is True
+    )
+    assert (
+        environment_variables[
+            "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE_BYTES"
+        ]()
+        == 16 * 1024 * 1024
+    )
+
+    monkeypatch.setenv("VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE", "0")
+    assert (
+        environment_variables["VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE"]()
+        is False
+    )
 
 
 def test_sparse_indexer_streaming_topk_envs_default_on(

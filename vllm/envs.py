@@ -118,16 +118,25 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_LOG_EVERY: int = 1
     VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_FAIL_ATOL: float = 1e-2
 
-    # P6: stateful frontier prototype. When enabled, V4 SWA ring blocks
-    # are snapshotted on completion and looked up by full-MLA BlockHash
-    # to enable prefix caching for sparse SWA layers.
-    # Default OFF until P6 task 41a-41e validation completes (commit-and-
-    # stabilize policy mirrors P5).
-    VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE: bool = False
+    # P6: stateful frontier path. V4 SWA ring blocks are snapshotted on
+    # completion and looked up by full-MLA BlockHash to enable prefix
+    # caching for sparse SWA layers. Default enabled after P6 N1-N5 gates
+    # and 256k frontier smoke; explicit opt-out remains available.
+    VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE: bool = True
     # Snapshot pool byte budget per layer. 60 SWA layers × this byte cap
     # = total snapshot memory upper bound. Default 32 MiB per layer
     # gives ~1.9 GiB total (about 80 cached prefixes at 16k tokens).
     VLLM_DEEPSEEK_V4_SWA_SNAPSHOT_BYTES: int = 32 * 1024 * 1024
+    # Optional long-context prefill budget cap. Default disabled.
+    VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_AFTER_TOKENS: int = 0
+    VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_TOKENS: int = 0
+    # Sparse indexer gathered-K prefix cache. Default enabled; the
+    # implementation self-disables for unsupported shapes (multi-request
+    # prefill, FP4 cache, prefix mismatch, cap exceeded).
+    VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE: bool = True
+    VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE_BYTES: int = (
+        16 * 1024 * 1024
+    )
     VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE: bool = True
     VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB: bool = True
     VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS: int = 4
@@ -1013,17 +1022,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_FAIL_ATOL": lambda: float(
         os.getenv("VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG_FAIL_ATOL", "1e-2")
     ),
-    # P6 task 41: SWA prefix caching opt-in. When 1, the
+    # P6 task 41: SWA prefix caching. When 1, the
     # RingSlidingWindowMLAManager consults SWARingSnapshotPool and the
     # worker copies snapshot blocks into fresh request rings on cache hit.
-    # Default 0 (= upstream behavior, prefix cache disabled for SWA ring).
+    # Default 1; set 0 to restore upstream behavior (prefix cache disabled
+    # for the SWA ring group).
     "VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE", "0"))
+        int(os.getenv("VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE", "1"))
     ),
     # P6 task 41: per-layer snapshot pool byte cap.
     "VLLM_DEEPSEEK_V4_SWA_SNAPSHOT_BYTES": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V4_SWA_SNAPSHOT_BYTES",
                   str(32 * 1024 * 1024))
+    ),
+    # P6 experimental: allow larger early prefill chunks, then lower the
+    # per-step budget after a long-context threshold to avoid very large
+    # late-context indexer-gather steps. Disabled by default.
+    "VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_AFTER_TOKENS": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_AFTER_TOKENS", "0")
+    ),
+    "VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_TOKENS": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_PREFILL_BUDGET_CAP_TOKENS", "0")
+    ),
+    # P6: worker-side gathered indexer-K prefix snapshot. Long chunked
+    # prefill can reuse the already-gathered contiguous K prefix and gather
+    # only the newly appended compressed tail. The runtime path is guarded by
+    # shape/cache checks and falls back to full-gather on mismatch.
+    "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE": lambda: bool(
+        int(os.getenv("VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE", "1"))
+    ),
+    "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE_BYTES": lambda: int(
+        os.getenv(
+            "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE_BYTES",
+            str(16 * 1024 * 1024),
+        )
     ),
     "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", "1"))

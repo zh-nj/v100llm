@@ -3,6 +3,8 @@
 """Custom Sparse Attention Indexer layers."""
 
 import os
+from contextlib import nullcontext
+from dataclasses import dataclass
 
 import torch
 
@@ -51,6 +53,248 @@ _PERSISTENT_TOPK_PREFILL_TOKENS = (512, 1024, 2048)
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+@dataclass
+class _GatheredKPrefixCacheEntry:
+    values: torch.Tensor
+    scales: torch.Tensor
+    valid_tokens: int
+    block_ids: tuple[int, ...]
+    tail_cu_seq_lens: torch.Tensor
+
+
+_GATHERED_K_PREFIX_CACHE: dict[tuple[object, ...], _GatheredKPrefixCacheEntry] = {}
+
+
+def _reset_gathered_k_prefix_cache_for_tests() -> None:
+    _GATHERED_K_PREFIX_CACHE.clear()
+
+
+def _gathered_k_prefix_cache_key(
+    *,
+    k_cache_prefix: str,
+    kv_cache: torch.Tensor,
+    fallback_k_quant: torch.Tensor,
+    fallback_k_scale: torch.Tensor,
+    use_fp4_cache: bool,
+) -> tuple[object, ...]:
+    device = fallback_k_quant.device
+    return (
+        k_cache_prefix,
+        device.type,
+        device.index,
+        int(kv_cache.data_ptr()),
+        fallback_k_quant.dtype,
+        fallback_k_scale.dtype,
+        int(fallback_k_quant.shape[1]),
+        int(fallback_k_scale.shape[1]),
+        bool(use_fp4_cache),
+    )
+
+
+def _gathered_k_cache_block_ids(
+    block_table: torch.Tensor,
+    num_blocks: int,
+) -> tuple[int, ...]:
+    if num_blocks <= 0:
+        return ()
+    return tuple(int(v) for v in block_table[0, :num_blocks].detach().cpu().tolist())
+
+
+def _gathered_k_cache_capacity_tokens(
+    *,
+    value_width: int,
+    scale_width: int,
+    max_bytes: int,
+) -> int:
+    per_token_bytes = value_width + scale_width
+    if per_token_bytes <= 0 or max_bytes <= 0:
+        return 0
+    return max_bytes // per_token_bytes
+
+
+def _allocate_gathered_k_prefix_entry(
+    *,
+    total_seq_lens: int,
+    fallback_k_quant: torch.Tensor,
+    fallback_k_scale: torch.Tensor,
+    max_tokens: int,
+    old_entry: _GatheredKPrefixCacheEntry | None = None,
+) -> _GatheredKPrefixCacheEntry | None:
+    if total_seq_lens <= 0 or total_seq_lens > max_tokens:
+        return None
+
+    current_capacity = (
+        old_entry.values.shape[0] if old_entry is not None else 0
+    )
+    if old_entry is not None and current_capacity >= total_seq_lens:
+        return old_entry
+
+    new_capacity = max(total_seq_lens, max(current_capacity * 2, 1))
+    new_capacity = min(max_tokens, new_capacity)
+    if new_capacity < total_seq_lens:
+        return None
+
+    values = torch.empty(
+        (new_capacity, fallback_k_quant.shape[1]),
+        dtype=fallback_k_quant.dtype,
+        device=fallback_k_quant.device,
+    )
+    scales = torch.empty(
+        (new_capacity, fallback_k_scale.shape[1]),
+        dtype=fallback_k_scale.dtype,
+        device=fallback_k_scale.device,
+    )
+    if old_entry is not None and old_entry.valid_tokens > 0:
+        copy_tokens = min(old_entry.valid_tokens, new_capacity)
+        with _profile_indexer_or_null(
+            "indexer.prefill.k_prefix_grow_copy", values
+        ):
+            values[:copy_tokens].copy_(old_entry.values[:copy_tokens])
+            scales[:copy_tokens].copy_(old_entry.scales[:copy_tokens])
+        valid_tokens = copy_tokens
+        block_ids = old_entry.block_ids
+    else:
+        valid_tokens = 0
+        block_ids = ()
+    tail_cu_seq_lens = torch.empty(
+        (2,), dtype=torch.int32, device=fallback_k_quant.device
+    )
+    return _GatheredKPrefixCacheEntry(
+        values=values,
+        scales=scales,
+        valid_tokens=valid_tokens,
+        block_ids=block_ids,
+        tail_cu_seq_lens=tail_cu_seq_lens,
+    )
+
+
+def _try_gather_indexer_k_with_prefix_cache(
+    *,
+    kv_cache: torch.Tensor,
+    fallback_k_quant: torch.Tensor,
+    fallback_k_scale: torch.Tensor,
+    chunk,
+    k_cache_prefix: str,
+    use_fp4_cache: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not envs.VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE:
+        return None
+    if use_fp4_cache or chunk.num_reqs != 1 or chunk.skip_kv_gather:
+        return None
+    if fallback_k_quant.dim() != 2 or fallback_k_scale.dim() != 2:
+        return None
+    if chunk.total_seq_lens <= 0:
+        return None
+
+    cache_block_size = int(kv_cache.shape[1])
+    total_seq_lens = int(chunk.total_seq_lens)
+    total_blocks = cdiv(total_seq_lens, cache_block_size)
+    max_tokens = _gathered_k_cache_capacity_tokens(
+        value_width=int(fallback_k_quant.shape[1]) * fallback_k_quant.element_size(),
+        scale_width=int(fallback_k_scale.shape[1]) * fallback_k_scale.element_size(),
+        max_bytes=envs.VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE_BYTES,
+    )
+    if total_seq_lens > max_tokens:
+        return None
+
+    key = _gathered_k_prefix_cache_key(
+        k_cache_prefix=k_cache_prefix,
+        kv_cache=kv_cache,
+        fallback_k_quant=fallback_k_quant,
+        fallback_k_scale=fallback_k_scale,
+        use_fp4_cache=use_fp4_cache,
+    )
+    entry = _GATHERED_K_PREFIX_CACHE.get(key)
+    entry = _allocate_gathered_k_prefix_entry(
+        total_seq_lens=total_seq_lens,
+        fallback_k_quant=fallback_k_quant,
+        fallback_k_scale=fallback_k_scale,
+        max_tokens=max_tokens,
+        old_entry=entry,
+    )
+    if entry is None:
+        _GATHERED_K_PREFIX_CACHE.pop(key, None)
+        return None
+    _GATHERED_K_PREFIX_CACHE[key] = entry
+
+    if entry.valid_tokens >= total_seq_lens:
+        expected_blocks = _gathered_k_cache_block_ids(
+            chunk.block_table, total_blocks
+        )
+        if entry.block_ids[:total_blocks] == expected_blocks:
+            return (
+                entry.values[:total_seq_lens],
+                entry.scales[:total_seq_lens],
+            )
+        entry.valid_tokens = 0
+        entry.block_ids = ()
+
+    can_append_tail = entry.valid_tokens > 0 and (
+        entry.valid_tokens % cache_block_size == 0
+    )
+    if can_append_tail:
+        prefix_blocks = entry.valid_tokens // cache_block_size
+        expected_prefix = _gathered_k_cache_block_ids(
+            chunk.block_table, prefix_blocks
+        )
+        if entry.block_ids[:prefix_blocks] == expected_prefix:
+            tail_tokens = total_seq_lens - entry.valid_tokens
+            if tail_tokens > 0:
+                entry.tail_cu_seq_lens[0] = 0
+                entry.tail_cu_seq_lens[1] = tail_tokens
+                tail_block_table = chunk.block_table[:, prefix_blocks:]
+                with _profile_indexer_or_null(
+                    "indexer.prefill.k_gather_tail",
+                    entry.values[entry.valid_tokens:total_seq_lens],
+                ):
+                    ops.cp_gather_indexer_k_quant_cache(
+                        kv_cache,
+                        entry.values[entry.valid_tokens:total_seq_lens],
+                        entry.scales[entry.valid_tokens:total_seq_lens],
+                        tail_block_table,
+                        entry.tail_cu_seq_lens,
+                    )
+            entry.valid_tokens = total_seq_lens
+            entry.block_ids = _gathered_k_cache_block_ids(
+                chunk.block_table, total_blocks
+            )
+            return (
+                entry.values[:total_seq_lens],
+                entry.scales[:total_seq_lens],
+            )
+
+    entry.valid_tokens = 0
+    entry.block_ids = ()
+    with _profile_indexer_or_null(
+        "indexer.prefill.k_gather_full_snapshot", entry.values
+    ):
+        ops.cp_gather_indexer_k_quant_cache(
+            kv_cache,
+            entry.values[:total_seq_lens],
+            entry.scales[:total_seq_lens],
+            chunk.block_table,
+            chunk.cu_seq_lens,
+        )
+    entry.valid_tokens = total_seq_lens
+    entry.block_ids = _gathered_k_cache_block_ids(chunk.block_table, total_blocks)
+    return (
+        entry.values[:total_seq_lens],
+        entry.scales[:total_seq_lens],
+    )
+
+
+def _profile_indexer_or_null(label: str, ref: torch.Tensor):
+    """Use DeepSeek V4 phase profiler from this module without import cycles."""
+    try:
+        if not ref.is_cuda:
+            return nullcontext()
+        from vllm.model_executor.layers import deepseek_v4_attention
+
+        return deepseek_v4_attention._profile_or_null(label, ref)
+    except Exception:
+        return nullcontext()
 
 
 def _gather_workspace_shapes(
@@ -453,6 +697,16 @@ def _try_prefill_streaming_topk_indices(
         prefill_streaming_topk_tilelang,
     )
 
+    streaming_out_indices = out_indices
+    copy_streaming_output = False
+    if not out_indices.is_contiguous():
+        streaming_out_indices = torch.empty(
+            out_indices.shape,
+            dtype=out_indices.dtype,
+            device=out_indices.device,
+        )
+        copy_streaming_output = True
+
     prefill_streaming_topk_tilelang(
         q=q,
         k_cache_values=k_cache_values,
@@ -460,9 +714,11 @@ def _try_prefill_streaming_topk_indices(
         weights=weights,
         row_starts=row_starts,
         row_ends=row_ends,
-        out_indices=out_indices,
+        out_indices=streaming_out_indices,
         topk_tokens=topk_tokens,
     )
+    if copy_streaming_output:
+        out_indices.copy_(streaming_out_indices)
     if envs.VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE:
         reference_logits = _fp8_fp4_mqa_logits_with_fallback(
             (q, None),
@@ -744,18 +1000,38 @@ def sparse_attn_indexer(
                 values_spec,
                 scales_spec,
             )
+        last_prefill_gather: tuple[int, torch.Tensor, torch.Tensor] | None = None
         for chunk in prefill_metadata.chunks:
             k_quant = k_quant_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
 
             if not chunk.skip_kv_gather:
-                ops.cp_gather_indexer_k_quant_cache(
-                    kv_cache,
-                    k_quant,
-                    k_scale,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
+                cached_gather = _try_gather_indexer_k_with_prefix_cache(
+                    kv_cache=kv_cache,
+                    fallback_k_quant=k_quant,
+                    fallback_k_scale=k_scale,
+                    chunk=chunk,
+                    k_cache_prefix=k_cache_prefix,
+                    use_fp4_cache=use_fp4_cache,
                 )
+                if cached_gather is None:
+                    with _profile_indexer_or_null("indexer.prefill.k_gather", k_quant):
+                        ops.cp_gather_indexer_k_quant_cache(
+                            kv_cache,
+                            k_quant,
+                            k_scale,
+                            chunk.block_table,
+                            chunk.cu_seq_lens,
+                        )
+                else:
+                    k_quant, k_scale = cached_gather
+                last_prefill_gather = (chunk.total_seq_lens, k_quant, k_scale)
+            elif (
+                last_prefill_gather is not None
+                and last_prefill_gather[0] == chunk.total_seq_lens
+            ):
+                k_quant = last_prefill_gather[1]
+                k_scale = last_prefill_gather[2]
 
             q_slice = q_quant[chunk.token_start : chunk.token_end]
             q_scale_slice = (
@@ -780,53 +1056,66 @@ def sparse_attn_indexer(
 
             num_q_rows = q_slice_cast.shape[0]
             num_kv_tokens = k_quant_cast.shape[0]
-            if _try_prefill_streaming_topk_indices(
-                q=q_slice_cast,
-                k_cache_values=k_quant_cast,
-                k_cache_scales=k_scale_cast,
-                weights=weights[chunk.token_start : chunk.token_end],
-                row_starts=chunk.cu_seqlen_ks,
-                row_ends=chunk.cu_seqlen_ke,
-                out_indices=topk_indices,
-                topk_tokens=topk_tokens,
-                use_fp4_cache=use_fp4_cache,
-                max_row_len=attn_metadata_narrowed.max_seq_len,
+            with _profile_indexer_or_null(
+                "indexer.prefill.streaming_topk", q_slice_cast
             ):
+                streaming_handled = _try_prefill_streaming_topk_indices(
+                    q=q_slice_cast,
+                    k_cache_values=k_quant_cast,
+                    k_cache_scales=k_scale_cast,
+                    weights=weights[chunk.token_start : chunk.token_end],
+                    row_starts=chunk.cu_seqlen_ks,
+                    row_ends=chunk.cu_seqlen_ke,
+                    out_indices=topk_indices,
+                    topk_tokens=topk_tokens,
+                    use_fp4_cache=use_fp4_cache,
+                    max_row_len=attn_metadata_narrowed.max_seq_len,
+                )
+            if streaming_handled:
                 continue
 
             for row_start, row_end in _iter_prefill_logits_row_chunks(
                 num_q_rows, num_kv_tokens
             ):
-                logits = _fp8_fp4_mqa_logits_with_fallback(
-                    (
-                        q_slice_cast[row_start:row_end],
+                with _profile_indexer_or_null(
+                    "indexer.prefill.mqa_logits",
+                    q_slice_cast[row_start:row_end],
+                ):
+                    logits = _fp8_fp4_mqa_logits_with_fallback(
                         (
-                            q_scale_slice[row_start:row_end]
-                            if q_scale_slice is not None
+                            q_slice_cast[row_start:row_end],
+                            (
+                                q_scale_slice[row_start:row_end]
+                                if q_scale_slice is not None
+                                else None
+                            ),
+                        ),
+                        (k_quant_cast, k_scale_cast),
+                        weights[
+                            chunk.token_start + row_start : chunk.token_start + row_end
+                        ],
+                        chunk.cu_seqlen_ks[row_start:row_end],
+                        chunk.cu_seqlen_ke[row_start:row_end],
+                        clean_logits=False,
+                        use_fp4_cache=use_fp4_cache,
+                    )
+
+                with _profile_indexer_or_null("indexer.prefill.topk", logits):
+                    _prefill_topk_indices(
+                        logits,
+                        chunk.cu_seqlen_ks[row_start:row_end],
+                        chunk.cu_seqlen_ke[row_start:row_end],
+                        topk_indices[row_start:row_end],
+                        topk_tokens,
+                        max_row_len=attn_metadata_narrowed.max_seq_len,
+                        all_row_starts_zero=chunk.num_reqs == 1,
+                        topk_workspace=topk_workspace,
+                        causal_row_offset=(
+                            chunk.token_start + row_start
+                            if chunk.num_reqs == 1
                             else None
                         ),
-                    ),
-                    (k_quant_cast, k_scale_cast),
-                    weights[chunk.token_start + row_start : chunk.token_start + row_end],
-                    chunk.cu_seqlen_ks[row_start:row_end],
-                    chunk.cu_seqlen_ke[row_start:row_end],
-                    clean_logits=False,
-                    use_fp4_cache=use_fp4_cache,
-                )
-
-                _prefill_topk_indices(
-                    logits,
-                    chunk.cu_seqlen_ks[row_start:row_end],
-                    chunk.cu_seqlen_ke[row_start:row_end],
-                    topk_indices[row_start:row_end],
-                    topk_tokens,
-                    max_row_len=attn_metadata_narrowed.max_seq_len,
-                    all_row_starts_zero=chunk.num_reqs == 1,
-                    topk_workspace=topk_workspace,
-                    causal_row_offset=(
-                        chunk.token_start + row_start if chunk.num_reqs == 1 else None
-                    ),
-                )
+                    )
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -878,56 +1167,60 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        logits = _fp8_fp4_paged_mqa_logits_with_fallback(
-            (padded_q_quant_cast, padded_q_scale),
-            kv_cache,
-            weights[:num_padded_tokens],
-            seq_lens,
-            decode_metadata.block_table,
-            decode_metadata.schedule_metadata,
-            max_model_len=max_model_len,
-            clean_logits=False,
-            use_fp4_cache=use_fp4_cache,
-        )
+        with _profile_indexer_or_null(
+            "indexer.decode.mqa_logits", padded_q_quant_cast
+        ):
+            logits = _fp8_fp4_paged_mqa_logits_with_fallback(
+                (padded_q_quant_cast, padded_q_scale),
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
+                max_model_len=max_model_len,
+                clean_logits=False,
+                use_fp4_cache=use_fp4_cache,
+            )
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if current_platform.is_cuda() and topk_tokens in (512, 1024, 2048):
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-            )
-            torch.ops._C.persistent_topk(
-                logits,
-                seq_lens,
-                topk_indices,
-                topk_workspace,
-                topk_tokens,
-                attn_metadata_narrowed.max_seq_len,
-            )
-        else:
-            if current_platform.is_xpu():
-                xpu_ops.top_k_per_row_decode(  # type: ignore[attr-defined]
+        with _profile_indexer_or_null("indexer.decode.topk", logits):
+            if current_platform.is_cuda() and topk_tokens in (512, 1024, 2048):
+                workspace_manager = current_workspace_manager()
+                (topk_workspace,) = workspace_manager.get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+                torch.ops._C.persistent_topk(
                     logits,
-                    next_n,
                     seq_lens,
                     topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
+                    topk_workspace,
                     topk_tokens,
+                    attn_metadata_narrowed.max_seq_len,
                 )
             else:
-                torch.ops._C.top_k_per_row_decode(
-                    logits,
-                    next_n,
-                    seq_lens,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
+                if current_platform.is_xpu():
+                    xpu_ops.top_k_per_row_decode(  # type: ignore[attr-defined]
+                        logits,
+                        next_n,
+                        seq_lens,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
+                else:
+                    torch.ops._C.top_k_per_row_decode(
+                        logits,
+                        next_n,
+                        seq_lens,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack

@@ -249,6 +249,49 @@ def test_indexer_gather_accepts_upper_bound_output():
     assert torch.all(dst_scale[valid_tokens:] == sentinel)
 
 
+def test_indexer_gather_block_aligned_tail_matches_full_gather():
+    """Existing gather op can append a block-aligned tail by slicing block_table."""
+
+    head_dim = 128
+    quant_block_size = 128
+    cache_stride = head_dim + head_dim * 4 // quant_block_size
+    block_size = 64
+    num_tokens = 192
+    prefix_tokens = 128
+    tail_tokens = num_tokens - prefix_tokens
+    device = "cuda"
+
+    k = torch.randn(num_tokens, head_dim, dtype=torch.bfloat16, device=device)
+    kv_cache = torch.zeros(
+        4, block_size, cache_stride, dtype=torch.uint8, device=device
+    )
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    ops.indexer_k_quant_and_cache(k, kv_cache, slot_mapping, quant_block_size, "ue8m0")
+
+    block_table = torch.arange(4, dtype=torch.int32, device=device).unsqueeze(0)
+    full_cu_seq_lens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+    full_k = torch.empty((num_tokens, head_dim), dtype=torch.uint8, device=device)
+    full_scale = torch.empty((num_tokens, 4), dtype=torch.uint8, device=device)
+    ops.cp_gather_indexer_k_quant_cache(
+        kv_cache, full_k, full_scale, block_table, full_cu_seq_lens
+    )
+
+    tail_cu_seq_lens = torch.tensor([0, tail_tokens], dtype=torch.int32, device=device)
+    tail_k = torch.empty((tail_tokens, head_dim), dtype=torch.uint8, device=device)
+    tail_scale = torch.empty((tail_tokens, 4), dtype=torch.uint8, device=device)
+    ops.cp_gather_indexer_k_quant_cache(
+        kv_cache,
+        tail_k,
+        tail_scale,
+        block_table[:, prefix_tokens // block_size :],
+        tail_cu_seq_lens,
+    )
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(tail_k, full_k[prefix_tokens:])
+    torch.testing.assert_close(tail_scale, full_scale[prefix_tokens:])
+
+
 # ── Test C: DeepseekV4 attention with values at different magnitudes ───────────
 
 
