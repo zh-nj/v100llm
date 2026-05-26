@@ -138,6 +138,8 @@ if TYPE_CHECKING:
         16 * 1024 * 1024
     )
     VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE: bool = True
+
+    VLLM_SM70_PREDEQUANT_PREFILL_DISABLE: bool = False
     VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB: bool = True
     VLLM_SM70_DEEPSEEK_V4_KV_INSERT_NUM_WARPS: int = 4
     VLLM_SM70_USE_TILELANG_SPARSE_PREFILL: bool = True
@@ -1059,6 +1061,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", "1"))
+    ),
+    # H60 cross-step cache fix: opt-out for the eager weight pre-dequant
+    # prefill that happens at model-load time (before cudagraph capture).
+    # Default 0 (= prefill is ON). Set to 1 to fall back to the lazy
+    # cache path that fires `_fp8_weight_predequant_to_fp16_kernel` once
+    # per layer per step (~0.8 ms/step on H60).
+    "VLLM_SM70_PREDEQUANT_PREFILL_DISABLE": lambda: bool(
+        int(os.getenv("VLLM_SM70_PREDEQUANT_PREFILL_DISABLE", "0"))
     ),
     # O1 fix gate: if set to 1, SM70 DeepSeek V4 fuses
     # `wrapper.o_fp8_einsum` and `wrapper.wo_b` into a single Python

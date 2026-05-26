@@ -2571,6 +2571,67 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 k_cache_prefix=self.mla_attn.prefix,
             )
 
+    def prefill_sm70_predequant_cache(self) -> bool:
+        """Eagerly populate ``wo_a.weight._sm70_predequant_f16``.
+
+        H60 nsys decode (2026-05-26) showed
+        ``_fp8_weight_predequant_to_fp16_kernel`` firing 43 calls/step
+        (~0.8 ms/step) under FULL_AND_PIECEWISE cudagraph: the lazy cache
+        miss happens during cudagraph capture, baking the kernel launch
+        into every replay. Calling this from the model loader **before**
+        capture kicks off pre-fills the cache eagerly so the wrapper
+        path takes the fast no-op branch on every subsequent call.
+
+        Returns True if the cache was populated by this call (eligible
+        SM70 fp8 fallback path + cache was empty), False otherwise.
+        Safe to call multiple times — it is a no-op once the cache is
+        already set or the env opt-out is active.
+        """
+        # Skip on non-SM70 / no-fp8 fallback layouts. The wo_a weight is
+        # only consumed by the software-fallback einsum path; on SM80+
+        # with fp8 deep_gemm available, this attribute is never read.
+        if envs.VLLM_SM70_PREDEQUANT_PREFILL_DISABLE:
+            return False
+        if not _env_flag("VLLM_SM70_DEEPSEEK_V4_FUSE_O_WOB", default=True):
+            # Both fused and non-fused SM70 wo_a paths share the cache
+            # attribute, but if the user explicitly disabled the fused
+            # path we still want the cache populated for
+            # `_sm70_fp8_einsum_bmm`. Keep going.
+            pass
+        wo_a = getattr(self, "wo_a", None)
+        if wo_a is None:
+            return False
+        weight = getattr(wo_a, "weight", None)
+        weight_scale = getattr(wo_a, "weight_scale_inv", None)
+        if weight is None or weight_scale is None:
+            return False
+        if not weight.is_cuda:
+            return False
+        if not _should_use_torch_fp8_einsum_fallback(weight):
+            return False
+        if getattr(weight, "_sm70_predequant_f16", None) is not None:
+            return False
+
+        groups = self.n_local_groups
+        rank = self.o_lora_rank
+        # The wo_a weight is shape (groups, rank, hidden) when stored
+        # as a 3D BMM weight. Some loaders flatten to (groups*rank, hidden).
+        if weight.dim() == 3:
+            hidden = weight.shape[2]
+        elif weight.dim() == 2:
+            assert weight.shape[0] == groups * rank, (
+                f"unexpected wo_a weight shape {tuple(weight.shape)} for "
+                f"groups={groups} rank={rank}"
+            )
+            hidden = weight.shape[1]
+        else:
+            return False
+
+        result = _sm70_prefill_predequant_weight(
+            weight, weight_scale, groups, rank, hidden
+        )
+        return result is not None
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -3015,6 +3076,39 @@ def _sm70_ensure_predequant_weight(b: torch.Tensor, b_scale: torch.Tensor,
                 b, b_scale, groups, rank, hidden
             )
         b._sm70_predequant_f16 = b_f16  # type: ignore[attr-defined]
+    return b_f16
+
+
+def _sm70_prefill_predequant_weight(
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    groups: int,
+    rank: int,
+    hidden: int,
+) -> torch.Tensor | None:
+    """Eagerly populate ``b._sm70_predequant_f16`` outside cudagraph capture.
+
+    H60 nsys decode showed `_fp8_weight_predequant_to_fp16_kernel` firing
+    ~43 calls/step (~0.8 ms/step) under FULL_AND_PIECEWISE cudagraph,
+    even though the lazy attribute cache should remove it after the
+    first forward. Root cause: the lazy populate happens *during*
+    cudagraph capture, so the kernel launch is recorded into the replay
+    graph and reissued every step.
+
+    This helper bypasses the shielded custom op and calls
+    ``sm70_fp8_weight_predequant_to_fp16`` directly in eager mode. It must
+    only be invoked **before** any cudagraph capture (e.g. at model load,
+    not from a forward pass).
+
+    Returns ``None`` if the env opt-out is set or the weight is already
+    cached. Otherwise returns the freshly populated fp16 tensor.
+    """
+    if envs.VLLM_SM70_PREDEQUANT_PREFILL_DISABLE:
+        return None
+    if getattr(b, "_sm70_predequant_f16", None) is not None:
+        return None
+    b_f16 = sm70_fp8_weight_predequant_to_fp16(b, b_scale, groups, rank, hidden)
+    b._sm70_predequant_f16 = b_f16  # type: ignore[attr-defined]
     return b_f16
 
 
