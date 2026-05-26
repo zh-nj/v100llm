@@ -117,6 +117,26 @@ def process_weights_after_loading(
             with device_loading_context(module, target_device):
                 module.process_weights_after_loading(model_config.dtype)
 
+    # Pluggable attention wrappers (e.g. DeepseekV4MultiHeadLatentAttentionWrapper)
+    # opt into the same hook by exposing
+    # ``process_weights_after_loading_post_quant``. They run **after** any
+    # quant_method.process_weights_after_loading has replaced their child
+    # weights, so attribute caches placed on the post-replacement weight
+    # tensors persist into runtime.
+    post_quant_invocations = 0
+    for _, module in model.named_modules():
+        hook = getattr(module, "process_weights_after_loading_post_quant", None)
+        if callable(hook) and not isinstance(module, (Attention, MLAAttention)):
+            with device_loading_context(module, target_device):
+                hook(model_config.dtype)
+            post_quant_invocations += 1
+    if post_quant_invocations:
+        from vllm.logger import init_logger as _init_logger
+        _init_logger(__name__).info(
+            "Post-quant hook ran on %d pluggable wrapper(s)",
+            post_quant_invocations,
+        )
+
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
     if model_config.quantization == "torchao":

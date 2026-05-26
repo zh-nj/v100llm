@@ -2632,6 +2632,24 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
         return result is not None
 
+    def process_weights_after_loading_post_quant(self, act_dtype) -> None:
+        """Post-quant hook entry point for the model loader.
+
+        Called from ``vllm.model_executor.model_loader.utils.process_weights_after_loading``
+        AFTER quant_method.process_weights_after_loading has potentially
+        replaced ``wo_a.weight``. We use this to install the
+        ``_sm70_predequant_f16`` cache attribute on the FINAL weight
+        tensor so cudagraph capture sees the fast path.
+        """
+        try:
+            self.prefill_sm70_predequant_cache()
+        except Exception as exc:  # noqa: BLE001 - never block model load
+            logger.warning(
+                "SM70 fp8 weight predequant prefill failed for %s: %s",
+                getattr(self, "prefix", "<unknown>"),
+                exc,
+            )
+
     def forward(
         self,
         positions: torch.Tensor,
