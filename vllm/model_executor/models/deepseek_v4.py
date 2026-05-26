@@ -1825,39 +1825,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()
-        self._sm70_prefill_predequant_caches()
         return loaded_params
-
-    def _sm70_prefill_predequant_caches(self) -> None:
-        """Eagerly populate SM70 fp8 wo_a fp16 dequant caches before
-        cudagraph capture. See `DeepseekV4MultiHeadLatentAttentionWrapper.
-        prefill_sm70_predequant_cache` for context. No-op on non-SM70 paths
-        and when ``VLLM_SM70_PREDEQUANT_PREFILL_DISABLE=1``."""
-        from vllm.model_executor.layers.deepseek_v4_attention import (
-            DeepseekV4MultiHeadLatentAttentionWrapper,
-        )
-
-        prefilled = 0
-        examined = 0
-        for module in self.modules():
-            if not isinstance(module, DeepseekV4MultiHeadLatentAttentionWrapper):
-                continue
-            examined += 1
-            try:
-                if module.prefill_sm70_predequant_cache():
-                    prefilled += 1
-            except Exception as exc:  # noqa: BLE001 - never block model load
-                logger.warning(
-                    "SM70 fp8 weight predequant prefill failed for %s: %s",
-                    getattr(module, "prefix", "<unknown>"),
-                    exc,
-                )
-        if prefilled:
-            logger.info(
-                "SM70 fp8 weight predequant prefilled on %d / %d MLA wrappers",
-                prefilled,
-                examined,
-            )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
