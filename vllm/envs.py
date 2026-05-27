@@ -137,6 +137,12 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE_BYTES: int = (
         16 * 1024 * 1024
     )
+    # Path A (cascade-GEMM decode indexer). Default OFF until the
+    # cudagraph-compatibility work lands; see
+    # .kiro/specs/deepseek-v4-decode-indexer-on-compressed-kv/measurements/h64_path_a_summary.md
+    VLLM_SM70_INDEXER_CASCADE_GEMM: bool = False
+    VLLM_SM70_INDEXER_CASCADE_GEMM_THRESHOLD: int = 2048
+    VLLM_SM70_INDEXER_CONTIGUOUS_KV_BYTES: int = 64 * 1024 * 1024
     VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE: bool = True
 
     VLLM_SM70_PREDEQUANT_PREFILL_DISABLE: bool = False
@@ -1058,6 +1064,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE_BYTES",
             str(16 * 1024 * 1024),
         )
+    ),
+    # Path A (cascade-GEMM decode indexer). Off by default; turn on
+    # via VLLM_SM70_INDEXER_CASCADE_GEMM=1 once the cudagraph-compat
+    # follow-up lands.
+    "VLLM_SM70_INDEXER_CASCADE_GEMM": lambda: bool(
+        int(os.getenv("VLLM_SM70_INDEXER_CASCADE_GEMM", "0"))
+    ),
+    "VLLM_SM70_INDEXER_CASCADE_GEMM_THRESHOLD": lambda: int(
+        os.getenv("VLLM_SM70_INDEXER_CASCADE_GEMM_THRESHOLD", "2048")
+    ),
+    "VLLM_SM70_INDEXER_CONTIGUOUS_KV_BYTES": lambda: int(
+        os.getenv("VLLM_SM70_INDEXER_CONTIGUOUS_KV_BYTES", str(64 * 1024 * 1024))
     ),
     "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", "1"))
