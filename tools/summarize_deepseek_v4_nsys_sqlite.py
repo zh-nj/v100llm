@@ -2396,6 +2396,24 @@ def _run_curl_json(
     stdout_path: Path | None = None,
     env: dict[str, str] | None = None,
 ) -> subprocess.Popen[str] | subprocess.CompletedProcess[str]:
+    # Write the JSON body to a temp file so very large prompts (>~128KB)
+    # do not blow up the curl argv. Linux's `getconf ARG_MAX` is typically
+    # 2 MiB, but the practical exec ceiling is much lower once env is
+    # included; long-context decay traces routinely cross it.
+    import tempfile
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="dsv4_curl_", suffix=".json", delete=False
+    )
+    try:
+        tmp.write(body)
+        tmp.close()
+    except Exception:
+        try:
+            tmp.close()
+        except Exception:
+            pass
+        raise
     cmd = [
         "curl",
         "-s",
@@ -2405,8 +2423,8 @@ def _run_curl_json(
         url,
         "-H",
         "Content-Type: application/json",
-        "-d",
-        json.dumps(payload, ensure_ascii=False),
+        "--data-binary",
+        f"@{tmp.name}",
     ]
     if stream:
         out = open(stdout_path, "w", encoding="utf-8") if stdout_path else subprocess.DEVNULL
@@ -2421,12 +2439,27 @@ def _run_curl_json(
             )
             if stdout_path:
                 out.close()
+            # Stash the temp-file path on the process so the caller
+            # (or our process-cleanup helpers) can delete it after
+            # curl is fully done. Deleting earlier races with curl's
+            # `--data-binary @file` open() on the body.
+            proc._dsv4_body_tempfile = tmp.name  # type: ignore[attr-defined]
             return proc
         except Exception:
             if stdout_path and not out.closed:
                 out.close()
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
             raise
-    return subprocess.run(cmd, check=True, env=env, text=True, capture_output=True)
+    try:
+        return subprocess.run(cmd, check=True, env=env, text=True, capture_output=True)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
 
 
 def _wait_for_server(
@@ -2852,6 +2885,13 @@ def run_collect_prefill(args: argparse.Namespace) -> None:
         _append_collect_config_summary(summary_path, collect_config)
 
 
+def _resolve_prompt(args: argparse.Namespace) -> str:
+    prompt_file = getattr(args, "prompt_file", None)
+    if prompt_file is not None:
+        return Path(prompt_file).read_text(encoding="utf-8")
+    return args.prompt
+
+
 def run_collect_decode(args: argparse.Namespace) -> None:
     nsys = _which_nsys(args.nsys)
     _validate_sm70_devices(args.server_cuda_visible_devices, skip=args.skip_sm70_device_check)
@@ -2989,7 +3029,7 @@ def run_collect_decode(args: argparse.Namespace) -> None:
 
         long_payload = {
             "model": args.model,
-            "messages": [{"role": "user", "content": args.prompt}],
+            "messages": [{"role": "user", "content": _resolve_prompt(args)}],
             "max_tokens": args.max_tokens,
             "temperature": 0,
             "stream": True,
@@ -3401,6 +3441,15 @@ def build_collect_decode_parser(prog: str) -> argparse.ArgumentParser:
         "--prompt",
         default="请详细描述大语言模型推理系统。",
         help="Prompt used for the long decode request.",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path; when set the file's UTF-8 contents replace "
+            "--prompt. Useful for long-context decay measurements."
+        ),
     )
     return parser
 
