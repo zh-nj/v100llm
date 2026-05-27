@@ -913,10 +913,8 @@ def _maybe_cascade_gemm_decode_logits(
 ) -> torch.Tensor | None:
     """Return logits via the SM70 cascade-GEMM path, or None to fall
     back. Guards: env-on, SM70 only, FP8 cache only, batch=1, next_n=1,
-    not currently capturing a CUDA graph (the snapshot lookup requires
-    a host-side block_table read), and context_len >= threshold.
-    Snapshot lookup may also return None (capacity exceeded) -> caller
-    falls back."""
+    and static context capacity >= threshold. Snapshot lookup may also
+    return None (capacity exceeded) -> caller falls back."""
     if not _cascade_gemm_enabled():
         return None
     if not _can_use_sm70_torch_indexer_fallback(use_fp4_cache=use_fp4_cache):
@@ -925,58 +923,41 @@ def _maybe_cascade_gemm_decode_logits(
         return None
     if q_quant.dim() != 4 or q_quant.shape[0] != 1 or q_quant.shape[1] != 1:
         return None
-    # Cudagraph compat: the snapshot path uses host-side block_table
-    # and context_len reads to manage state. Both are forbidden during
-    # capture. Fall back to the paged kernel when capturing; eager-mode
-    # forward calls take the fast path.
-    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-        return None
-    if seq_lens.dim() == 2:
-        ctx = int(seq_lens[0, -1].item())
-    else:
-        ctx = int(seq_lens[0].item())
     threshold = _cascade_gemm_threshold()
-    if ctx < threshold:
+    # `seq_lens` may live on the stream currently being captured. Avoid
+    # `.item()` and use the fixed static capacity as the host-side gate;
+    # the GEMM epilogue masks runtime positions >= seq_lens on device.
+    if max_model_len < threshold:
         return None
 
     head_dim = int(q_quant.shape[-1])
     from vllm.model_executor.layers.sm70_indexer_snapshot import (
-        ensure_decode_snapshot,
+        ensure_decode_snapshot_cudagraph,
     )
     from vllm.model_executor.layers.sm70_cascade_gemm_indexer import (
-        sm70_cascade_gemm_indexer,
+        sm70_cascade_gemm_indexer_from_snapshot,
     )
 
     block_table_row = block_table[0]
-    snapshot = ensure_decode_snapshot(
+    snapshot = ensure_decode_snapshot_cudagraph(
         k_cache_prefix=k_cache_prefix,
         kv_cache=kv_cache,
         block_table_row=block_table_row,
+        seq_lens=seq_lens,
         block_size=cache_block_size,
-        compressed_seq_len=ctx,
         head_dim=head_dim,
+        max_model_len=max_model_len,
     )
     if snapshot is None:
         return None
 
     # weights here is [num_padded_tokens, H] = [1, 64] for batch=1 next_n=1.
-    # On the snapshot-hit path k_values / k_scales are not consumed by the
-    # wrapper (k_f32_cache is the source of truth). Pass zero-size sentinels
-    # of the right shape to satisfy the assertion contract.
-    dummy_k_values = torch.empty(
-        (ctx, head_dim), dtype=torch.uint8, device=kv_cache.device
-    )
-    dummy_k_scales = torch.empty(
-        (ctx,), dtype=torch.float32, device=kv_cache.device
-    )
-    return sm70_cascade_gemm_indexer(
-        q_quant,
-        dummy_k_values,
-        dummy_k_scales,
-        weights,
-        ctx,
-        max_model_len,
+    return sm70_cascade_gemm_indexer_from_snapshot(
+        q=q_quant,
         k_f32_cache=snapshot,
+        weights=weights,
+        context_lens=seq_lens,
+        max_model_len=max_model_len,
     )
 
 
@@ -1004,6 +985,22 @@ def sparse_attn_indexer(
 
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
+        if (
+            envs.VLLM_SM70_INDEXER_CASCADE_GEMM
+            and _can_use_sm70_torch_indexer_fallback(use_fp4_cache=use_fp4_cache)
+            and not use_fp4_cache
+        ):
+            from vllm.model_executor.layers.sm70_indexer_snapshot import (
+                reserve_decode_snapshot_cudagraph,
+            )
+
+            reserve_decode_snapshot_cudagraph(
+                k_cache_prefix=k_cache_prefix,
+                kv_cache=kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache),
+                head_dim=head_dim,
+                max_model_len=max_model_len,
+            )
+
         # Reserve workspace for indexer during profiling run
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache

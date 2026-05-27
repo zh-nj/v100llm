@@ -66,6 +66,7 @@ class _SnapshotEntry:
     values_fp32: torch.Tensor    # [capacity, head_dim] fp32
     valid_count: int             # rows currently populated
     block_ids: tuple[int, ...]   # snapshot of block_table[req, :n_blocks]
+    row_block_ids: torch.Tensor | None = None  # int32 [capacity], graph-safe path
 
 
 # Per-layer pool, keyed by ``k_cache_prefix``.
@@ -138,6 +139,200 @@ def _block_ids_tuple(block_table_row: torch.Tensor, n_blocks: int) -> tuple[int,
     if n_blocks <= 0:
         return ()
     return tuple(int(v) for v in block_table_row[:n_blocks].detach().cpu().tolist())
+
+
+@triton.jit
+def _decode_indexer_k_to_fp32_cudagraph_kernel(
+    kv_cache_ptr,                   # uint8 [num_blocks, block_size, hd+4]
+    kv_cache_block_stride,
+    kv_cache_token_stride,
+    block_table_ptr,                # int32 [max_blocks]
+    seq_lens_ptr,                   # flattened int32, first decode row
+    out_ptr,                        # fp32 [capacity, D]
+    out_stride_n,
+    row_block_ids_ptr,              # int32 [capacity]
+    block_size,
+    capacity_rows,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Graph-safe gather/dequant from paged indexer KV into a fixed snapshot.
+
+    The launch shape is fixed to the snapshot capacity.  Each row copies only
+    when it is inside the runtime context and its physical block id differs
+    from the last populated value.  Rows outside context are marked invalid so
+    request resets / context shrinkage force a fresh copy before reuse.
+    """
+    pid = tl.program_id(0)
+    n_idx = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    in_capacity = n_idx < capacity_rows
+    context_len = tl.load(seq_lens_ptr)
+    context_len = tl.minimum(context_len, capacity_rows)
+    in_context = in_capacity & (n_idx < context_len)
+
+    cache_block_idx = n_idx // block_size
+    pos_in_block = n_idx % block_size
+    physical_block = tl.load(
+        block_table_ptr + cache_block_idx, mask=in_context, other=-1
+    )
+    old_block = tl.load(row_block_ids_ptr + n_idx, mask=in_capacity, other=-1)
+    needs_copy = in_context & (old_block != physical_block)
+
+    d_range = tl.arange(0, HEAD_DIM)
+    head_dim_with_scale = HEAD_DIM + 4
+    base_addr = (
+        kv_cache_ptr
+        + physical_block.to(tl.int64) * kv_cache_block_stride
+        + pos_in_block * kv_cache_token_stride
+    )
+    addr = base_addr[:, None] + d_range[None, :]
+    k_uint = tl.load(addr, mask=needs_copy[:, None], other=0)
+
+    val32 = k_uint.to(tl.int32)
+    sign_bit = (val32 & 0x80) << 24
+    low7 = val32 & 0x7F
+    fp32_bits = sign_bit | ((low7 + (120 << 3)) << 20)
+    fp32_bits = tl.where(low7 == 0, 0, fp32_bits)
+    k_f32 = fp32_bits.to(tl.float32, bitcast=True)
+
+    scale_addr = base_addr + HEAD_DIM
+    scale_typed_addr = scale_addr.to(tl.pointer_type(tl.float32))
+    k_scale = tl.load(scale_typed_addr, mask=needs_copy, other=1.0)
+    k_scaled = k_f32 * k_scale[:, None]
+
+    out_addr = out_ptr + n_idx[:, None] * out_stride_n + d_range[None, :]
+    tl.store(out_addr, k_scaled, mask=needs_copy[:, None])
+    tl.store(row_block_ids_ptr + n_idx, physical_block, mask=needs_copy)
+    tl.store(row_block_ids_ptr + n_idx, -1, mask=in_capacity & (n_idx >= context_len))
+
+
+def _snapshot_capacity_rows(head_dim: int, requested_rows: int) -> int:
+    bytes_per_layer = _env_bytes(
+        "VLLM_SM70_INDEXER_CONTIGUOUS_KV_BYTES", _DEFAULT_BYTES_PER_LAYER
+    )
+    capacity_rows = bytes_per_layer // (head_dim * 4)
+    if requested_rows <= 0 or requested_rows > capacity_rows:
+        return 0
+    return requested_rows
+
+
+def _graph_snapshot_key(
+    *,
+    k_cache_prefix: str,
+    kv_cache: torch.Tensor,
+    head_dim: int,
+    capacity_rows: int,
+) -> tuple[object, ...]:
+    device = kv_cache.device
+    return (
+        "cudagraph",
+        k_cache_prefix,
+        device.type,
+        device.index,
+        int(kv_cache.data_ptr()),
+        int(head_dim),
+        int(capacity_rows),
+    )
+
+
+def reserve_decode_snapshot_cudagraph(
+    *,
+    k_cache_prefix: str,
+    kv_cache: torch.Tensor,
+    head_dim: int,
+    max_model_len: int,
+) -> torch.Tensor | None:
+    """Preallocate the fixed-size snapshot used by the capture-safe path."""
+    capacity_rows = _snapshot_capacity_rows(head_dim, max_model_len)
+    if capacity_rows <= 0:
+        return None
+
+    layer_pool = _DECODE_SNAPSHOT_POOLS.setdefault(k_cache_prefix, {})
+    key = _graph_snapshot_key(
+        k_cache_prefix=k_cache_prefix,
+        kv_cache=kv_cache,
+        head_dim=head_dim,
+        capacity_rows=capacity_rows,
+    )
+    entry = layer_pool.get(key)
+    if entry is not None:
+        return entry.values_fp32
+
+    values = torch.zeros(
+        (capacity_rows, head_dim), dtype=torch.float32, device=kv_cache.device
+    )
+    row_block_ids = torch.full(
+        (capacity_rows,), -1, dtype=torch.int32, device=kv_cache.device
+    )
+    entry = _SnapshotEntry(
+        values_fp32=values,
+        valid_count=0,
+        block_ids=(),
+        row_block_ids=row_block_ids,
+    )
+    layer_pool[key] = entry
+    return entry.values_fp32
+
+
+def ensure_decode_snapshot_cudagraph(
+    *,
+    k_cache_prefix: str,
+    kv_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    head_dim: int,
+    max_model_len: int,
+) -> torch.Tensor | None:
+    """Return a fixed-size fp32 K snapshot and update it without host sync."""
+    snapshot = reserve_decode_snapshot_cudagraph(
+        k_cache_prefix=k_cache_prefix,
+        kv_cache=kv_cache,
+        head_dim=head_dim,
+        max_model_len=max_model_len,
+    )
+    if snapshot is None:
+        return None
+
+    layer_pool = _DECODE_SNAPSHOT_POOLS[k_cache_prefix]
+    key = _graph_snapshot_key(
+        k_cache_prefix=k_cache_prefix,
+        kv_cache=kv_cache,
+        head_dim=head_dim,
+        capacity_rows=max_model_len,
+    )
+    entry = layer_pool[key]
+    assert entry.row_block_ids is not None
+
+    head_dim_with_scale = head_dim + 4
+    kv_cache_u8 = kv_cache.view(torch.uint8)
+    if kv_cache_u8.dim() == 4:
+        kv_cache_u8_flat = kv_cache_u8.reshape(
+            kv_cache_u8.shape[0], block_size, head_dim_with_scale
+        )
+    elif kv_cache_u8.dim() == 3:
+        kv_cache_u8_flat = kv_cache_u8
+    else:
+        return None
+
+    seq_lens_flat = seq_lens.reshape(-1)
+    BLOCK_N = 32
+    n_blocks_program = (max_model_len + BLOCK_N - 1) // BLOCK_N
+    _decode_indexer_k_to_fp32_cudagraph_kernel[(n_blocks_program,)](
+        kv_cache_u8_flat,
+        kv_cache_u8_flat.stride(0),
+        kv_cache_u8_flat.stride(1),
+        block_table_row,
+        seq_lens_flat,
+        entry.values_fp32,
+        entry.values_fp32.stride(0),
+        entry.row_block_ids,
+        block_size,
+        max_model_len,
+        HEAD_DIM=head_dim,
+        BLOCK_N=BLOCK_N,
+    )
+    return entry.values_fp32
 
 
 def ensure_decode_snapshot(

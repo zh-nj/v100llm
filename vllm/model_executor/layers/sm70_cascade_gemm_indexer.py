@@ -231,6 +231,170 @@ def _cascade_gemm_epilogue_kernel(
     tl.store(out_addr, out_val, mask=out_mask)
 
 
+@triton.jit
+def _cascade_gemm_epilogue_tensor_len_kernel(
+    scores_ptr,           # float32 [num_rows, 8, static_context_len]
+    scores_stride_row,
+    scores_stride_bucket,
+    w_emul_ptr,           # float32 [num_rows, 8]
+    w_emul_stride_row,
+    context_lens_ptr,     # int32 flattened, one length per decode row
+    out_ptr,              # float32 [num_rows, max_model_len]
+    out_stride_row,
+    static_context_len,
+    max_model_len,
+    BLOCK_K: tl.constexpr,
+):
+    """Capture-safe epilogue variant.
+
+    Unlike `_cascade_gemm_epilogue_kernel`, the true context length is
+    read from a device tensor so the host never calls `.item()` while a
+    CUDA graph is being captured.  The GEMM is fixed-shape over
+    `static_context_len`; positions beyond the runtime context are
+    masked to -inf here.
+    """
+    pid = tl.program_id(0)
+    pid_row = pid // tl.cdiv(max_model_len, BLOCK_K)
+    pid_k_block = pid - pid_row * tl.cdiv(max_model_len, BLOCK_K)
+
+    context_len = tl.load(context_lens_ptr + pid_row)
+    context_len = tl.minimum(context_len, static_context_len)
+
+    k_pos_base = pid_k_block * BLOCK_K
+    k_range = k_pos_base + tl.arange(0, BLOCK_K)
+    in_range = (k_range < context_len) & (k_range < static_context_len)
+
+    w_emul_row = w_emul_ptr + pid_row * w_emul_stride_row
+    w_0 = tl.load(w_emul_row + 0)
+    w_1 = tl.load(w_emul_row + 1)
+    w_2 = tl.load(w_emul_row + 2)
+    w_3 = tl.load(w_emul_row + 3)
+    w_4 = tl.load(w_emul_row + 4)
+    w_5 = tl.load(w_emul_row + 5)
+    w_6 = tl.load(w_emul_row + 6)
+    w_7 = tl.load(w_emul_row + 7)
+
+    scores_row = scores_ptr + pid_row * scores_stride_row
+    s_0 = tl.load(scores_row + 0 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
+    s_1 = tl.load(scores_row + 1 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
+    s_2 = tl.load(scores_row + 2 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
+    s_3 = tl.load(scores_row + 3 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
+    s_4 = tl.load(scores_row + 4 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
+    s_5 = tl.load(scores_row + 5 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
+    s_6 = tl.load(scores_row + 6 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
+    s_7 = tl.load(scores_row + 7 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
+
+    logit = (
+        tl.maximum(s_0, 0.0) * w_0
+        + tl.maximum(s_1, 0.0) * w_1
+        + tl.maximum(s_2, 0.0) * w_2
+        + tl.maximum(s_3, 0.0) * w_3
+        + tl.maximum(s_4, 0.0) * w_4
+        + tl.maximum(s_5, 0.0) * w_5
+        + tl.maximum(s_6, 0.0) * w_6
+        + tl.maximum(s_7, 0.0) * w_7
+    )
+    out_val = tl.where(in_range, logit, float("-inf"))
+    out_addr = out_ptr + pid_row * out_stride_row + k_range
+    tl.store(out_addr, out_val, mask=k_range < max_model_len)
+
+
+def _decode_q_and_weights(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
+    """Decode Q into the 8 cascade buckets and materialize bucket weights."""
+    if q.dim() == 3:
+        q = q.unsqueeze(0)
+    batch_size, next_n, num_heads, head_dim = q.shape
+    assert batch_size == 1, "cascade-gemm currently supports batch=1"
+    assert weights.dim() == 2 and weights.shape[1] == num_heads
+    assert weights.shape[0] == next_n
+
+    q_u8 = q.view(torch.uint8)
+    num_buckets = 8
+    device = q.device
+    q_emul = torch.empty(
+        (next_n, num_buckets, head_dim), dtype=torch.float32, device=device
+    )
+    w_emul = torch.zeros((next_n, num_buckets), dtype=torch.float32, device=device)
+    num_d_chunks = head_dim // 64
+    _decode_q_emul_kernel[(next_n * num_d_chunks,)](
+        q_u8,
+        q_u8.stride(0),
+        q_u8.stride(1),
+        q_u8.stride(2),
+        weights,
+        weights.stride(0),
+        q_emul,
+        q_emul.stride(0),
+        q_emul.stride(1),
+        w_emul,
+        w_emul.stride(0),
+        next_n,
+        NUM_HEADS=num_heads,
+        HEAD_DIM=head_dim,
+    )
+    return q_emul, w_emul, next_n, num_heads, head_dim
+
+
+def sm70_cascade_gemm_indexer_from_snapshot(
+    *,
+    q: torch.Tensor,
+    k_f32_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_model_len: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Capture-safe cascade-compatible GEMM indexer from a fixed snapshot.
+
+    `k_f32_cache` is a preallocated contiguous snapshot.  The GEMM shape is
+    fixed to `min(k_f32_cache.shape[0], max_model_len)`, while runtime
+    masking uses `context_lens` on device.  This avoids host-side `.item()`
+    during FULL cudagraph capture.
+    """
+    assert q.is_cuda
+    assert k_f32_cache.is_cuda and k_f32_cache.dtype == torch.float32
+    static_context_len = min(int(k_f32_cache.shape[0]), int(max_model_len))
+    assert static_context_len > 0
+
+    q_emul, w_emul, next_n, _, head_dim = _decode_q_and_weights(q, weights)
+    assert k_f32_cache.dim() == 2 and k_f32_cache.shape[1] == head_dim
+
+    if out is None:
+        out = torch.empty(
+            (next_n, max_model_len), device=q.device, dtype=torch.float32
+        )
+    else:
+        assert out.shape == (next_n, max_model_len)
+        assert out.dtype == torch.float32
+
+    k_f32 = k_f32_cache[:static_context_len]
+    if next_n == 1:
+        scores = torch.matmul(q_emul[0], k_f32.T).unsqueeze(0)
+    else:
+        scores = torch.matmul(q_emul, k_f32.T)
+
+    context_lens_flat = context_lens.reshape(-1)
+    BLOCK_K = 32
+    n_k_blocks = (max_model_len + BLOCK_K - 1) // BLOCK_K
+    _cascade_gemm_epilogue_tensor_len_kernel[(next_n * n_k_blocks,)](
+        scores,
+        scores.stride(0),
+        scores.stride(1),
+        w_emul,
+        w_emul.stride(0),
+        context_lens_flat,
+        out,
+        out.stride(0),
+        static_context_len,
+        max_model_len,
+        BLOCK_K=BLOCK_K,
+    )
+    return out
+
+
 def sm70_cascade_gemm_indexer(
     q: torch.Tensor,            # [B, next_n, H, D] uint8 (FP8) or fp8_e4m3fn
     k_values: torch.Tensor,      # [N, D] uint8 (FP8 raw bytes)
@@ -281,30 +445,8 @@ def sm70_cascade_gemm_indexer(
     if context_len <= 0:
         return out
 
-    q_u8 = q.view(torch.uint8)
-    NUM_BUCKETS = 8
-
     # 1. Q dequant + 8-bucket collapse + w_emul (one fused Triton kernel).
-    q_emul = torch.empty((next_n, NUM_BUCKETS, head_dim), dtype=torch.float32, device=device)
-    w_emul = torch.zeros((next_n, NUM_BUCKETS), dtype=torch.float32, device=device)
-    NUM_D_CHUNKS = head_dim // 64
-    grid_q = (next_n * NUM_D_CHUNKS,)
-    _decode_q_emul_kernel[grid_q](
-        q_u8,
-        q_u8.stride(0),
-        q_u8.stride(1),
-        q_u8.stride(2),
-        weights,
-        weights.stride(0),
-        q_emul,
-        q_emul.stride(0),
-        q_emul.stride(1),
-        w_emul,
-        w_emul.stride(0),
-        next_n,
-        NUM_HEADS=num_heads,
-        HEAD_DIM=head_dim,
-    )
+    q_emul, w_emul, _, _, _ = _decode_q_and_weights(q, weights)
 
     # 2. K dequant + scale (skipped if k_f32_cache provided + complete).
     if k_f32_cache is not None and k_f32_cache.shape[0] >= context_len:
