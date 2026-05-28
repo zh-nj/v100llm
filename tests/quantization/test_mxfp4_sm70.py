@@ -931,3 +931,257 @@ def test_sm70_moe_add_bias_out_cuda_adds_bias_by_expert_offsets() -> None:
         device="cuda",
     )
     torch.testing.assert_close(out, expected)
+
+
+
+def _build_apply_layer_for_dispatcher_test():
+    """Shared layer + buffer scaffolding for H74-A apply tests."""
+    layer = torch.nn.Module()
+    layer.sm70_batched_ready = True
+    layer.sm70_num_experts = 2
+    layer.sm70_hidden_logical_size = 256
+    layer.sm70_w13_k_dim = 256
+    layer.sm70_w13_n_dim = 256
+    layer.sm70_w2_k_dim = 128
+    layer.sm70_w2_n_dim = 256
+    layer.sm70_intermediate_size = 128
+    layer._buf_max_tokens = 32
+    layer._buf_max_slots = 32
+    layer._buf_top_k = 1
+    layer._buf_output = torch.empty(32, 256, dtype=torch.float16)
+    layer._buf_permuted_input = torch.empty(32, 256, dtype=torch.float16)
+    layer._buf_sorted_output = torch.empty(32, 256, dtype=torch.float16)
+    layer._buf_gate_up = torch.empty(32, 256, dtype=torch.float16)
+    layer._buf_intermediate = torch.empty(32, 128, dtype=torch.float16)
+    layer._buf_expert_offsets = torch.empty(3, dtype=torch.int32)
+    layer._buf_expert_offsets64 = torch.empty(3, dtype=torch.int64)
+    layer._buf_inv_permuted_idx = torch.empty(32, 1, dtype=torch.int32)
+    layer._buf_topk_ids_i32 = torch.empty(32, 1, dtype=torch.int32)
+    layer._buf_token_expert_indices = torch.arange(32, dtype=torch.int32).view(32, 1)
+    layer._buf_permuted_idx = torch.empty(32, dtype=torch.int32)
+    layer._buf_m_indices = torch.empty(32, dtype=torch.int32)
+    layer.w13_strided_ptrs_w = torch.empty(32, dtype=torch.uint8)
+    layer.w13_strided_ptrs_s = torch.empty(32, dtype=torch.uint8)
+    layer.w2_strided_ptrs_w = torch.empty(32, dtype=torch.uint8)
+    layer.w2_strided_ptrs_s = torch.empty(32, dtype=torch.uint8)
+    return layer
+
+
+def _patch_dispatcher_stubs(monkeypatch, sm70_module, ops_module):
+    """Stub out the C++ ops + activation so the apply path can run on CPU.
+
+    Returns ``(permute_observations, gemm_calls, activation_calls)`` lists
+    that the caller can inspect after invoking ``method.apply(...)``.
+    """
+    permute_observations: list[dict] = []
+    gemm_calls: list[tuple] = []
+    activation_calls: list[tuple] = []
+
+    def fake_permute(
+        x,
+        topk_ids,
+        token_expert_indices,
+        scales,
+        num_experts,
+        padded_num_experts,
+        top_k,
+        maybe_unused,
+        permuted_input,
+        expert_offsets64,
+        inv_permuted_idx,
+        permuted_idx,
+        m_indices,
+    ):
+        del scales, num_experts, padded_num_experts, maybe_unused
+        del permuted_idx, m_indices, token_expert_indices, top_k
+        permute_observations.append(
+            {
+                "topk_ids_dtype": topk_ids.dtype,
+                "topk_ids_id": id(topk_ids),
+                "topk_ids_data_ptr": topk_ids.data_ptr(),
+            }
+        )
+        permuted_input[: x.size(0)].copy_(x)
+        expert_offsets64.copy_(torch.tensor([0, x.size(0), x.size(0)]))
+        inv_permuted_idx.zero_()
+
+    def fake_unpermute(sorted_output, topk_weights, inv_idx, offsets, top_k, output):
+        del topk_weights, inv_idx, offsets, top_k
+        output.copy_(sorted_output[: output.size(0)])
+
+    def fake_mxfp4_moe_gemm_out(
+        out,
+        sorted_input,
+        expert_offsets,
+        ptrs_w,
+        ptrs_s,
+        num_experts,
+        k,
+        n,
+        group_size,
+        gated_silu=False,
+    ):
+        del sorted_input, expert_offsets, ptrs_w, ptrs_s, num_experts
+        gemm_calls.append((tuple(out.shape), k, n, group_size, gated_silu))
+        out.fill_(3 if k == 256 else 5)
+
+    def fake_activation(activation, output, input):
+        activation_calls.append(
+            (activation.value, tuple(output.shape), tuple(input.shape))
+        )
+        output.fill_(7)
+
+    monkeypatch.setattr(torch.ops._moe_C, "moe_permute", fake_permute)
+    monkeypatch.setattr(torch.ops._moe_C, "moe_unpermute", fake_unpermute)
+    monkeypatch.setattr(
+        sm70_module,
+        "_moe_permute_accepts_scale_and_m_indices",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        ops_module,
+        "sm70_mxfp4_moe_gemm_out",
+        fake_mxfp4_moe_gemm_out,
+        raising=False,
+    )
+    monkeypatch.setattr(sm70_module, "apply_moe_activation", fake_activation)
+    return permute_observations, gemm_calls, activation_calls
+
+
+def _make_sm70_method(activation: str = "swigluoai"):
+    sm70_module = importlib.import_module(
+        "vllm.model_executor.layers.quantization.sm70_mxfp4_moe"
+    )
+    method_cls = getattr(sm70_module, "Mxfp4SM70MoEMethod")
+    dummy_moe_config = type(
+        "MoeCfg",
+        (),
+        {"experts_per_token": 1, "activation": activation, "has_bias": False},
+    )()
+    return sm70_module, method_cls(dummy_moe_config)
+
+
+def test_mxfp4_sm70_apply_h74a_int32_topk_ids_skips_copy(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H74-A: when select_experts already returns int32, the dispatcher
+    must feed topk_ids straight to moe_permute without an int32 copy."""
+    del default_vllm_config
+    sm70_module, method = _make_sm70_method()
+    ops_module = importlib.import_module("vllm._custom_ops")
+    layer = _build_apply_layer_for_dispatcher_test()
+    permute_observations, _, _ = _patch_dispatcher_stubs(
+        monkeypatch, sm70_module, ops_module
+    )
+
+    x = torch.ones(2, 256, dtype=torch.float16)
+    topk_weights = torch.ones(2, 1, dtype=torch.float32)
+    topk_ids = torch.zeros(2, 1, dtype=torch.int32)  # already int32
+
+    method.apply(layer, x, topk_weights, topk_ids, None)
+
+    assert len(permute_observations) == 1
+    obs = permute_observations[0]
+    assert obs["topk_ids_dtype"] == torch.int32
+    # The exact same tensor object (not a copy) was forwarded.
+    assert obs["topk_ids_data_ptr"] == topk_ids.data_ptr()
+
+
+def test_mxfp4_sm70_apply_h74a_int64_topk_ids_falls_back(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the upstream router yields int64 indices, the dispatcher
+    must still cast through the per-layer int32 buffer."""
+    del default_vllm_config
+    sm70_module, method = _make_sm70_method()
+    ops_module = importlib.import_module("vllm._custom_ops")
+    layer = _build_apply_layer_for_dispatcher_test()
+    permute_observations, _, _ = _patch_dispatcher_stubs(
+        monkeypatch, sm70_module, ops_module
+    )
+
+    x = torch.ones(2, 256, dtype=torch.float16)
+    topk_weights = torch.ones(2, 1, dtype=torch.float32)
+    topk_ids_i64 = torch.zeros(2, 1, dtype=torch.int64)
+
+    method.apply(layer, x, topk_weights, topk_ids_i64, None)
+
+    assert len(permute_observations) == 1
+    obs = permute_observations[0]
+    assert obs["topk_ids_dtype"] == torch.int32
+    # The forwarded buffer is the layer's pinned int32 buffer, not the
+    # caller's int64 tensor.
+    assert obs["topk_ids_data_ptr"] != topk_ids_i64.data_ptr()
+    assert obs["topk_ids_data_ptr"] == layer._buf_topk_ids_i32[:2].data_ptr()
+
+
+def test_mxfp4_sm70_apply_h74a_skips_pre_zero_when_unpermute_writes(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H74-A: skip the per-call `output.zero_()` when total_slots > 0;
+    moe_unpermute writes every output row.
+
+    We seed the persistent output buffer with sentinel non-zero values and
+    confirm those values are *replaced* by the unpermute fake (not by a
+    pre-zero call). If the dispatcher pre-zeroes the buffer the test
+    catches it because the non-zero sentinel would never reach unpermute.
+    """
+    del default_vllm_config
+    sm70_module, method = _make_sm70_method()
+    ops_module = importlib.import_module("vllm._custom_ops")
+    layer = _build_apply_layer_for_dispatcher_test()
+
+    # Seed a sentinel into the persistent output buffer.
+    layer._buf_output.fill_(99.0)
+
+    # Hook unpermute to capture whether it sees the seeded sentinel
+    # in `output` (proves no pre-zero ran), then write its own pattern.
+    seen_output_before_write: list[float] = []
+
+    def fake_unpermute(sorted_output, topk_weights, inv_idx, offsets, top_k, output):
+        del topk_weights, inv_idx, offsets, top_k
+        seen_output_before_write.append(float(output[0, 0].item()))
+        output.copy_(sorted_output[: output.size(0)])
+
+    monkeypatch.setattr(torch.ops._moe_C, "moe_unpermute", fake_unpermute)
+    _patch_dispatcher_stubs(monkeypatch, sm70_module, ops_module)
+    # _patch_dispatcher_stubs re-patched moe_unpermute; restore our hook.
+    monkeypatch.setattr(torch.ops._moe_C, "moe_unpermute", fake_unpermute)
+
+    x = torch.ones(2, 256, dtype=torch.float16)
+    topk_weights = torch.ones(2, 1, dtype=torch.float32)
+    topk_ids = torch.zeros(2, 1, dtype=torch.int32)
+
+    method.apply(layer, x, topk_weights, topk_ids, None)
+
+    # Sentinel reached unpermute → no pre-zero ran on the hot path.
+    assert seen_output_before_write == [99.0]
+
+
+def test_mxfp4_sm70_apply_h74a_returns_empty_when_total_slots_zero(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When num_tokens == 0 the dispatcher must short-circuit before
+    moe_permute, return an empty `[0, hidden]` tensor, and not invoke
+    the GEMM/permute fakes."""
+    del default_vllm_config
+    sm70_module, method = _make_sm70_method()
+    ops_module = importlib.import_module("vllm._custom_ops")
+    layer = _build_apply_layer_for_dispatcher_test()
+    permute_observations, gemm_calls, _ = _patch_dispatcher_stubs(
+        monkeypatch, sm70_module, ops_module
+    )
+
+    x = torch.empty(0, 256, dtype=torch.float16)
+    topk_weights = torch.empty(0, 1, dtype=torch.float32)
+    topk_ids = torch.empty(0, 1, dtype=torch.int32)
+
+    out = method.apply(layer, x, topk_weights, topk_ids, None)
+
+    assert tuple(out.shape) == (0, 256)
+    assert permute_observations == []
+    assert gemm_calls == []

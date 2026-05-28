@@ -338,12 +338,22 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
         total_slots = num_tokens * top_k
         buffers = self._get_buffers(layer, total_slots, num_tokens)
         output = buffers["output"]
-        output.zero_()
         if total_slots == 0:
+            # Nothing to dispatch; zero the output explicitly since
+            # moe_unpermute won't be invoked this step.
+            output.zero_()
             return output
 
-        topk_ids_i32 = buffers["topk_ids_i32"]
-        topk_ids_i32.copy_(topk_ids, non_blocking=True)
+        # H74-A: drop redundant `topk_ids_i32.copy_(topk_ids)` when the
+        # router already returns int32 (the SM70 path), and feed the
+        # result of select_experts directly to moe_permute.
+        if topk_ids.dtype == torch.int32 and topk_ids.is_contiguous():
+            topk_ids_i32 = topk_ids
+        else:
+            topk_ids_i32 = buffers["topk_ids_i32"]
+            topk_ids_i32.copy_(topk_ids, non_blocking=True)
+        # H74-A: skip output.zero_(); finalizeMoeRoutingKernel writes every
+        # original_row in the [:num_tokens] output slot.
         with _profile_or_null("moe.experts.permute", x):
             if _moe_permute_accepts_scale_and_m_indices():
                 torch.ops._moe_C.moe_permute(
