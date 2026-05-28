@@ -299,6 +299,19 @@ def classify_decode(row: KernelRow) -> str:
         return "compressor.kv_insert"
     if "_sm70_fp8_paged_mqa_logits_kernel" in name or "paged_mqa_logits" in name:
         return "indexer.mqa_logits"
+    # Cascade-GEMM (snapshot-based) decode logits: roll the Q-collapse
+    # kernel, K dequant snapshot kernel, cuBLAS gemv2T body, and the
+    # capture-safe epilogue mask into one ``indexer.cascade_gemm``
+    # bucket so OFF (paged) vs ON (cascade) is directly comparable.
+    if "_decode_q_emul_kernel" in name:
+        return "indexer.cascade_gemm.q_collapse"
+    if (
+        "_decode_indexer_k_to_fp32_cudagraph_kernel" in name
+        or "_decode_k_to_fp32_kernel" in name
+    ):
+        return "indexer.cascade_gemm.k_snapshot"
+    if "_cascade_gemm_epilogue" in name:
+        return "indexer.cascade_gemm.epilogue"
     if "_fused_indexer_q_rope_quant_kernel" in name:
         return "indexer.q_rope_quant"
     if "_save_partial_states_kernel" in name or "_save_partial_states" in name:
@@ -631,6 +644,9 @@ _CATEGORY_STAGE: dict[str, str] = {
     "indexer K gather": _STAGE_INDEXER,
     "indexer.kv_compress_insert": _STAGE_INDEXER,
     "indexer.mqa_logits": _STAGE_INDEXER,
+    "indexer.cascade_gemm.q_collapse": _STAGE_INDEXER,
+    "indexer.cascade_gemm.k_snapshot": _STAGE_INDEXER,
+    "indexer.cascade_gemm.epilogue": _STAGE_INDEXER,
     "indexer.q_rope_quant": _STAGE_INDEXER,
     "indexer.save_partial": _STAGE_INDEXER,
     "indexer.global_topk_indices": _STAGE_INDEXER,

@@ -128,6 +128,21 @@ def _fused_indexer_q_rope_quant_kernel(
     index_weights_head_scale,
     index_weights_out_ptr,
     index_weights_out_stride,
+    # Optional fused weights_proj GEMV inputs.  When FUSE_WEIGHTS_PROJ is
+    # True, the kernel computes
+    #     index_weights[tok, head] = dot(hidden_states[tok, :],
+    #                                    weights_proj_weight[head, :])
+    # on-the-fly per (tok, head) program, replacing the cuBLAS GEMV that
+    # would otherwise feed ``index_weights_ptr``.  The pointer args are
+    # keyword-only so the legacy call site can pass ``None`` / 0 sentinels
+    # without touching the kernel body when fused mode is off.
+    hidden_states_ptr,
+    hidden_states_stride0,
+    weights_proj_weight_ptr,
+    weights_proj_weight_stride0,
+    HIDDEN_SIZE: tl.constexpr = 0,
+    HIDDEN_BLOCK: tl.constexpr = 256,
+    FUSE_WEIGHTS_PROJ: tl.constexpr = False,
     USE_SM70_FP8_ENCODE: tl.constexpr = False,
 ):
     # Layout matches the unfused reference (DeepseekV4ScalingRotaryEmbedding
@@ -219,10 +234,28 @@ def _fused_indexer_q_rope_quant_kernel(
     # apply per-token Q scale inline. See the MXFP4 kernel below for the
     # contrasting convention (scales live with the Q values, weights are NOT
     # q-scaled).
-    index_weights = tl.load(
-        index_weights_ptr + tok_idx * index_weights_stride + head_idx
-    )
-    index_weights = index_weights.to(tl.float32)
+    if FUSE_WEIGHTS_PROJ:
+        # Compute index_weights[tok, head] = dot(hidden_states[tok, :],
+        #                                        weights_proj_weight[head, :])
+        # in-kernel, replacing the cuBLAS GEMV path (volta_sgemm_128x32_tn).
+        # ``weights_proj_weight_stride0`` is HIDDEN_SIZE (no quant_config →
+        # weight is stored as ``(out_features=n_head, in_features=hidden)``
+        # fp16 contiguous on the input dim).
+        hs_base = hidden_states_ptr + tok_idx * hidden_states_stride0
+        w_base = weights_proj_weight_ptr + head_idx * weights_proj_weight_stride0
+        acc = tl.zeros([], dtype=tl.float32)
+        for k_off in range(0, HIDDEN_SIZE, HIDDEN_BLOCK):
+            k_idx = k_off + tl.arange(0, HIDDEN_BLOCK)
+            k_mask = k_idx < HIDDEN_SIZE
+            x_chunk = tl.load(hs_base + k_idx, mask=k_mask, other=0.0).to(tl.float32)
+            w_chunk = tl.load(w_base + k_idx, mask=k_mask, other=0.0).to(tl.float32)
+            acc += tl.sum(x_chunk * w_chunk, axis=0)
+        index_weights = acc
+    else:
+        index_weights = tl.load(
+            index_weights_ptr + tok_idx * index_weights_stride + head_idx
+        )
+        index_weights = index_weights.to(tl.float32)
     index_weights *= index_q_scale
     index_weights *= index_weights_softmax_scale
     index_weights *= index_weights_head_scale
@@ -351,6 +384,16 @@ def fused_indexer_q_rope_quant(
     index_weights_softmax_scale: float,
     index_weights_head_scale: float,
     use_fp4: bool = False,
+    # Optional fused weights_proj GEMV (FP8 path only).  When both
+    # ``hidden_states`` and ``weights_proj_weight`` are provided, the
+    # kernel folds the GEMV ``hidden_states @ weights_proj_weight.T``
+    # into its own per-(tok, head) program, replacing the upstream
+    # ``self.weights_proj(...)`` cuBLAS call.  ``index_weights`` is then
+    # used only as an output buffer (its loaded value is ignored when the
+    # fused path is active).  If either is None the legacy path runs and
+    # ``index_weights`` is treated as the input weight tensor.
+    hidden_states: torch.Tensor | None = None,
+    weights_proj_weight: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     torch.Tensor,
@@ -445,6 +488,45 @@ def fused_indexer_q_rope_quant(
     # On SM70, pass fp8 output as uint8 view to avoid Triton fp8 pointer issues
     fp8_kernel_buf = index_q_fp8.view(torch.uint8) if use_sm70_fp8 else index_q_fp8
 
+    fuse_weights_proj = (
+        hidden_states is not None and weights_proj_weight is not None
+    )
+    if fuse_weights_proj:
+        assert hidden_states.dim() == 2, (
+            f"fused weights_proj path expects 2-D hidden_states, got "
+            f"{tuple(hidden_states.shape)}"
+        )
+        assert weights_proj_weight.dim() == 2, (
+            f"fused weights_proj path expects 2-D weight, got "
+            f"{tuple(weights_proj_weight.shape)}"
+        )
+        assert hidden_states.shape[-1] == weights_proj_weight.shape[-1], (
+            f"hidden_size mismatch: hs={hidden_states.shape[-1]} vs "
+            f"weight K={weights_proj_weight.shape[-1]}"
+        )
+        assert weights_proj_weight.shape[0] == num_index_q_heads, (
+            f"weights_proj rows must equal num_index_q_heads "
+            f"({num_index_q_heads}), got {weights_proj_weight.shape[0]}"
+        )
+        assert hidden_states.shape[0] == num_tokens, (
+            f"hidden_states tokens={hidden_states.shape[0]} vs "
+            f"positions tokens={num_tokens}"
+        )
+        # ``index_weights`` is the output buffer in the fused path; its
+        # contents are ignored.  ``index_weights_out`` shape (T, H) matches
+        # ``index_weights`` regardless.
+        hs_stride0 = hidden_states.stride(0)
+        wp_stride0 = weights_proj_weight.stride(0)
+        hidden_size = int(hidden_states.shape[-1])
+        # Pick a HIDDEN_BLOCK that evenly tiles a typical hidden size
+        # (4096 / 256 = 16 iters; 5120 / 256 = 20 iters with mask).
+        hidden_block = 256
+    else:
+        hs_stride0 = 0
+        wp_stride0 = 0
+        hidden_size = 0
+        hidden_block = 256
+
     _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
         positions,
         index_q,
@@ -463,6 +545,13 @@ def fused_indexer_q_rope_quant(
         index_weights_head_scale,
         index_weights_out,
         index_weights_out.stride(0),
+        hidden_states if fuse_weights_proj else index_weights,
+        hs_stride0,
+        weights_proj_weight if fuse_weights_proj else index_weights,
+        wp_stride0,
+        HIDDEN_SIZE=hidden_size,
+        HIDDEN_BLOCK=hidden_block,
+        FUSE_WEIGHTS_PROJ=fuse_weights_proj,
         USE_SM70_FP8_ENCODE=use_sm70_fp8,
         num_warps=1,  # TODO: Tune this
     )

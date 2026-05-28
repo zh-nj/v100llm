@@ -4460,8 +4460,28 @@ class DeepseekV4Indexer(nn.Module):
         q = q.view(-1, self.n_head, self.head_dim)
         with _profile_or_null("indexer.compressor", hidden_states):
             k = self.compressor(hidden_states, positions, rotary_emb)
-        with _profile_or_null("indexer.weights_proj", hidden_states):
-            weights, _ = self.weights_proj(hidden_states)
+        # Fuse the indexer ``weights_proj`` GEMV into ``fused_indexer_q_rope_quant``
+        # so the per-layer fp32 cuBLAS sgemm fallback (volta_sgemm_128x32_tn,
+        # ~22 µs/call × 21 indexer layers ≈ 0.47 ms/step at decode B=1) goes
+        # away.  ``weights`` here is a placeholder tensor that only carries
+        # the shape/stride contract of the ``self.weights_proj(hidden_states)``
+        # output; the kernel computes the GEMV in-line per (tok, head) program.
+        # FP4 (Blackwell) cache path keeps the legacy ``self.weights_proj``
+        # call because the MXFP4 quantize kernel does not currently fuse the
+        # GEMV.
+        if self.use_fp4_kv:
+            with _profile_or_null("indexer.weights_proj", hidden_states):
+                weights, _ = self.weights_proj(hidden_states)
+            fused_hidden = None
+            fused_wproj = None
+        else:
+            weights = torch.empty(
+                hidden_states.shape[:-1] + (self.n_head,),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            fused_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+            fused_wproj = self.weights_proj.weight
         with _profile_or_null("indexer.q_rope_quant", q):
             q_quant, weights = fused_indexer_q_rope_quant(
                 positions,
@@ -4471,6 +4491,8 @@ class DeepseekV4Indexer(nn.Module):
                 self.softmax_scale,
                 self.n_head**-0.5,
                 use_fp4=self.use_fp4_kv,
+                hidden_states=fused_hidden,
+                weights_proj_weight=fused_wproj,
             )
         with _profile_or_null("indexer.indexer_op", q_quant):
             return self.indexer_op(hidden_states, q_quant, k, weights)

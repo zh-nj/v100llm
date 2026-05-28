@@ -141,8 +141,29 @@ if TYPE_CHECKING:
     # cudagraph-compatibility work lands; see
     # .kiro/specs/deepseek-v4-decode-indexer-on-compressed-kv/measurements/h64_path_a_summary.md
     VLLM_SM70_INDEXER_CASCADE_GEMM: bool = False
+    # Cascade-GEMM only engages when the indexer's compressed
+    # ``max_model_len`` (= model.max_model_len // compress_ratio, with
+    # compress_ratio == 4 for V4-Flash) reaches this many rows.  Below
+    # the threshold the snapshot allocation is not amortized and the
+    # paged ``_sm70_fp8_paged_mqa_logits_kernel`` is faster.  Default
+    # 2048 rows ≈ 8k tokens of model context: from the 32k decode nsys
+    # the paged indexer at 4k context already costs only ~1 ms/step, so
+    # 8k is the regime where cascade starts paying off.  Lower the
+    # threshold to engage cascade earlier; raise it to keep short
+    # contexts on the original kernel.
     VLLM_SM70_INDEXER_CASCADE_GEMM_THRESHOLD: int = 2048
-    VLLM_SM70_INDEXER_CONTIGUOUS_KV_BYTES: int = 64 * 1024 * 1024
+    # Optional hard byte cap for the per-layer fp32 K snapshot pool used by
+    # the cascade-GEMM indexer.  ``0`` (default) means auto-size: the pool
+    # grows to exactly fit the indexer's compressed ``max_model_len`` rows
+    # at fp32 head_dim width, so an operator only has to set the model's
+    # ``--max-model-len``.  A positive value imposes a hard upper bound;
+    # contexts that would exceed the cap fall back to the paged kernel.
+    VLLM_SM70_INDEXER_CONTIGUOUS_KV_BYTES: int = 0
+    # When set, the cascade-GEMM dispatch logs (once per worker) why it
+    # engaged or skipped at runtime.  Useful for verifying that a fresh
+    # vLLM launch actually took the cascade path; off by default to keep
+    # production logs quiet.
+    VLLM_SM70_INDEXER_CASCADE_GEMM_DEBUG: bool = False
     VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE: bool = True
 
     VLLM_SM70_PREDEQUANT_PREFILL_DISABLE: bool = False
@@ -1075,7 +1096,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_SM70_INDEXER_CASCADE_GEMM_THRESHOLD", "2048")
     ),
     "VLLM_SM70_INDEXER_CONTIGUOUS_KV_BYTES": lambda: int(
-        os.getenv("VLLM_SM70_INDEXER_CONTIGUOUS_KV_BYTES", str(64 * 1024 * 1024))
+        os.getenv("VLLM_SM70_INDEXER_CONTIGUOUS_KV_BYTES", "0")
+    ),
+    "VLLM_SM70_INDEXER_CASCADE_GEMM_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_SM70_INDEXER_CASCADE_GEMM_DEBUG", "0"))
     ),
     "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", "1"))

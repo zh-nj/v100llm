@@ -39,7 +39,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-_DEFAULT_BYTES_PER_LAYER = 64 * 1024 * 1024  # 64 MiB / layer
+_DEFAULT_BYTES_PER_LAYER = 0  # 0 == auto-size from max_model_len; >0 == hard cap
 
 
 def _env_bytes(name: str, default: int) -> int:
@@ -59,6 +59,32 @@ def _env_bytes(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _resolve_capacity_rows(head_dim: int, requested_rows: int) -> int:
+    """Pick a snapshot row capacity given the requested context.
+
+    Behaviour:
+
+    - ``requested_rows <= 0``                    -> 0 (caller should fall back).
+    - ``VLLM_SM70_INDEXER_CONTIGUOUS_KV_BYTES`` unset or 0 -> auto-size to exactly
+      ``requested_rows`` so the snapshot always covers ``max_model_len``.
+    - explicit byte cap > 0 ->
+      ``capacity = bytes // (head_dim*4)``;
+      if ``requested_rows > capacity`` we return 0 (preserves the prior
+      reject-rather-than-truncate guarantee that callers rely on).
+    """
+    if requested_rows <= 0:
+        return 0
+    bytes_per_layer = _env_bytes(
+        "VLLM_SM70_INDEXER_CONTIGUOUS_KV_BYTES", _DEFAULT_BYTES_PER_LAYER
+    )
+    if bytes_per_layer <= 0:
+        return requested_rows
+    capacity_rows = bytes_per_layer // (head_dim * 4)
+    if requested_rows > capacity_rows:
+        return 0
+    return requested_rows
 
 
 @dataclass
@@ -207,13 +233,7 @@ def _decode_indexer_k_to_fp32_cudagraph_kernel(
 
 
 def _snapshot_capacity_rows(head_dim: int, requested_rows: int) -> int:
-    bytes_per_layer = _env_bytes(
-        "VLLM_SM70_INDEXER_CONTIGUOUS_KV_BYTES", _DEFAULT_BYTES_PER_LAYER
-    )
-    capacity_rows = bytes_per_layer // (head_dim * 4)
-    if requested_rows <= 0 or requested_rows > capacity_rows:
-        return 0
-    return requested_rows
+    return _resolve_capacity_rows(head_dim, requested_rows)
 
 
 def _graph_snapshot_key(
@@ -354,11 +374,8 @@ def ensure_decode_snapshot(
     if compressed_seq_len <= 0:
         return None
 
-    bytes_per_layer = _env_bytes(
-        "VLLM_SM70_INDEXER_CONTIGUOUS_KV_BYTES", _DEFAULT_BYTES_PER_LAYER
-    )
-    capacity_rows = bytes_per_layer // (head_dim * 4)
-    if compressed_seq_len > capacity_rows:
+    capacity_rows = _resolve_capacity_rows(head_dim, compressed_seq_len)
+    if capacity_rows <= 0:
         return None
 
     # Use kv_cache.data_ptr + dtype as the layer-instance identity. The

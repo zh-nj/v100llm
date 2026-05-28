@@ -888,6 +888,7 @@ def _prefill_topk_indices(
 
 
 _CASCADE_GEMM_DEFAULT_THRESHOLD = 2048
+_CASCADE_DEBUG_LOGGED: bool = False
 
 
 def _cascade_gemm_threshold() -> int:
@@ -915,19 +916,33 @@ def _maybe_cascade_gemm_decode_logits(
     back. Guards: env-on, SM70 only, FP8 cache only, batch=1, next_n=1,
     and static context capacity >= threshold. Snapshot lookup may also
     return None (capacity exceeded) -> caller falls back."""
+    global _CASCADE_DEBUG_LOGGED
+    debug = bool(envs.VLLM_SM70_INDEXER_CASCADE_GEMM_DEBUG)
     if not _cascade_gemm_enabled():
+        if debug and not _CASCADE_DEBUG_LOGGED:
+            logger.info("cascade-gemm: skipped (env disabled)")
+            _CASCADE_DEBUG_LOGGED = True
         return None
     if not _can_use_sm70_torch_indexer_fallback(use_fp4_cache=use_fp4_cache):
+        if debug and not _CASCADE_DEBUG_LOGGED:
+            logger.info("cascade-gemm: skipped (not SM70 / use_fp4_cache=%s)", use_fp4_cache)
+            _CASCADE_DEBUG_LOGGED = True
         return None
     if q_scale is not None:
+        if debug and not _CASCADE_DEBUG_LOGGED:
+            logger.info("cascade-gemm: skipped (q_scale present, fp4 path)")
+            _CASCADE_DEBUG_LOGGED = True
         return None
     if q_quant.dim() != 4 or q_quant.shape[0] != 1 or q_quant.shape[1] != 1:
+        if debug and not _CASCADE_DEBUG_LOGGED:
+            logger.info("cascade-gemm: skipped (q_quant.shape=%s)", tuple(q_quant.shape))
+            _CASCADE_DEBUG_LOGGED = True
         return None
     threshold = _cascade_gemm_threshold()
-    # `seq_lens` may live on the stream currently being captured. Avoid
-    # `.item()` and use the fixed static capacity as the host-side gate;
-    # the GEMM epilogue masks runtime positions >= seq_lens on device.
     if max_model_len < threshold:
+        if debug and not _CASCADE_DEBUG_LOGGED:
+            logger.info("cascade-gemm: skipped (max_model_len=%d < threshold=%d)", max_model_len, threshold)
+            _CASCADE_DEBUG_LOGGED = True
         return None
 
     head_dim = int(q_quant.shape[-1])
@@ -949,7 +964,22 @@ def _maybe_cascade_gemm_decode_logits(
         max_model_len=max_model_len,
     )
     if snapshot is None:
+        if debug and not _CASCADE_DEBUG_LOGGED:
+            logger.info(
+                "cascade-gemm: skipped (snapshot reservation returned None; "
+                "max_model_len=%d head_dim=%d)",
+                max_model_len, head_dim,
+            )
+            _CASCADE_DEBUG_LOGGED = True
         return None
+
+    if debug and not _CASCADE_DEBUG_LOGGED:
+        logger.info(
+            "cascade-gemm: ENGAGED (k_cache_prefix=%s max_model_len=%d "
+            "snapshot.shape=%s threshold=%d)",
+            k_cache_prefix, max_model_len, tuple(snapshot.shape), threshold,
+        )
+        _CASCADE_DEBUG_LOGGED = True
 
     # weights here is [num_padded_tokens, H] = [1, 64] for batch=1 next_n=1.
     return sm70_cascade_gemm_indexer_from_snapshot(
