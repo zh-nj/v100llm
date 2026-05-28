@@ -137,10 +137,12 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_PREFILL_GATHERED_K_PREFIX_CACHE_BYTES: int = (
         16 * 1024 * 1024
     )
-    # Path A (cascade-GEMM decode indexer). Default OFF until the
-    # cudagraph-compatibility work lands; see
-    # .kiro/specs/deepseek-v4-decode-indexer-on-compressed-kv/measurements/h64_path_a_summary.md
-    VLLM_SM70_INDEXER_CASCADE_GEMM: bool = False
+    # Path A (cascade-GEMM decode indexer). Default ON since H66/H67
+    # validation (see .kiro/specs/deepseek-v4-decode-indexer-on-compressed-kv/
+    # measurements/h66_path_a_ab_summary.md and h67_fused_weights_proj_summary.md):
+    # 32k decode TPOT 110.7→51.4 ms (2.0×); semantic + MTP gates pass.
+    # Set to 0 to fall back to the legacy paged ``_sm70_fp8_paged_mqa_logits_kernel``.
+    VLLM_SM70_INDEXER_CASCADE_GEMM: bool = True
     # Cascade-GEMM only engages when the indexer's compressed
     # ``max_model_len`` (= model.max_model_len // compress_ratio, with
     # compress_ratio == 4 for V4-Flash) reaches this many rows.  Below
@@ -1086,11 +1088,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
             str(16 * 1024 * 1024),
         )
     ),
-    # Path A (cascade-GEMM decode indexer). Off by default; turn on
-    # via VLLM_SM70_INDEXER_CASCADE_GEMM=1 once the cudagraph-compat
-    # follow-up lands.
+    # Path A (cascade-GEMM decode indexer). On by default since H66/H67;
+    # set VLLM_SM70_INDEXER_CASCADE_GEMM=0 to fall back to the legacy paged
+    # `_sm70_fp8_paged_mqa_logits_kernel`.
     "VLLM_SM70_INDEXER_CASCADE_GEMM": lambda: bool(
-        int(os.getenv("VLLM_SM70_INDEXER_CASCADE_GEMM", "0"))
+        int(os.getenv("VLLM_SM70_INDEXER_CASCADE_GEMM", "1"))
     ),
     "VLLM_SM70_INDEXER_CASCADE_GEMM_THRESHOLD": lambda: int(
         os.getenv("VLLM_SM70_INDEXER_CASCADE_GEMM_THRESHOLD", "2048")
