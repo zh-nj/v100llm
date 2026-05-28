@@ -139,6 +139,14 @@ _PREFILL_CUDAGRAPH_PERF_GATE = (
 # editing this file.
 _DEEPSEEK_V4_PROFILE_ENABLED = os.getenv("VLLM_DEEPSEEK_V4_PROFILE", "0") == "1"
 _DEEPSEEK_V4_PROFILE_NVTX = os.getenv("VLLM_DEEPSEEK_V4_PROFILE_NVTX", "0") == "1"
+if _DEEPSEEK_V4_PROFILE_NVTX:
+    # One-shot debug log so the operator can confirm NVTX scopes were
+    # actually compiled into the worker, rather than silently disabled
+    # by an env that didn't propagate across the process boundary.
+    logger.info(
+        "DeepSeek V4 NVTX scopes enabled "
+        "(VLLM_DEEPSEEK_V4_PROFILE_NVTX=1)."
+    )
 _DEEPSEEK_V4_PROFILE_LOG_EVERY = int(
     os.getenv("VLLM_DEEPSEEK_V4_PROFILE_LOG_EVERY", "200")
 )

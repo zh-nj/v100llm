@@ -2924,6 +2924,13 @@ def run_collect_decode(args: argparse.Namespace) -> None:
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
             "VLLM_DEEPSEEK_V4_INDEXER_TOPK": str(args.indexer_topk),
             "VLLM_MOE_EARLY_SHARED_EXPERTS_STREAM": "1",
+            # H71: enable NVTX scopes so the captured nsys report can
+            # attribute turbomind GEMM launches back to call-site labels
+            # (`wrapper.fused_wqa_wkv` / `compressor.gemm` / `impl.q_proj`
+            # / `indexer.compressor` / etc.).  Without this every shape
+            # collapses to "8x4 grid, 18 KiB smem" and you can't tell which
+            # module dispatched it.
+            "VLLM_DEEPSEEK_V4_PROFILE_NVTX": "1",
             "TORCHINDUCTOR_CACHE_DIR": args.torchinductor_cache_dir,
             "TRITON_CACHE_DIR": args.triton_cache_dir,
         }
@@ -2934,7 +2941,7 @@ def run_collect_decode(args: argparse.Namespace) -> None:
     before_pids = _process_ids()
 
     compilation_config = json.dumps(
-        {"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1]},
+        {"cudagraph_mode": args.cudagraph_mode, "cudagraph_capture_sizes": [1]},
         separators=(",", ":"),
     )
     service_cmd = [
@@ -2991,7 +2998,7 @@ def run_collect_decode(args: argparse.Namespace) -> None:
     profile_cmd = [
         nsys,
         "profile",
-        "--trace=cuda,osrt",
+        "--trace=cuda,nvtx,osrt",
         f"--cuda-graph-trace={args.cuda_graph_trace}",
         "--sample=none",
         "--cuda-memory-usage=false",
@@ -3465,6 +3472,20 @@ def build_collect_decode_parser(prog: str) -> argparse.ArgumentParser:
         help=(
             "Optional path; when set the file's UTF-8 contents replace "
             "--prompt. Useful for long-context decay measurements."
+        ),
+    )
+    parser.add_argument(
+        "--cudagraph-mode",
+        default="FULL_AND_PIECEWISE",
+        choices=["FULL_AND_PIECEWISE", "PIECEWISE", "NONE"],
+        help=(
+            "Compilation cudagraph_mode for the captured server.  Default "
+            "(FULL_AND_PIECEWISE) matches production decode latency.  Use "
+            "NONE for an attribution-friendly capture: NVTX scopes from "
+            "_profile_or_null become visible in the nsys timeline because "
+            "no graph capture stage strips them out, at the cost of ~10-30% "
+            "decode wall.  Use only for module->kernel attribution runs, "
+            "not for absolute-perf measurement."
         ),
     )
     return parser

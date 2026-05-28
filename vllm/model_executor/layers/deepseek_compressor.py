@@ -885,6 +885,24 @@ class DeepseekCompressor(nn.Module):
                 f"Unsupported head_dim for fused quant+cache: {self.head_dim}"
             )
 
+    def _profile_compressor(self, label: str, ref: torch.Tensor):
+        """Lazy NVTX wrapper that defers to ``deepseek_v4_attention``'s
+        profile context. Returns a ``nullcontext`` if the attention module
+        cannot be imported (avoids circular-import surprises during model
+        load) or if NVTX scoping is disabled. Mirrors the pattern in
+        ``sparse_attn_indexer._compressor_profile``.
+        """
+        try:
+            from contextlib import nullcontext
+
+            from vllm.model_executor.layers import deepseek_v4_attention
+
+            return deepseek_v4_attention._profile_or_null(label, ref)
+        except Exception:
+            from contextlib import nullcontext
+
+            return nullcontext()
+
     def forward(
         self,
         # [num_tokens, hidden_size]
@@ -896,7 +914,8 @@ class DeepseekCompressor(nn.Module):
         num_tokens, _ = x.shape
         # bf16 weights/activations but fp32 output for numerical stability of
         # the downstream compressor math.
-        kv_score = cublas_gemm_bf16_bf16_fp32(x, self.fused_wkv_wgate.weight)
+        with self._profile_compressor("compressor.gemm", x):
+            kv_score = cublas_gemm_bf16_bf16_fp32(x, self.fused_wkv_wgate.weight)
         # Each of shape [num_tokens, coff * self.head_dim]
         # input bf16, output are fp32
         kv, score = kv_score.split(
