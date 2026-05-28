@@ -1165,21 +1165,29 @@ def print_idle_gap_summary(
 # are stable across topk and seq-len under the current SM70 emitter.
 # ---------------------------------------------------------------------------
 
-# FlashMLA SM70 sparse decode kernel internal split (H17 measurement).
+# FlashMLA SM70 sparse decode kernel internal split.
 # Stages within one kernel call:
 #   s0  KV tile HBM->smem + fp8 dequant
-#   s1  QK MMA884 + sync (dominant due to V100 mma_m8n8k4 STEP serialisation)
+#   s1  QK MMA884 + sync (mma_m8n8k4 fragment loads + HMMA + score store)
 #   s2  online softmax + sync
 #   s3  output accumulator scale + sync
 #   s4  PV MMA + sync
 #   s5  epilogue (LSE + write per block)
+#
+# Source: H29 clean stage meter on the default build
+# (FLASH_MLA_SM70_SPARSE_DECODE_KV_ROW_PAD_HALF=4, no METER macros). See
+# `.kiro/specs/deepseek-v4-flash-flashmla-sparse-internals/measurements/
+# h29_decode_sparse_stage_breakdown_kvpad4_default.md`. The earlier H17
+# numbers (s1 = 66.9 %) were measured under the meter instrumentation
+# itself; clock64 + atomic per-tap inflated s1 wildly. The H29 clean
+# numbers are what the production kernel actually runs.
 _DECODE_SPARSE_STAGE_SHARES: tuple[tuple[str, float], ...] = (
-    ("s0 KV tile load + fp8 dequant", 0.184),
-    ("s1 QK MMA884", 0.669),
-    ("s2 online softmax", 0.011),
-    ("s3 acc rescale", 0.002),
-    ("s4 PV MMA", 0.133),
-    ("s5 epilogue + LSE write", 0.001),
+    ("s0 KV tile load + fp8 dequant", 0.391),
+    ("s1 QK MMA884", 0.278),
+    ("s2 online softmax", 0.022),
+    ("s3 acc rescale", 0.005),
+    ("s4 PV MMA", 0.303),
+    ("s5 epilogue + LSE write", 0.002),
 )
 
 # TileLang sparse prefill main kernel internal split. Estimated from the
@@ -1245,7 +1253,8 @@ def print_hot_kernel_internal_breakdown(
     """Decompose the two hot monolithic kernels into internal sub-stages.
 
     Source priors:
-      - flashmla_decode.sparse stage shares: H17 clock64 meter results.
+      - flashmla_decode.sparse stage shares: H29 clean stage meter on the
+        default build (KV_ROW_PAD_HALF=4, no METER instrumentation).
       - TileLang sparse prefill main shares: estimated from kernel
         structure + H56 register-spill measurements.
 
@@ -1306,8 +1315,8 @@ def print_hot_kernel_internal_breakdown(
     )
     print()
     print(
-        "- FlashMLA SM70 sparse_decode: H17 in-kernel clock64 meter "
-        "(s0/s1/s2/s4 stage IDs)"
+        "- FlashMLA SM70 sparse_decode: H29 clean stage meter (default "
+        "KV_ROW_PAD_HALF=4, no METER macros)"
     )
     print(
         "- TileLang sparse prefill main: kernel-source structural estimate, "
