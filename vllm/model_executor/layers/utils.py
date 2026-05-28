@@ -362,7 +362,24 @@ def cublas_gemm_bf16_bf16_fp32(
         "router_gemm_bf16_fp32 custom op is unavailable or inputs are not "
         "bfloat16; using torch fp32 matmul fallback."
     )
-    return x.float() @ weight.float().t()
+    # Cache the fp32 view of `weight` on the tensor itself so the
+    # per-step path doesn't re-upcast.  Weights are constant; on V100
+    # decode the compressor's fused_wkv_wgate has shape
+    # (N=1024..2048, K=4096) fp16 → ~8-16 MiB fp32 per layer, paid once
+    # at first call.  The H71 attribution showed this fallback is hit
+    # 21 times per step (compressor-bearing layers); without the cache
+    # each call recomputes the upcast, contributing ~3 ms/step extra
+    # `copy.float` traffic at 32k decode.
+    cached = getattr(weight, "_fp32_view", None)
+    if cached is None or cached.device != weight.device:
+        cached = weight.to(torch.float32)
+        try:
+            weight._fp32_view = cached  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            # Some Parameter subclasses disallow setattr; fall back to
+            # the per-call upcast in that branch.
+            pass
+    return x.float() @ cached.t()
 
 
 def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
