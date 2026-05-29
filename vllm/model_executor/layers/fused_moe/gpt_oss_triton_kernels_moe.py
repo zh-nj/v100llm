@@ -217,9 +217,13 @@ if has_triton_kernels():
         if not use_legacy_triton_kernels:
             _patch_make_bitmatrix_metadata()
     except (AttributeError, ImportError) as e:
-        logger.error(
-            "Failed to import Triton kernels. Please make sure your triton "
-            "version is compatible. Error: %s",
+        # Vendored triton_kernels in vLLM 0.19 lacks `SparseMatrix` /
+        # `make_ragged_tensor_metadata`, which only the gpt-oss MXFP4 and
+        # Quark MoE paths use. Other models (DeepSeek V4-Flash, etc.) hit
+        # this branch but never reach the affected code path. Demote to
+        # debug so it doesn't pollute the production server log.
+        logger.debug(
+            "Triton kernels (gpt-oss MXFP4) unavailable in this build: %s",
             e,
         )
 
