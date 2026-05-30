@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+from contextlib import contextmanager
 from importlib.util import find_spec
-from typing import cast
+from typing import Iterator, cast
 
 import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import (
     CUDAGraphMode,
     VllmConfig,
@@ -54,6 +56,37 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _mtp_draft_nvtx() -> Iterator[None]:
+    """Emit an `mtp.draft` NVTX range around the MTP/Eagle draft forward
+    so an nsys capture can separate the draft pass from the target verify
+    pass (which shares the same module-level NVTX scope names). Gated on
+    VLLM_DEEPSEEK_V4_PROFILE_NVTX and skipped under cudagraph capture /
+    torch.compile tracing (range_push is not Dynamo-traceable)."""
+    use_nvtx = bool(envs.VLLM_DEEPSEEK_V4_PROFILE_NVTX)
+    if use_nvtx:
+        try:
+            if torch.compiler.is_compiling():
+                use_nvtx = False
+        except AttributeError:
+            pass
+        if use_nvtx and torch.cuda.is_available():
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    use_nvtx = False
+            except Exception:
+                pass
+    if not use_nvtx:
+        yield
+        return
+    torch.cuda.nvtx.range_push("mtp.draft")
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
 
 
 def _get_image_token_index_for_draft(target_model: nn.Module, model_name: str) -> int:
@@ -495,7 +528,8 @@ class SpecDecodeBaseProposer:
                 num_input_tokens, common_attn_metadata.slot_mapping
             ),
         ):
-            ret_hidden_states = self.model(**model_kwargs)
+            with _mtp_draft_nvtx():
+                ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
