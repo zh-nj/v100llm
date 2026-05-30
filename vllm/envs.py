@@ -1043,16 +1043,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # index_topk (typically 2048 for V3.2 / 512 effective for V4 Flash) to
     # keep the topk_indices_buffer allocation valid.
     #
-    # H75 R3: default raised from "0" (use cfg) to "256" because every
-    # measured V4-Flash benchmark since the bottleneck-fixes spec lands
-    # in favour of 256 (TTFT -20%, semantic-canary byte-equivalent,
-    # +8 ms/step recovered at 12k+ context under MTP=1, see
-    # .kiro/specs/deepseek-v4-mtp-long-context-decode-regression/
-    # measurements/h74k_sweep_mtp1_topk256.json).
-    # Setting "0" explicitly still falls back to model config for back-compat;
-    # any positive value <= cfg topk overrides as before.
+    # H75 R3 (REVERTED): the default was briefly raised to 256 for
+    # throughput (TTFT -20%, byte-equivalent short canary). But the H75
+    # needle-topk sweep (measurements/h75_needle_topk_dependency.md)
+    # showed topk=256 halves long-range single-fact recall (needle
+    # retrieval ceiling ~2k vs ~5k raw tokens at topk=512). Default
+    # restored to 512 (the model config ceiling for V4-Flash) to keep
+    # long-context recall intact by default. Operators who want the
+    # throughput tradeoff can opt in with VLLM_DEEPSEEK_V4_INDEXER_TOPK=256.
+    # Setting "0" explicitly falls back to model config for back-compat.
     "VLLM_DEEPSEEK_V4_INDEXER_TOPK": lambda: int(
-        os.getenv("VLLM_DEEPSEEK_V4_INDEXER_TOPK", "256")
+        os.getenv("VLLM_DEEPSEEK_V4_INDEXER_TOPK", "512")
     ),
     "VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE", "4")
