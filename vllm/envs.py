@@ -166,6 +166,16 @@ if TYPE_CHECKING:
     # vLLM launch actually took the cascade path; off by default to keep
     # production logs quiet.
     VLLM_SM70_INDEXER_CASCADE_GEMM_DEBUG: bool = False
+    # When set, allow the SM70 cascade-GEMM decode indexer to serve
+    # next_n == 2 (MTP=1 speculative verify) decodes instead of falling
+    # back to the legacy paged ``_sm70_fp8_paged_mqa_logits_kernel``.
+    # Root cause H75: the paged kernel costs 16-45 ms/step under MTP=1
+    # at long context (vs ~0.5 ms/step for cascade-GEMM), producing the
+    # 8k→12k decode cliff. The cascade path is already next_n-generic;
+    # this flag only relaxes the caller-side gate. Default off until the
+    # A/B byte-equivalence, acceptance-rate, and MTP<MTP0 perf gates
+    # pass.
+    VLLM_V4_MTP_LONG_CTX_FIX: bool = False
     VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE: bool = True
 
     VLLM_SM70_PREDEQUANT_PREFILL_DISABLE: bool = False
@@ -1111,6 +1121,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_INDEXER_CASCADE_GEMM_DEBUG": lambda: bool(
         int(os.getenv("VLLM_SM70_INDEXER_CASCADE_GEMM_DEBUG", "0"))
+    ),
+    # H75 MTP long-context cliff fix: allow cascade-GEMM decode indexer
+    # to serve next_n == 2 (MTP=1). Default off; see envs hint above.
+    "VLLM_V4_MTP_LONG_CTX_FIX": lambda: bool(
+        int(os.getenv("VLLM_V4_MTP_LONG_CTX_FIX", "0"))
     ),
     "VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_DEEPSEEK_V4_DIRECT_DECODE", "1"))

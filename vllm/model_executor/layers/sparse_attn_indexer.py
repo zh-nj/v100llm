@@ -913,9 +913,11 @@ def _maybe_cascade_gemm_decode_logits(
     cache_block_size: int,
 ) -> torch.Tensor | None:
     """Return logits via the SM70 cascade-GEMM path, or None to fall
-    back. Guards: env-on, SM70 only, FP8 cache only, batch=1, next_n=1,
-    and static context capacity >= threshold. Snapshot lookup may also
-    return None (capacity exceeded) -> caller falls back."""
+    back. Guards: env-on, SM70 only, FP8 cache only, batch=1,
+    next_n <= max_next_n (1 by default; 2 when VLLM_V4_MTP_LONG_CTX_FIX
+    is set, for MTP=1 verify), and static context capacity >= threshold.
+    Snapshot lookup may also return None (capacity exceeded) -> caller
+    falls back."""
     global _CASCADE_DEBUG_LOGGED
     debug = bool(envs.VLLM_SM70_INDEXER_CASCADE_GEMM_DEBUG)
     if not _cascade_gemm_enabled():
@@ -933,9 +935,25 @@ def _maybe_cascade_gemm_decode_logits(
             logger.info("cascade-gemm: skipped (q_scale present, fp4 path)")
             _CASCADE_DEBUG_LOGGED = True
         return None
-    if q_quant.dim() != 4 or q_quant.shape[0] != 1 or q_quant.shape[1] != 1:
+    if q_quant.dim() != 4 or q_quant.shape[0] != 1:
         if debug and not _CASCADE_DEBUG_LOGGED:
             logger.info("cascade-gemm: skipped (q_quant.shape=%s)", tuple(q_quant.shape))
+            _CASCADE_DEBUG_LOGGED = True
+        return None
+    # H75: admit next_n == 2 (MTP=1 speculative verify) when the
+    # long-ctx fix flag is on. The cascade-GEMM wrapper + snapshot pool
+    # are already next_n-generic; only this caller-side gate forbade it,
+    # which forced MTP=1 onto the 16-45 ms/step paged kernel (the
+    # 8k->12k decode cliff). next_n > 2 stays on the paged path
+    # (deepgemm/FlashMLA shape constraint).
+    max_next_n = 2 if envs.VLLM_V4_MTP_LONG_CTX_FIX else 1
+    if q_quant.shape[1] > max_next_n:
+        if debug and not _CASCADE_DEBUG_LOGGED:
+            logger.info(
+                "cascade-gemm: skipped (next_n=%d > max_next_n=%d; "
+                "VLLM_V4_MTP_LONG_CTX_FIX=%s)",
+                q_quant.shape[1], max_next_n, envs.VLLM_V4_MTP_LONG_CTX_FIX,
+            )
             _CASCADE_DEBUG_LOGGED = True
         return None
     threshold = _cascade_gemm_threshold()
@@ -954,11 +972,22 @@ def _maybe_cascade_gemm_decode_logits(
     )
 
     block_table_row = block_table[0]
+    # H75: for next_n > 1 (MTP verify), seq_lens is [B, next_n] with one
+    # context length per verify position. The K snapshot is shared across
+    # next_n rows (same request KV), so it must cover the longest
+    # context = the last column (newest token). Use a view (no device
+    # reduction, capture-safe) for the snapshot gather; the per-row
+    # epilogue mask in the GEMM wrapper still reads the full 2D seq_lens
+    # so each output row gets its own -inf cut.
+    if seq_lens.dim() == 2 and seq_lens.shape[1] > 1:
+        snapshot_seq_lens = seq_lens[:, -1:]
+    else:
+        snapshot_seq_lens = seq_lens
     snapshot = ensure_decode_snapshot_cudagraph(
         k_cache_prefix=k_cache_prefix,
         kv_cache=kv_cache,
         block_table_row=block_table_row,
-        seq_lens=seq_lens,
+        seq_lens=snapshot_seq_lens,
         block_size=cache_block_size,
         head_dim=head_dim,
         max_model_len=max_model_len,
@@ -981,7 +1010,10 @@ def _maybe_cascade_gemm_decode_logits(
         )
         _CASCADE_DEBUG_LOGGED = True
 
-    # weights here is [num_padded_tokens, H] = [1, 64] for batch=1 next_n=1.
+    # weights is [num_padded_tokens, H]: [1, 64] for next_n=1,
+    # [2, 64] for next_n=2 (MTP verify). The wrapper handles both.
+    # context_lens passes the full 2D seq_lens so each next_n row is
+    # masked by its own context in the epilogue.
     return sm70_cascade_gemm_indexer_from_snapshot(
         q=q_quant,
         k_f32_cache=snapshot,

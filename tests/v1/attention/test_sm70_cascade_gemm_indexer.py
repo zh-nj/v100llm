@@ -165,3 +165,83 @@ def test_cascade_gemm_matches_paged_within_fp32_gemm_precision(
     # Trailing region must be -inf for both.
     assert torch.isinf(paged_out[:, context_len:]).all()
     assert torch.isinf(gemm_out[:, context_len:]).all()
+
+
+def _build_snapshot_next_n(
+    *,
+    seed: int,
+    context_lens: list[int],
+    num_heads: int = 64,
+    head_dim: int = 128,
+    weight_scale: float = 0.02,
+):
+    """Build a next_n batched cascade-GEMM-from-snapshot input set.
+
+    Returns a pre-decoded fp32 K snapshot plus per-row q / weights /
+    context_lens, so we can compare a batched next_n call against
+    per-row next_n=1 calls (row-independence / parity).
+    """
+    rng = np.random.default_rng(seed)
+    next_n = len(context_lens)
+    capacity = max(context_lens)
+    q_bytes = rng.integers(0, 120, (1, next_n, num_heads, head_dim), dtype=np.uint8)
+    q = torch.from_numpy(q_bytes).cuda()
+    k_f32 = torch.from_numpy(
+        rng.normal(0, 1.0, (capacity, head_dim)).astype(np.float32)
+    ).cuda()
+    weights = torch.from_numpy(
+        rng.normal(0, weight_scale, (next_n, num_heads)).astype(np.float32)
+    ).cuda()
+    context_lens_t = torch.tensor(
+        [context_lens], dtype=torch.int32, device="cuda"
+    )  # [1, next_n]
+    return {
+        "q": q,
+        "k_f32": k_f32,
+        "weights": weights,
+        "context_lens": context_lens_t,
+        "capacity": capacity,
+        "next_n": next_n,
+    }
+
+
+@pytest.mark.skipif(not _IS_SM70, reason="SM70 GPU required")
+@pytest.mark.parametrize("seed", [20260530, 3, 99])
+@pytest.mark.parametrize("context_lens", [[256, 256], [1024, 1021], [4096, 4093]])
+def test_cascade_gemm_next_n2_matches_per_row_next_n1(seed, context_lens):
+    """H75: MTP=1 verify uses next_n=2. Prove the batched next_n=2
+    cascade-GEMM produces per-row results bit-identical to running each
+    row alone as next_n=1. Transitively validates next_n=2 vs paged via
+    the existing next_n=1 vs paged sweep above."""
+    from vllm.model_executor.layers.sm70_cascade_gemm_indexer import (
+        sm70_cascade_gemm_indexer_from_snapshot,
+    )
+
+    inputs = _build_snapshot_next_n(seed=seed, context_lens=context_lens)
+    max_model_len = inputs["capacity"] + 16
+
+    batched = sm70_cascade_gemm_indexer_from_snapshot(
+        q=inputs["q"],
+        k_f32_cache=inputs["k_f32"],
+        weights=inputs["weights"],
+        context_lens=inputs["context_lens"],
+        max_model_len=max_model_len,
+    )
+    assert batched.shape == (inputs["next_n"], max_model_len)
+    assert torch.isfinite(batched[0, : context_lens[0]]).all()
+    assert torch.isfinite(batched[1, : context_lens[1]]).all()
+
+    for r in range(inputs["next_n"]):
+        single = sm70_cascade_gemm_indexer_from_snapshot(
+            q=inputs["q"][:, r : r + 1],
+            k_f32_cache=inputs["k_f32"],
+            weights=inputs["weights"][r : r + 1],
+            context_lens=inputs["context_lens"][:, r : r + 1],
+            max_model_len=max_model_len,
+        )
+        # Same kernel, same inputs -> must be bit-identical per row.
+        torch.testing.assert_close(
+            batched[r], single[0], rtol=0.0, atol=0.0
+        )
+        # Per-row context mask: -inf strictly past that row's context.
+        assert torch.isinf(batched[r, context_lens[r] :]).all()
