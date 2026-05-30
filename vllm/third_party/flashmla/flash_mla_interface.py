@@ -220,6 +220,75 @@ def flash_mla_sparse_fwd(
         - max_logits:  [s_q, h_q], float
         - lse: [s_q, h_q], float, log-sum-exp of attention scores
     """
+    try:
+        import vllm.envs as envs
+        use_tilelang = getattr(envs, "VLLM_SM70_USE_TILELANG_SPARSE_PREFILL",
+                               False)
+    except Exception:
+        use_tilelang = False
+
+    if use_tilelang:
+        try:
+            from vllm.v1.attention.ops.tilelang_sparse_prefill import (
+                flash_mla_sparse_fwd_tilelang,
+                is_tilelang_available,
+                is_tilelang_sparse_fwd_cached,
+            )
+            ok, reason = is_tilelang_available()
+            if ok:
+                block_I = getattr(envs, "VLLM_SM70_TILELANG_SPARSE_PREFILL_BI",
+                                  16)
+                num_stages = getattr(
+                    envs, "VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES", 1)
+                heads_per_block = getattr(
+                    envs,
+                    "VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK",
+                    64)
+                threads = getattr(
+                    envs, "VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS", 128)
+                pv_gemm_policy = getattr(
+                    envs,
+                    "VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY",
+                    "full_row")
+                assume_valid_indices = getattr(
+                    envs,
+                    "VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES",
+                    False)
+                # Check cache before calling: if not cached, fall through to
+                # FlashMLA rather than JIT-stall inside a CUDA graph capture.
+                if is_tilelang_sparse_fwd_cached(
+                        q, kv, indices, sm_scale, d_v,
+                        attn_sink=attn_sink, topk_length=topk_length,
+                        out=out, block_I=block_I, num_stages=num_stages,
+                        heads_per_block=heads_per_block, threads=threads,
+                        pv_gemm_policy=pv_gemm_policy,
+                        assume_valid_indices=assume_valid_indices):
+                    return flash_mla_sparse_fwd_tilelang(
+                        q, kv, indices, sm_scale, d_v,
+                        attn_sink=attn_sink, topk_length=topk_length, out=out,
+                        block_I=block_I, num_stages=num_stages,
+                        heads_per_block=heads_per_block, threads=threads,
+                        pv_gemm_policy=pv_gemm_policy,
+                        assume_valid_indices=assume_valid_indices)
+                import warnings
+                warnings.warn(
+                    "TileLang sparse prefill cache miss for shape "
+                    f"s_q={q.shape[0]} h_q={q.shape[1]} d_qk={q.shape[2]} "
+                    f"topk={indices.shape[-1]} dtype={q.dtype}; falling "
+                    "back to FlashMLA. Extend the TileLang sparse prefill "
+                    "prewarm set if this shape is expected.",
+                    stacklevel=2,
+                )
+            else:
+                import warnings
+                warnings.warn(
+                    "VLLM_SM70_USE_TILELANG_SPARSE_PREFILL=1 but tilelang "
+                    f"is not available ({reason}); falling back to FlashMLA.",
+                    stacklevel=2,
+                )
+        except ImportError:
+            pass
+
     results = flash_mla_cuda.sparse_prefill_fwd(
         q, kv, indices, sm_scale, d_v, attn_sink, topk_length, out
     )
