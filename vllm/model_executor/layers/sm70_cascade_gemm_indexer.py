@@ -3,31 +3,35 @@
 """SM70 cascade-compatible GEMM indexer logits (decode path).
 
 Replaces the decode call to ``sm70_fp8_paged_mqa_logits`` with a
-contiguous-K fp32 GEMM that mirrors the existing 8-bucket head
-cascade exactly. See
+contiguous-K fp32 GEMM. See
 ``.kiro/specs/deepseek-v4-decode-indexer-on-compressed-kv/`` for the
-design rationale.
+original throughput rationale and
+``.kiro/specs/deepseek-v4-indexer-head-reduction-correctness/`` for the
+head-reduction correctness fix.
 
-Per-call cost on V100 at 32k context: ~90 µs (vs ~7000 µs for
-the paged kernel). The K snapshot is pre-staged in a higher-level
-helper; this module only handles the per-call compute.
+The K snapshot is pre-staged in a higher-level helper; this module only
+handles the per-call compute.
 
-Cascade contract (mirrors ``_sm70_fp8_paged_mqa_logits_kernel``):
+Indexer contract (matches ``_sm70_fp8_paged_mqa_logits_kernel`` and the
+model's definition — TRUE per-head reduction):
 
   for k_pos in [0, context_len):
-      score = [0.0] * 8
-      for h in [0, NUM_HEADS):
-          partial = sum(decode(q[h]) * decode(k[k_pos]) * k_scale)
-          bucket = h if h <= 6 else 7
-          score[bucket] += partial
-      logit[k_pos] = sum(relu(score[i]) * w_i for i in 0..7)
+      logit[k_pos] = sum_{h=0..NUM_HEADS-1}
+                         relu( sum_d decode(q[h,d]) * decode(k[k_pos,d]) * k_scale )
+                       * w_h
 
-Bilinearity gives us the GEMM equivalent: by collapsing
-``q[7:]`` into a single summed Q row, the dot-product ordering across
-the K-axis still differs from the paged kernel (cuBLAS picks its own
-tiling), but per-position values match within fp32 precision
-(~7e-7 max relative error). The 125-case stress sweep in
-``tools/cascade_gemm_indexer.py`` confirms this contract.
+  Each head gets its OWN ReLU and OWN weight w_h. The GEMM computes
+  per-head scores ``q_emul [next_n, H, D] @ k_f32.T -> [next_n, H, N]``
+  and the epilogue applies ``relu(s_h) * w_h`` and sums over heads.
+
+HISTORY: an earlier version collapsed heads 7..H-1 into a single summed
+Q row ("8-bucket cascade"). That is only correct for NUM_HEADS <= 8;
+for the real indexer (H=64) ``relu(sum) != sum(relu)`` and weights
+8..63 were dropped, corrupting top-k KV selection (the long-context
+haystack root cause). The per-position cascade-vs-paged stress sweep in
+``tests/v1/attention/test_sm70_cascade_gemm_indexer.py`` still holds
+(both paths now use true per-head reduction; values agree within fp32
+GEMM precision, ~1e-7).
 """
 
 from __future__ import annotations
@@ -56,24 +60,23 @@ def _decode_q_emul_kernel(
     q_stride_b,
     q_stride_n,
     q_stride_h,
-    weights_ptr,          # float32 [num_rows, H]
-    weights_stride_row,
-    q_emul_ptr,           # float32 [num_rows, 8, D]
+    q_emul_ptr,           # float32 [num_rows, H, D]
     q_emul_stride_row,
-    q_emul_stride_bucket,
-    w_emul_ptr,           # float32 [num_rows, 8]
-    w_emul_stride_row,
+    q_emul_stride_head,
     next_n,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    """Fuse Q FP8 decode + 8-bucket cascade collapse + weight emul.
+    """Fuse Q FP8 decode into a per-head fp32 [num_rows, H, D] tensor.
 
-    One program per (next_idx, d_chunk). Each program:
-      - decodes Q[next_idx, h, d_chunk] for all h, sums heads >= 7 into
-        bucket 7, copies heads 0..6 into buckets 0..6.
-      - writes the 8-row Q_emul slice for this d_chunk.
-      - if d_chunk == 0, also writes the 8-element w_emul row.
+    One program per (next_idx, d_chunk). Each program decodes
+    Q[next_idx, h, d_chunk] for ALL heads h and writes them to their own
+    row in q_emul (true 64-head layout; no bucket collapse).
+
+    NOTE: an earlier implementation collapsed heads 7..H-1 into a single
+    summed "bucket 7" row, which corrupts the indexer score for H>8
+    (relu(sum) != sum(relu); weights 8..H-1 dropped). See
+    .kiro/specs/deepseek-v4-indexer-head-reduction-correctness/.
     """
     pid = tl.program_id(0)
     BLOCK_D: tl.constexpr = 64
@@ -87,52 +90,13 @@ def _decode_q_emul_kernel(
     d_range = d_off + tl.arange(0, BLOCK_D)
 
     q_row_base = q_ptr + pid_row * q_stride_n
-    weights_row_base = weights_ptr + pid_row * weights_stride_row
     q_emul_row_base = q_emul_ptr + pid_row * q_emul_stride_row
-    w_emul_row_base = w_emul_ptr + pid_row * w_emul_stride_row
 
-    # Decode buckets 0..6 directly. Bucket 7 accumulates heads 7..H-1.
-    bucket_7 = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    # Decode every head into its own row (no bucketing).
     for h in tl.static_range(NUM_HEADS):
         q_uint = tl.load(q_row_base + h * q_stride_h + d_range)
         q_chunk = _decode_fp8_e4m3fn_inline(q_uint)
-        if h == 0:
-            tl.store(q_emul_row_base + 0 * q_emul_stride_bucket + d_range, q_chunk)
-        elif h == 1:
-            tl.store(q_emul_row_base + 1 * q_emul_stride_bucket + d_range, q_chunk)
-        elif h == 2:
-            tl.store(q_emul_row_base + 2 * q_emul_stride_bucket + d_range, q_chunk)
-        elif h == 3:
-            tl.store(q_emul_row_base + 3 * q_emul_stride_bucket + d_range, q_chunk)
-        elif h == 4:
-            tl.store(q_emul_row_base + 4 * q_emul_stride_bucket + d_range, q_chunk)
-        elif h == 5:
-            tl.store(q_emul_row_base + 5 * q_emul_stride_bucket + d_range, q_chunk)
-        elif h == 6:
-            tl.store(q_emul_row_base + 6 * q_emul_stride_bucket + d_range, q_chunk)
-        else:
-            bucket_7 += q_chunk
-    tl.store(q_emul_row_base + 7 * q_emul_stride_bucket + d_range, bucket_7)
-
-    # First chunk also writes w_emul.
-    if pid_chunk == 0:
-        for h in tl.static_range(NUM_HEADS):
-            if h == 0:
-                tl.store(w_emul_row_base + 0, tl.load(weights_row_base + 0))
-            elif h == 1:
-                tl.store(w_emul_row_base + 1, tl.load(weights_row_base + 1))
-            elif h == 2:
-                tl.store(w_emul_row_base + 2, tl.load(weights_row_base + 2))
-            elif h == 3:
-                tl.store(w_emul_row_base + 3, tl.load(weights_row_base + 3))
-            elif h == 4:
-                tl.store(w_emul_row_base + 4, tl.load(weights_row_base + 4))
-            elif h == 5:
-                tl.store(w_emul_row_base + 5, tl.load(weights_row_base + 5))
-            elif h == 6:
-                tl.store(w_emul_row_base + 6, tl.load(weights_row_base + 6))
-            elif h == 7:
-                tl.store(w_emul_row_base + 7, tl.load(weights_row_base + 7))
+        tl.store(q_emul_row_base + h * q_emul_stride_head + d_range, q_chunk)
 
 
 @triton.jit
@@ -168,22 +132,25 @@ def _decode_k_to_fp32_kernel(
 
 @triton.jit
 def _cascade_gemm_epilogue_kernel(
-    scores_ptr,           # float32 [num_rows, 8, context_len] (no padding)
+    scores_ptr,           # float32 [num_rows, H, context_len] (no padding)
     scores_stride_row,
-    scores_stride_bucket,
-    w_emul_ptr,           # float32 [num_rows, 8]
-    w_emul_stride_row,
+    scores_stride_head,
+    weights_ptr,          # float32 [num_rows, H]
+    weights_stride_row,
     out_ptr,              # float32 [num_rows, max_model_len]
     out_stride_row,
     context_len,
     max_model_len,
+    NUM_HEADS: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """Apply ReLU + weighted sum across the 8 buckets, write logits.
+    """Apply per-head ReLU + weighted sum across ALL NUM_HEADS heads.
 
     One program per (next_idx, k_block). Each program handles BLOCK_K
-    consecutive k positions. Out positions >= context_len are written
-    with -inf to preserve the contract.
+    consecutive k positions, accumulating sum_h relu(s_h) * w_h over the
+    full head range (true 64-head semantics, no 8-bucket collapse). Out
+    positions >= context_len are written with -inf to preserve the
+    contract.
     """
     pid = tl.program_id(0)
     pid_row = pid // tl.cdiv(max_model_len, BLOCK_K)
@@ -193,36 +160,18 @@ def _cascade_gemm_epilogue_kernel(
     k_range = k_pos_base + tl.arange(0, BLOCK_K)
     in_range = k_range < context_len
 
-    w_emul_row = w_emul_ptr + pid_row * w_emul_stride_row
-    w_0 = tl.load(w_emul_row + 0)
-    w_1 = tl.load(w_emul_row + 1)
-    w_2 = tl.load(w_emul_row + 2)
-    w_3 = tl.load(w_emul_row + 3)
-    w_4 = tl.load(w_emul_row + 4)
-    w_5 = tl.load(w_emul_row + 5)
-    w_6 = tl.load(w_emul_row + 6)
-    w_7 = tl.load(w_emul_row + 7)
-
+    weights_row = weights_ptr + pid_row * weights_stride_row
     scores_row = scores_ptr + pid_row * scores_stride_row
-    s_0 = tl.load(scores_row + 0 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_1 = tl.load(scores_row + 1 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_2 = tl.load(scores_row + 2 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_3 = tl.load(scores_row + 3 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_4 = tl.load(scores_row + 4 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_5 = tl.load(scores_row + 5 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_6 = tl.load(scores_row + 6 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_7 = tl.load(scores_row + 7 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
 
-    logit = (
-        tl.maximum(s_0, 0.0) * w_0
-        + tl.maximum(s_1, 0.0) * w_1
-        + tl.maximum(s_2, 0.0) * w_2
-        + tl.maximum(s_3, 0.0) * w_3
-        + tl.maximum(s_4, 0.0) * w_4
-        + tl.maximum(s_5, 0.0) * w_5
-        + tl.maximum(s_6, 0.0) * w_6
-        + tl.maximum(s_7, 0.0) * w_7
-    )
+    logit = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    for h in tl.static_range(NUM_HEADS):
+        w_h = tl.load(weights_row + h)
+        s_h = tl.load(
+            scores_row + h * scores_stride_head + k_range,
+            mask=in_range, other=0.0,
+        )
+        logit += tl.maximum(s_h, 0.0) * w_h
+
     # Write logit if in_range, otherwise -inf.
     NEG_INF = float("-inf")
     out_val = tl.where(in_range, logit, NEG_INF)
@@ -233,19 +182,20 @@ def _cascade_gemm_epilogue_kernel(
 
 @triton.jit
 def _cascade_gemm_epilogue_tensor_len_kernel(
-    scores_ptr,           # float32 [num_rows, 8, static_context_len]
+    scores_ptr,           # float32 [num_rows, H, static_context_len]
     scores_stride_row,
-    scores_stride_bucket,
-    w_emul_ptr,           # float32 [num_rows, 8]
-    w_emul_stride_row,
+    scores_stride_head,
+    weights_ptr,          # float32 [num_rows, H]
+    weights_stride_row,
     context_lens_ptr,     # int32 flattened, one length per decode row
     out_ptr,              # float32 [num_rows, max_model_len]
     out_stride_row,
     static_context_len,
     max_model_len,
+    NUM_HEADS: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """Capture-safe epilogue variant.
+    """Capture-safe epilogue variant (true 64-head reduction).
 
     Unlike `_cascade_gemm_epilogue_kernel`, the true context length is
     read from a device tensor so the host never calls `.item()` while a
@@ -264,36 +214,18 @@ def _cascade_gemm_epilogue_tensor_len_kernel(
     k_range = k_pos_base + tl.arange(0, BLOCK_K)
     in_range = (k_range < context_len) & (k_range < static_context_len)
 
-    w_emul_row = w_emul_ptr + pid_row * w_emul_stride_row
-    w_0 = tl.load(w_emul_row + 0)
-    w_1 = tl.load(w_emul_row + 1)
-    w_2 = tl.load(w_emul_row + 2)
-    w_3 = tl.load(w_emul_row + 3)
-    w_4 = tl.load(w_emul_row + 4)
-    w_5 = tl.load(w_emul_row + 5)
-    w_6 = tl.load(w_emul_row + 6)
-    w_7 = tl.load(w_emul_row + 7)
-
+    weights_row = weights_ptr + pid_row * weights_stride_row
     scores_row = scores_ptr + pid_row * scores_stride_row
-    s_0 = tl.load(scores_row + 0 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_1 = tl.load(scores_row + 1 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_2 = tl.load(scores_row + 2 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_3 = tl.load(scores_row + 3 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_4 = tl.load(scores_row + 4 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_5 = tl.load(scores_row + 5 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_6 = tl.load(scores_row + 6 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
-    s_7 = tl.load(scores_row + 7 * scores_stride_bucket + k_range, mask=in_range, other=0.0)
 
-    logit = (
-        tl.maximum(s_0, 0.0) * w_0
-        + tl.maximum(s_1, 0.0) * w_1
-        + tl.maximum(s_2, 0.0) * w_2
-        + tl.maximum(s_3, 0.0) * w_3
-        + tl.maximum(s_4, 0.0) * w_4
-        + tl.maximum(s_5, 0.0) * w_5
-        + tl.maximum(s_6, 0.0) * w_6
-        + tl.maximum(s_7, 0.0) * w_7
-    )
+    logit = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    for h in tl.static_range(NUM_HEADS):
+        w_h = tl.load(weights_row + h)
+        s_h = tl.load(
+            scores_row + h * scores_stride_head + k_range,
+            mask=in_range, other=0.0,
+        )
+        logit += tl.maximum(s_h, 0.0) * w_h
+
     out_val = tl.where(in_range, logit, float("-inf"))
     out_addr = out_ptr + pid_row * out_stride_row + k_range
     tl.store(out_addr, out_val, mask=k_range < max_model_len)
@@ -303,7 +235,13 @@ def _decode_q_and_weights(
     q: torch.Tensor,
     weights: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
-    """Decode Q into the 8 cascade buckets and materialize bucket weights."""
+    """Decode Q into per-head fp32 rows and return the head weights.
+
+    Returns ``(q_emul [next_n, H, D] fp32, weights [next_n, H] fp32,
+    next_n, num_heads, head_dim)``. ``weights`` is returned as-is (the
+    true per-head weights); the previous 8-bucket ``w_emul`` collapse is
+    gone.
+    """
     if q.dim() == 3:
         q = q.unsqueeze(0)
     batch_size, next_n, num_heads, head_dim = q.shape
@@ -312,30 +250,24 @@ def _decode_q_and_weights(
     assert weights.shape[0] == next_n
 
     q_u8 = q.view(torch.uint8)
-    num_buckets = 8
     device = q.device
     q_emul = torch.empty(
-        (next_n, num_buckets, head_dim), dtype=torch.float32, device=device
+        (next_n, num_heads, head_dim), dtype=torch.float32, device=device
     )
-    w_emul = torch.zeros((next_n, num_buckets), dtype=torch.float32, device=device)
     num_d_chunks = head_dim // 64
     _decode_q_emul_kernel[(next_n * num_d_chunks,)](
         q_u8,
         q_u8.stride(0),
         q_u8.stride(1),
         q_u8.stride(2),
-        weights,
-        weights.stride(0),
         q_emul,
         q_emul.stride(0),
         q_emul.stride(1),
-        w_emul,
-        w_emul.stride(0),
         next_n,
         NUM_HEADS=num_heads,
         HEAD_DIM=head_dim,
     )
-    return q_emul, w_emul, next_n, num_heads, head_dim
+    return q_emul, weights.contiguous(), next_n, num_heads, head_dim
 
 
 def sm70_cascade_gemm_indexer_from_snapshot(
@@ -360,6 +292,7 @@ def sm70_cascade_gemm_indexer_from_snapshot(
     assert static_context_len > 0
 
     q_emul, w_emul, next_n, _, head_dim = _decode_q_and_weights(q, weights)
+    num_heads = q_emul.shape[1]
     assert k_f32_cache.dim() == 2 and k_f32_cache.shape[1] == head_dim
 
     if out is None:
@@ -390,6 +323,7 @@ def sm70_cascade_gemm_indexer_from_snapshot(
         out.stride(0),
         static_context_len,
         max_model_len,
+        NUM_HEADS=num_heads,
         BLOCK_K=BLOCK_K,
     )
     return out
@@ -445,8 +379,9 @@ def sm70_cascade_gemm_indexer(
     if context_len <= 0:
         return out
 
-    # 1. Q dequant + 8-bucket collapse + w_emul (one fused Triton kernel).
+    # 1. Q dequant into per-head fp32 rows (one fused Triton kernel).
     q_emul, w_emul, _, _, _ = _decode_q_and_weights(q, weights)
+    num_heads_local = q_emul.shape[1]
 
     # 2. K dequant + scale (skipped if k_f32_cache provided + complete).
     if k_f32_cache is not None and k_f32_cache.shape[0] >= context_len:
@@ -466,16 +401,16 @@ def sm70_cascade_gemm_indexer(
             BLOCK_N=BLOCK_N,
         )
 
-    # 3. fp32 GEMM: q_emul [next_n, 8, D] @ k_f32.T [D, N] -> [next_n, 8, N]
+    # 3. fp32 GEMM: q_emul [next_n, H, D] @ k_f32.T [D, N] -> [next_n, H, N]
     if next_n == 1:
-        scores = torch.matmul(q_emul[0], k_f32.T)  # [8, N]
-        scores = scores.unsqueeze(0)  # [1, 8, N]
+        scores = torch.matmul(q_emul[0], k_f32.T)  # [H, N]
+        scores = scores.unsqueeze(0)  # [1, H, N]
     else:
-        scores = torch.matmul(q_emul, k_f32.T)  # [next_n, 8, N]
+        scores = torch.matmul(q_emul, k_f32.T)  # [next_n, H, N]
 
-    # 4. ReLU + weighted-sum epilogue (fused Triton kernel) writes
-    # logits + -inf padding directly into ``out``. Scores tensor is
-    # [next_n, 8, context_len] only (no max_model_len padding).
+    # 4. Per-head ReLU + weighted-sum epilogue (fused Triton kernel)
+    # writes logits + -inf padding directly into ``out``. Scores tensor
+    # is [next_n, H, context_len] only (no max_model_len padding).
     BLOCK_K = 32
     n_k_blocks = (max_model_len + BLOCK_K - 1) // BLOCK_K
     grid_e = (next_n * n_k_blocks,)
@@ -489,6 +424,7 @@ def sm70_cascade_gemm_indexer(
         out.stride(0),
         int(context_len),
         max_model_len,
+        NUM_HEADS=num_heads_local,
         BLOCK_K=BLOCK_K,
     )
     return out

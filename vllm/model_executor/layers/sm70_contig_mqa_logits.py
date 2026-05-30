@@ -13,9 +13,16 @@ indexer decode kernel faster at long context by:
    (query, key)) down to ``(num_rows × ceil(N / BLOCK_K))``.
 
 The arithmetic mirrors ``_sm70_fp8_paged_mqa_logits_kernel`` exactly:
-the head cascade collapses heads ≥ 7 into ``score_7`` / ``w_7`` and
-applies ``ReLU + weight + sum`` per key. Bit-identical output is the
-correctness contract for path A.
+TRUE per-head reduction — each head gets its own ReLU and weight,
+``logit = sum_h relu(q_h . k) * w_h``. Bit-close output (fp32
+accumulation order) is the correctness contract for path A.
+
+NOTE: this kernel is an experimental Path-A prototype, superseded by
+the cascade-GEMM decode indexer and not wired into production routing.
+It is kept (and fixed to true 64-head reduction, matching
+.kiro/specs/deepseek-v4-indexer-head-reduction-correctness/) so it
+stays correct if revived. An earlier version collapsed heads >= 7 into
+a single bucket, which is wrong for NUM_HEADS > 8.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ from vllm.triton_utils import tl, triton
 
 from vllm.model_executor.layers.sm70_mqa_logits import (
     _decode_fp8_e4m3fn,
+    _next_power_of_2,
     _sm70_mqa_block_d,
 )
 
@@ -55,29 +63,22 @@ def _sm70_fp8_contig_mqa_logits_kernel(
     # constexprs
     HEAD_DIM: tl.constexpr,
     NUM_HEADS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     """One block per (next_idx, k_block_idx).
 
     Block work plan:
-      - block_dim=BLOCK_K threads (or whichever Triton chooses).
-      - Load weights[next_idx, :NUM_HEADS] once.
+      - Load weights[next_idx, :NUM_HEADS] once (padded to BLOCK_H).
       - For each k position in [k_pos_base, k_pos_base+BLOCK_K):
           - load 1 K row (HEAD_DIM bytes) and 1 K scale (4 bytes)
-          - for each h in [0, NUM_HEADS):
-              load Q[next_idx, h, :HEAD_DIM]  (this is the cost we
-              cannot avoid without true smem; keep as-is for now,
-              the gain comes from reducing program count)
-          - compute the per-head ReLU + weighted sum using the same
-            cascade as the paged kernel (heads >= 7 collapse into
-            score_7/w_7).
-          - store one fp32 logit at logits[next_idx, k_pos].
+          - load Q[next_idx, :, :HEAD_DIM] for all heads
+          - compute per-head ReLU + weighted sum (true 64-head),
+            store one fp32 logit at logits[next_idx, k_pos].
 
     The crucial difference vs paged: BLOCK_K consecutive keys are
-    handled by ONE program. Paged launches one program per (key);
-    contig launches one program per (BLOCK_K keys), so the launch
-    overhead amortizes BLOCK_K-fold.
+    handled by ONE program, amortizing launch overhead BLOCK_K-fold.
     """
     pid = tl.program_id(0)
     pid_row = pid // tl.cdiv(max_model_len, BLOCK_K)
@@ -93,15 +94,10 @@ def _sm70_fp8_contig_mqa_logits_kernel(
     q_row_base = q_ptr + pid_row * q_stride_n
     weights_row_base = weights_ptr + pid_row * weights_stride_row
 
-    # Pre-load weights for the 8-bucket cascade (bit-equivalent to paged).
-    w_0 = tl.load(weights_row_base + 0) if NUM_HEADS > 0 else 0.0
-    w_1 = tl.load(weights_row_base + 1) if NUM_HEADS > 1 else 0.0
-    w_2 = tl.load(weights_row_base + 2) if NUM_HEADS > 2 else 0.0
-    w_3 = tl.load(weights_row_base + 3) if NUM_HEADS > 3 else 0.0
-    w_4 = tl.load(weights_row_base + 4) if NUM_HEADS > 4 else 0.0
-    w_5 = tl.load(weights_row_base + 5) if NUM_HEADS > 5 else 0.0
-    w_6 = tl.load(weights_row_base + 6) if NUM_HEADS > 6 else 0.0
-    w_7 = tl.load(weights_row_base + 7) if NUM_HEADS > 7 else 0.0
+    # Per-head lanes padded to BLOCK_H; lanes >= NUM_HEADS masked / w=0.
+    h_range = tl.arange(0, BLOCK_H)
+    h_mask = h_range < NUM_HEADS
+    w = tl.load(weights_row_base + h_range, mask=h_mask, other=0.0)
 
     NUM_D_CHUNKS: tl.constexpr = HEAD_DIM // BLOCK_D
 
@@ -113,14 +109,7 @@ def _sm70_fp8_contig_mqa_logits_kernel(
             k_row_base = k_values_ptr + k_pos * k_values_stride_n
             k_scale = tl.load(k_scales_ptr + k_pos)
 
-            score_0 = tl.zeros((), dtype=tl.float32)
-            score_1 = tl.zeros((), dtype=tl.float32)
-            score_2 = tl.zeros((), dtype=tl.float32)
-            score_3 = tl.zeros((), dtype=tl.float32)
-            score_4 = tl.zeros((), dtype=tl.float32)
-            score_5 = tl.zeros((), dtype=tl.float32)
-            score_6 = tl.zeros((), dtype=tl.float32)
-            score_7 = tl.zeros((), dtype=tl.float32)
+            scores = tl.zeros((BLOCK_H,), dtype=tl.float32)
 
             for d_chunk in tl.static_range(NUM_D_CHUNKS):
                 d_off = d_chunk * BLOCK_D
@@ -129,47 +118,16 @@ def _sm70_fp8_contig_mqa_logits_kernel(
                 k_chunk_uint8 = tl.load(k_row_base + d_range)
                 k_chunk_f32 = _decode_fp8_e4m3fn(k_chunk_uint8) * k_scale
 
-                for h in tl.static_range(NUM_HEADS):
-                    q_chunk_uint8 = tl.load(
-                        q_row_base + h * q_stride_h + d_range
-                    )
-                    q_chunk_f32 = _decode_fp8_e4m3fn(q_chunk_uint8)
-                    partial = tl.sum(q_chunk_f32 * k_chunk_f32, axis=0)
-                    if h == 0:
-                        score_0 += partial
-                    elif h == 1:
-                        score_1 += partial
-                    elif h == 2:
-                        score_2 += partial
-                    elif h == 3:
-                        score_3 += partial
-                    elif h == 4:
-                        score_4 += partial
-                    elif h == 5:
-                        score_5 += partial
-                    elif h == 6:
-                        score_6 += partial
-                    else:
-                        score_7 += partial
+                q_addr = (
+                    q_row_base
+                    + h_range[:, None] * q_stride_h
+                    + d_range[None, :]
+                )
+                q_chunk_uint8 = tl.load(q_addr, mask=h_mask[:, None], other=0)
+                q_chunk_f32 = _decode_fp8_e4m3fn(q_chunk_uint8)
+                scores += tl.sum(q_chunk_f32 * k_chunk_f32[None, :], axis=1)
 
-            logit_val = tl.zeros((), dtype=tl.float32)
-            if NUM_HEADS > 0:
-                logit_val += tl.maximum(score_0, 0.0) * w_0
-            if NUM_HEADS > 1:
-                logit_val += tl.maximum(score_1, 0.0) * w_1
-            if NUM_HEADS > 2:
-                logit_val += tl.maximum(score_2, 0.0) * w_2
-            if NUM_HEADS > 3:
-                logit_val += tl.maximum(score_3, 0.0) * w_3
-            if NUM_HEADS > 4:
-                logit_val += tl.maximum(score_4, 0.0) * w_4
-            if NUM_HEADS > 5:
-                logit_val += tl.maximum(score_5, 0.0) * w_5
-            if NUM_HEADS > 6:
-                logit_val += tl.maximum(score_6, 0.0) * w_6
-            if NUM_HEADS > 7:
-                logit_val += tl.maximum(score_7, 0.0) * w_7
-
+            logit_val = tl.sum(tl.maximum(scores, 0.0) * w, axis=0)
             tl.store(logits_ptr + pid_row * logits_stride_row + k_pos, logit_val)
 
 
@@ -210,6 +168,7 @@ def sm70_fp8_contiguous_mqa_logits(
     q_u8 = q.view(torch.uint8)
 
     BLOCK_D = _sm70_mqa_block_d(head_dim)
+    BLOCK_H = _next_power_of_2(num_heads)
     if block_k is None:
         block_k = 8
     BLOCK_K = block_k
@@ -233,6 +192,7 @@ def sm70_fp8_contiguous_mqa_logits(
         max_model_len,
         HEAD_DIM=head_dim,
         NUM_HEADS=num_heads,
+        BLOCK_H=BLOCK_H,
         BLOCK_D=BLOCK_D,
         BLOCK_K=BLOCK_K,
     )

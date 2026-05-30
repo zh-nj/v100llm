@@ -92,6 +92,7 @@ def _sm70_fp8_paged_mqa_logits_kernel(
     max_model_len,
     HEAD_DIM: tl.constexpr,
     NUM_HEADS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -100,9 +101,20 @@ def _sm70_fp8_paged_mqa_logits_kernel(
     pid_row = batch_idx * next_n + next_idx
     pid_k   = k position index
 
-    Optimization: chunks the HEAD_DIM dot product into BLOCK_D-sized pieces,
-    processing all heads per chunk to keep K loaded and reduce register
-    pressure from full-vector Q reloads.
+    Implements the model's indexer score with TRUE per-head reduction:
+
+        logit(k) = sum_{h=0..NUM_HEADS-1} relu(q_h . k) * w_h
+
+    Each head gets its OWN ReLU and OWN weight. NUM_HEADS is padded to the
+    power-of-two BLOCK_H for the vector accumulator; padded lanes carry a
+    zero weight (and masked-zero q), so they contribute nothing.
+
+    NOTE: a previous SM70 implementation folded heads 7..NUM_HEADS-1 into a
+    single bucket (one ReLU, one weight w_7), which is only correct for
+    NUM_HEADS <= 8. For the real indexer (NUM_HEADS=64) that bucketing
+    corrupts the top-k KV selection (relu(sum) != sum(relu); w_8..w_63
+    dropped) and was the long-context haystack root cause. See
+    .kiro/specs/deepseek-v4-indexer-head-reduction-correctness/.
     """
     pid = tl.program_id(0)
     pid_row = pid // max_model_len
@@ -137,17 +149,14 @@ def _sm70_fp8_paged_mqa_logits_kernel(
         + pos_in_block * kv_cache_stride1
     )
 
-    # Preload weights for all heads before the main loop to avoid
-    # scattered loads in the epilogue and enable register reuse.
+    # Per-head lane indices (padded to BLOCK_H). Lanes >= NUM_HEADS are
+    # masked off and given zero weight.
+    h_range = tl.arange(0, BLOCK_H)
+    h_mask = h_range < NUM_HEADS
+
+    # Load all per-head weights at once; padded lanes -> 0.0.
     weights_base = weights_ptr + pid_row * weights_stride0
-    w_0 = tl.load(weights_base + 0) if NUM_HEADS > 0 else 0.0
-    w_1 = tl.load(weights_base + 1) if NUM_HEADS > 1 else 0.0
-    w_2 = tl.load(weights_base + 2) if NUM_HEADS > 2 else 0.0
-    w_3 = tl.load(weights_base + 3) if NUM_HEADS > 3 else 0.0
-    w_4 = tl.load(weights_base + 4) if NUM_HEADS > 4 else 0.0
-    w_5 = tl.load(weights_base + 5) if NUM_HEADS > 5 else 0.0
-    w_6 = tl.load(weights_base + 6) if NUM_HEADS > 6 else 0.0
-    w_7 = tl.load(weights_base + 7) if NUM_HEADS > 7 else 0.0
+    w = tl.load(weights_base + h_range, mask=h_mask, other=0.0)
 
     # Q base address for this batch/next position
     q_base_bn = (
@@ -156,21 +165,12 @@ def _sm70_fp8_paged_mqa_logits_kernel(
         + next_idx * q_stride_n
     )
 
-    # Chunk the HEAD_DIM dot product into BLOCK_D-sized pieces.
-    # For each chunk, load K once and process all heads, reducing
-    # peak register pressure from full-vector Q reloads.
+    # Chunk the HEAD_DIM dot product into BLOCK_D-sized pieces. Per chunk,
+    # load K once and all heads' Q, accumulate per-head partial dots.
     NUM_D_CHUNKS: tl.constexpr = HEAD_DIM // BLOCK_D
 
-    # Per-head score accumulators across D chunks.
-    # After all chunks, apply ReLU + weight + sum.
-    score_0 = tl.zeros((), dtype=tl.float32)
-    score_1 = tl.zeros((), dtype=tl.float32)
-    score_2 = tl.zeros((), dtype=tl.float32)
-    score_3 = tl.zeros((), dtype=tl.float32)
-    score_4 = tl.zeros((), dtype=tl.float32)
-    score_5 = tl.zeros((), dtype=tl.float32)
-    score_6 = tl.zeros((), dtype=tl.float32)
-    score_7 = tl.zeros((), dtype=tl.float32)
+    # Per-head score accumulator [BLOCK_H].
+    scores = tl.zeros((BLOCK_H,), dtype=tl.float32)
 
     # Scale is stored as float32 at byte offset HEAD_DIM
     k_scale_ptr_typed = (kv_base + HEAD_DIM).to(tl.pointer_type(tl.float32))
@@ -182,53 +182,23 @@ def _sm70_fp8_paged_mqa_logits_kernel(
 
         # Load and decode K chunk: fp8 e4m3fn → fp32, apply scale
         k_chunk_uint8 = tl.load(kv_base + d_range)
-        k_chunk_f32 = _decode_fp8_e4m3fn(k_chunk_uint8) * k_scale
+        k_chunk_f32 = _decode_fp8_e4m3fn(k_chunk_uint8) * k_scale  # [BLOCK_D]
 
-        # Process each head with this K chunk
-        for h in tl.static_range(NUM_HEADS):
-            # Load and decode Q chunk for head h
-            q_chunk_uint8 = tl.load(q_base_bn + h * q_stride_h + d_range)
-            q_chunk_f32 = _decode_fp8_e4m3fn(q_chunk_uint8)
+        # Load and decode Q for all heads: [BLOCK_H, BLOCK_D]. Padded
+        # head lanes are masked to 0 (they get zero weight anyway).
+        q_addr = (
+            q_base_bn
+            + h_range[:, None] * q_stride_h
+            + d_range[None, :]
+        )
+        q_chunk_uint8 = tl.load(q_addr, mask=h_mask[:, None], other=0)
+        q_chunk_f32 = _decode_fp8_e4m3fn(q_chunk_uint8)  # [BLOCK_H, BLOCK_D]
 
-            # Partial dot product for this chunk
-            partial = tl.sum(q_chunk_f32 * k_chunk_f32, axis=0)
+        # Per-head partial dot product over this D chunk -> [BLOCK_H]
+        scores += tl.sum(q_chunk_f32 * k_chunk_f32[None, :], axis=1)
 
-            # Accumulate into per-head score
-            if h == 0:
-                score_0 += partial
-            elif h == 1:
-                score_1 += partial
-            elif h == 2:
-                score_2 += partial
-            elif h == 3:
-                score_3 += partial
-            elif h == 4:
-                score_4 += partial
-            elif h == 5:
-                score_5 += partial
-            elif h == 6:
-                score_6 += partial
-            else:
-                score_7 += partial
-
-    # Apply ReLU + weighted accumulation using preloaded weights
-    logit_val = tl.zeros((), dtype=tl.float32)
-    if NUM_HEADS > 0:
-        logit_val += tl.maximum(score_0, 0.0) * w_0
-    if NUM_HEADS > 1:
-        logit_val += tl.maximum(score_1, 0.0) * w_1
-    if NUM_HEADS > 2:
-        logit_val += tl.maximum(score_2, 0.0) * w_2
-    if NUM_HEADS > 3:
-        logit_val += tl.maximum(score_3, 0.0) * w_3
-    if NUM_HEADS > 4:
-        logit_val += tl.maximum(score_4, 0.0) * w_4
-    if NUM_HEADS > 5:
-        logit_val += tl.maximum(score_5, 0.0) * w_5
-    if NUM_HEADS > 6:
-        logit_val += tl.maximum(score_6, 0.0) * w_6
-    if NUM_HEADS > 7:
-        logit_val += tl.maximum(score_7, 0.0) * w_7
+    # Per-head ReLU + weight, then sum over heads. Padded lanes have w=0.
+    logit_val = tl.sum(tl.maximum(scores, 0.0) * w, axis=0)
 
     # Store logit
     out_addr = logits_ptr + pid_row * logits_stride0 + k_pos
@@ -280,6 +250,8 @@ def sm70_fp8_paged_mqa_logits(
     # Use 64 for the real DeepSeek dimensions, but keep small synthetic
     # contract tests valid by choosing a divisor of head_dim.
     BLOCK_D = _sm70_mqa_block_d(head_dim)
+    # Pad head count to a power of two for the per-head vector accumulator.
+    BLOCK_H = _next_power_of_2(num_heads)
 
     grid = _sm70_paged_mqa_logits_grid(num_rows, max_model_len)
     _sm70_fp8_paged_mqa_logits_kernel[grid](
@@ -303,6 +275,7 @@ def sm70_fp8_paged_mqa_logits(
         max_model_len,
         HEAD_DIM=head_dim,
         NUM_HEADS=num_heads,
+        BLOCK_H=BLOCK_H,
         BLOCK_SIZE=block_size,
         BLOCK_D=BLOCK_D,
     )
@@ -536,12 +509,14 @@ def _sm70_fp8_mqa_logits_kernel(
     N,
     HEAD_DIM: tl.constexpr,
     NUM_HEADS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """One program per (m, n) pair.
 
-    Optimization: chunks the HEAD_DIM dot product into BLOCK_D-sized pieces,
-    processing all heads per chunk to reuse K and reduce register pressure.
+    Implements TRUE per-head reduction (each head its own ReLU + weight):
+        logit = sum_{h} relu(q_h . k) * w_h
+    NUM_HEADS is padded to power-of-two BLOCK_H; padded lanes get w=0.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -563,28 +538,16 @@ def _sm70_fp8_mqa_logits_kernel(
     # Q base for this query token
     q_base_m = q_ptr + pid_m * q_stride_m
 
-    # Preload weights for all heads before the main loop
+    # Per-head lanes padded to BLOCK_H; lanes >= NUM_HEADS masked / w=0.
+    h_range = tl.arange(0, BLOCK_H)
+    h_mask = h_range < NUM_HEADS
     weights_base = weights_ptr + pid_m * weights_stride_m
-    w_0 = tl.load(weights_base + 0) if NUM_HEADS > 0 else 0.0
-    w_1 = tl.load(weights_base + 1) if NUM_HEADS > 1 else 0.0
-    w_2 = tl.load(weights_base + 2) if NUM_HEADS > 2 else 0.0
-    w_3 = tl.load(weights_base + 3) if NUM_HEADS > 3 else 0.0
-    w_4 = tl.load(weights_base + 4) if NUM_HEADS > 4 else 0.0
-    w_5 = tl.load(weights_base + 5) if NUM_HEADS > 5 else 0.0
-    w_6 = tl.load(weights_base + 6) if NUM_HEADS > 6 else 0.0
-    w_7 = tl.load(weights_base + 7) if NUM_HEADS > 7 else 0.0
+    w = tl.load(weights_base + h_range, mask=h_mask, other=0.0)
 
     NUM_D_CHUNKS: tl.constexpr = HEAD_DIM // BLOCK_D
 
-    # Per-head score accumulators (partial dot products across D chunks)
-    score_0 = tl.zeros((), dtype=tl.float32)
-    score_1 = tl.zeros((), dtype=tl.float32)
-    score_2 = tl.zeros((), dtype=tl.float32)
-    score_3 = tl.zeros((), dtype=tl.float32)
-    score_4 = tl.zeros((), dtype=tl.float32)
-    score_5 = tl.zeros((), dtype=tl.float32)
-    score_6 = tl.zeros((), dtype=tl.float32)
-    score_7 = tl.zeros((), dtype=tl.float32)
+    # Per-head score accumulator [BLOCK_H].
+    scores = tl.zeros((BLOCK_H,), dtype=tl.float32)
 
     for d_chunk in tl.static_range(NUM_D_CHUNKS):
         d_off = d_chunk * BLOCK_D
@@ -592,50 +555,17 @@ def _sm70_fp8_mqa_logits_kernel(
 
         # Load and decode K chunk
         k_chunk_uint8 = tl.load(k_base + d_range)
-        k_chunk_f32 = _decode_fp8_e4m3fn(k_chunk_uint8) * k_scale
+        k_chunk_f32 = _decode_fp8_e4m3fn(k_chunk_uint8) * k_scale  # [BLOCK_D]
 
-        # Process each head with this K chunk
-        for h in tl.static_range(NUM_HEADS):
-            q_chunk_uint8 = tl.load(q_base_m + h * q_stride_h + d_range)
-            q_chunk_f32 = _decode_fp8_e4m3fn(q_chunk_uint8)
+        # Load + decode Q for all heads: [BLOCK_H, BLOCK_D]
+        q_addr = q_base_m + h_range[:, None] * q_stride_h + d_range[None, :]
+        q_chunk_uint8 = tl.load(q_addr, mask=h_mask[:, None], other=0)
+        q_chunk_f32 = _decode_fp8_e4m3fn(q_chunk_uint8)
 
-            partial = tl.sum(q_chunk_f32 * k_chunk_f32, axis=0)
+        scores += tl.sum(q_chunk_f32 * k_chunk_f32[None, :], axis=1)
 
-            if h == 0:
-                score_0 += partial
-            elif h == 1:
-                score_1 += partial
-            elif h == 2:
-                score_2 += partial
-            elif h == 3:
-                score_3 += partial
-            elif h == 4:
-                score_4 += partial
-            elif h == 5:
-                score_5 += partial
-            elif h == 6:
-                score_6 += partial
-            else:
-                score_7 += partial
-
-    # Apply ReLU + weighted accumulation using preloaded weights
-    logit_val = tl.zeros((), dtype=tl.float32)
-    if NUM_HEADS > 0:
-        logit_val += tl.maximum(score_0, 0.0) * w_0
-    if NUM_HEADS > 1:
-        logit_val += tl.maximum(score_1, 0.0) * w_1
-    if NUM_HEADS > 2:
-        logit_val += tl.maximum(score_2, 0.0) * w_2
-    if NUM_HEADS > 3:
-        logit_val += tl.maximum(score_3, 0.0) * w_3
-    if NUM_HEADS > 4:
-        logit_val += tl.maximum(score_4, 0.0) * w_4
-    if NUM_HEADS > 5:
-        logit_val += tl.maximum(score_5, 0.0) * w_5
-    if NUM_HEADS > 6:
-        logit_val += tl.maximum(score_6, 0.0) * w_6
-    if NUM_HEADS > 7:
-        logit_val += tl.maximum(score_7, 0.0) * w_7
+    # Per-head ReLU + weight, then sum over heads (padded lanes w=0).
+    logit_val = tl.sum(tl.maximum(scores, 0.0) * w, axis=0)
 
     tl.store(out_ptr + pid_m * out_stride_m + pid_n, logit_val)
 
@@ -662,6 +592,7 @@ def sm70_fp8_mqa_logits(
     # Use 64 for the real DeepSeek dimensions, but keep small synthetic
     # contract tests valid by choosing a divisor of head_dim.
     BLOCK_D = _sm70_mqa_block_d(head_dim)
+    BLOCK_H = _next_power_of_2(num_heads)
 
     grid = (M, N)
     _sm70_fp8_mqa_logits_kernel[grid](
@@ -681,6 +612,7 @@ def sm70_fp8_mqa_logits(
         N,
         HEAD_DIM=head_dim,
         NUM_HEADS=num_heads,
+        BLOCK_H=BLOCK_H,
         BLOCK_D=BLOCK_D,
     )
     return logits
