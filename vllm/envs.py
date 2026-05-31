@@ -202,7 +202,7 @@ if TYPE_CHECKING:
     VLLM_SM70_SPARSE_PREFILL_V2_JIT_ON_MISS: bool = False
     VLLM_SM70_SPARSE_PREFILL_V2_DEBUG_COMPARE: bool = False
     VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB: int = 64
-    VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK: bool = True
+    VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK: bool = False
     VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE: bool = False
     VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_TOPK: bool = False
     VLLM_SPARSE_INDEXER_PREFILL_FUSED_TILE_BLOCK_K: int = 128
@@ -1243,10 +1243,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_SPARSE_PREFILL_V2_SELECTED_KV_CHUNK_MB": lambda: 64,
     # Streaming prefill indexer top-k computes tile logits and merges
     # candidates without materializing full [rows, kv_tokens] fp32 logits.
-    # It is enabled by default but still gated to SM70 fp8_ds_mla long rows
-    # in sparse_attn_indexer._should_use_streaming_topk_prefill().
+    # Keep it opt-in so the default sparse-indexer top-k generation matches
+    # upstream vLLM's logits + top_k_per_row_prefill flow.
     "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK": lambda: bool(
-        int(os.getenv("VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK", "1"))
+        int(os.getenv("VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK", "0"))
     ),
     "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE": lambda: bool(
         int(os.getenv(

@@ -200,7 +200,7 @@ def test_sparse_indexer_gathered_k_prefix_cache_envs_default_on(
     )
 
 
-def test_sparse_indexer_streaming_topk_envs_default_on(
+def test_sparse_indexer_streaming_topk_envs_default_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv(
@@ -219,7 +219,10 @@ def test_sparse_indexer_streaming_topk_envs_default_on(
         raising=False,
     )
 
-    assert environment_variables["VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK"]()
+    assert (
+        environment_variables["VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK"]()
+        is False
+    )
     assert (
         environment_variables[
             "VLLM_SPARSE_INDEXER_PREFILL_STREAMING_TOPK_DEBUG_COMPARE"
