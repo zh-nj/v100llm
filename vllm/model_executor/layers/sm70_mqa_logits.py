@@ -142,12 +142,14 @@ def _sm70_fp8_paged_mqa_logits_kernel(
         block_tables_ptr + batch_idx * block_tables_stride0 + cache_block_idx
     )
 
-    # Base address for K vector in paged cache
-    kv_base = (
-        kv_cache_ptr
-        + physical_block.to(tl.int64) * kv_cache_stride0
-        + pos_in_block * kv_cache_stride1
-    )
+    # Base address for K vector in paged cache. SEGREGATED layout (matches
+    # the compressor writer + reference fp8_paged_mqa_logits_torch): within
+    # a block, all BLOCK_SIZE tokens' HEAD_DIM fp8 bytes come first, then
+    # all tokens' 4-byte fp32 scales. (The old interleaved read --
+    # token=[HEAD_DIM fp8|4 scale], scale at +HEAD_DIM -- mismatched the
+    # writer and dequantized garbage ~3e38; see indexer correctness spec.)
+    block_base = kv_cache_ptr + physical_block.to(tl.int64) * kv_cache_stride0
+    kv_base = block_base + pos_in_block.to(tl.int64) * HEAD_DIM
 
     # Per-head lane indices (padded to BLOCK_H). Lanes >= NUM_HEADS are
     # masked off and given zero weight.
@@ -172,8 +174,10 @@ def _sm70_fp8_paged_mqa_logits_kernel(
     # Per-head score accumulator [BLOCK_H].
     scores = tl.zeros((BLOCK_H,), dtype=tl.float32)
 
-    # Scale is stored as float32 at byte offset HEAD_DIM
-    k_scale_ptr_typed = (kv_base + HEAD_DIM).to(tl.pointer_type(tl.float32))
+    # Scale: segregated scale region, 4 bytes/token.
+    k_scale_ptr_typed = (
+        block_base + BLOCK_SIZE * HEAD_DIM + pos_in_block.to(tl.int64) * 4
+    ).to(tl.pointer_type(tl.float32))
     k_scale = tl.load(k_scale_ptr_typed)
 
     for d_chunk in tl.static_range(NUM_D_CHUNKS):

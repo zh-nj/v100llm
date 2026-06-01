@@ -134,12 +134,13 @@ def _decode_indexer_k_to_fp32_kernel(
     physical_block = tl.load(block_table_ptr + cache_block_idx, mask=n_mask, other=0)
 
     d_range = tl.arange(0, HEAD_DIM)
-    base_addr = (
-        kv_cache_ptr
-        + physical_block.to(tl.int64) * kv_cache_block_stride
-        + pos_in_block * kv_cache_token_stride
-    )
-    addr = base_addr[:, None] + d_range[None, :]
+    # SEGREGATED block layout (matches the compressor writer + reference
+    # fp8_paged_mqa_logits_torch): all BLOCK_SIZE tokens' HEAD_DIM fp8
+    # bytes first, then all tokens' 4-byte fp32 scales. (Interleaved read
+    # mismatched the writer -> garbage dequant ~3e38; see spec.)
+    block_base = physical_block.to(tl.int64) * kv_cache_block_stride
+    fp8_base = kv_cache_ptr + block_base + pos_in_block.to(tl.int64) * HEAD_DIM
+    addr = fp8_base[:, None] + d_range[None, :]
     k_uint = tl.load(addr, mask=n_mask[:, None], other=0)
 
     # FP8 e4m3fn decode (mirror of `_decode_fp8_e4m3fn`).
@@ -150,9 +151,13 @@ def _decode_indexer_k_to_fp32_kernel(
     fp32_bits = tl.where(low7 == 0, 0, fp32_bits)
     k_f32 = fp32_bits.to(tl.float32, bitcast=True)
 
-    # Load the per-row fp32 scale stored at byte offset HEAD_DIM in the
-    # paged token slot.
-    scale_addr = base_addr + HEAD_DIM
+    # Per-row fp32 scale in the segregated scale region.
+    scale_addr = (
+        kv_cache_ptr
+        + block_base
+        + block_size * HEAD_DIM
+        + pos_in_block.to(tl.int64) * 4
+    )
     scale_typed_addr = scale_addr.to(tl.pointer_type(tl.float32))
     k_scale = tl.load(scale_typed_addr, mask=n_mask, other=1.0)
     k_scaled = k_f32 * k_scale[:, None]
