@@ -330,23 +330,35 @@ def _maybe_dump_needle_rank(logits, seq_lens, topk_tokens, k_cache_prefix):
         ratio = int(os.environ.get("VLLM_HAYSTACK_COMPRESS_RATIO", "4"))
         raw_lo, raw_hi = (int(x) for x in spec.split(":"))
         comp_lo, comp_hi = raw_lo // ratio, max(raw_hi // ratio, raw_lo // ratio + 1)
-        # logits: [num_rows, max_model_len] fp32, -inf past context.
+        # logits: [num_rows, max_model_len] fp32. Use the REAL compressed
+        # context length from seq_lens (NOT a finite-count proxy, since
+        # corrupted NaN/inf entries would skew that).
         row = logits[0]
-        seq = row.isfinite().sum().item()
-        if comp_lo >= seq:
+        sl = seq_lens.reshape(-1)
+        ctx = int(sl[0].item()) if sl.numel() else int(row.isfinite().sum().item())
+        ctx = min(ctx, row.numel())
+        if comp_lo >= ctx:
             return
-        comp_hi = min(comp_hi, seq)
-        finite = row[:seq]
-        # rank of each position = how many positions strictly greater.
-        needle_scores = finite[comp_lo:comp_hi]
-        best = needle_scores.max().item()
-        rank = int((finite > best).sum().item()) + 1  # 1-based
+        comp_hi = min(comp_hi, ctx)
+        ctx_row = row[:ctx]          # exactly the scored compressed positions
+        n_nan = int(ctx_row.isnan().sum().item())
+        n_posinf = int((ctx_row == float("inf")).sum().item())
+        n_neginf = int((ctx_row == float("-inf")).sum().item())
+        fin = ctx_row[ctx_row.isfinite()]
+        row_absmax = fin.abs().max().item() if fin.numel() else float("nan")
+        # needle rank: count scored positions strictly greater (treat
+        # NaN as not-greater). Use nan_to_num so NaN doesn't poison topk.
+        needle = ctx_row[comp_lo:comp_hi]
+        best = needle.max().item()
+        rank = int((ctx_row > best).sum().item()) + 1
         in_topk = rank <= topk_tokens
         logger.info(
             "NEEDLE_RANK call=%d layer=%s ctx_comp=%d "
-            "needle_comp=[%d,%d) best_score=%.4f rank=%d topk=%d in_topk=%s",
-            _NEEDLE_RANK_STEP, k_cache_prefix, seq,
+            "needle_comp=[%d,%d) best=%.4g rank=%d topk=%d in_topk=%s "
+            "row_absmax=%.4g n_nan=%d n_posinf=%d n_neginf=%d",
+            _NEEDLE_RANK_STEP, k_cache_prefix, ctx,
             comp_lo, comp_hi, best, rank, topk_tokens, in_topk,
+            row_absmax, n_nan, n_posinf, n_neginf,
         )
         _NEEDLE_RANK_STEP += 1
     except Exception as e:  # never break inference for a debug probe

@@ -309,6 +309,33 @@ def sm70_cascade_gemm_indexer_from_snapshot(
     else:
         scores = torch.matmul(q_emul, k_f32.T)
 
+    import os as _os
+    if _os.environ.get("VLLM_HAYSTACK_NEEDLE_RAW") and not torch.cuda.is_current_stream_capturing():
+        try:
+            from vllm.logger import init_logger as _il
+            _lg = _il(__name__)
+            kf = k_f32
+            kfin = kf[kf.isfinite()]
+            qfin = q_emul[q_emul.isfinite()]
+            wfin = w_emul[w_emul.isfinite()]
+            # which K rows are huge (>1e6)?
+            row_absmax = kf.abs().amax(dim=1)
+            n_big_rows = int((row_absmax > 1e6).sum().item())
+            n_nan_rows = int(kf.isnan().any(dim=1).sum().item())
+            _lg.info(
+                "CASCADE_STATS ctx=%d k_absmax=%.3g k_nan=%d q_absmax=%.3g "
+                "q_nan=%d w_absmax=%.3g big_k_rows(>1e6)=%d nan_k_rows=%d",
+                static_context_len,
+                kfin.abs().max().item() if kfin.numel() else float("nan"),
+                int(kf.isnan().sum().item()),
+                qfin.abs().max().item() if qfin.numel() else float("nan"),
+                int(q_emul.isnan().sum().item()),
+                wfin.abs().max().item() if wfin.numel() else float("nan"),
+                n_big_rows, n_nan_rows,
+            )
+        except Exception:
+            pass
+
     context_lens_flat = context_lens.reshape(-1)
     BLOCK_K = 32
     n_k_blocks = (max_model_len + BLOCK_K - 1) // BLOCK_K
