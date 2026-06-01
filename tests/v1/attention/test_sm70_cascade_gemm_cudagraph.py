@@ -233,18 +233,20 @@ def test_cudagraph_snapshot_fill_and_gemm_replay_match_paged_reference():
     paged_cpu = torch.zeros(
         (num_blocks, block_size, 1, head_dim + 4), dtype=torch.uint8
     )
+    # SEGREGATED block layout (matches the compressor writer + kernels).
+    block_nbytes = block_size * (head_dim + 4)
+    paged_flat = paged_cpu.reshape(num_blocks, block_nbytes)
     values_cpu = contig_values.cpu()
     scales_cpu = contig_scales.cpu()
     for i in range(max_model_len):
         bi, ti = i // block_size, i % block_size
-        paged_cpu[bi, ti, 0, :head_dim] = values_cpu[i]
+        paged_flat[bi, ti * head_dim : ti * head_dim + head_dim] = values_cpu[i]
         scale_bytes = np.frombuffer(
             np.float32(float(scales_cpu[i])).tobytes(), dtype=np.uint8
         )
-        paged_cpu[bi, ti, 0, head_dim : head_dim + 4] = torch.from_numpy(
-            scale_bytes.copy()
-        )
-    paged = paged_cpu.cuda()
+        s_off = block_size * head_dim + ti * 4
+        paged_flat[bi, s_off : s_off + 4] = torch.from_numpy(scale_bytes.copy())
+    paged = paged_flat.reshape(num_blocks, block_size, 1, head_dim + 4).cuda()
     block_table = torch.arange(num_blocks, dtype=torch.int32, device="cuda").view(
         1, -1
     )

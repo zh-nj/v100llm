@@ -53,11 +53,15 @@ def _build_paged_kv(n_ctx: int, seed: int):
     scale = absmax / 448.0
     k_fp8 = (k_raw / scale).to(FP8)
     k_f32_true = k_fp8.to(torch.float32) * scale
-    flat = kv_u8.view(npages * BLOCK_SIZE, bytes_per_tok)
-    flat[:, :D] = k_fp8.view(torch.uint8)
-    flat[:, D : D + 4] = (
-        scale.squeeze(1).to(torch.float32).view(torch.uint8).view(-1, 4)
+    # SEGREGATED block layout (matches the compressor writer + kernels):
+    # per block, all BLOCK_SIZE tokens' D fp8 bytes first, then all scales.
+    kv_blocks = kv_u8.view(npages, BLOCK_SIZE * bytes_per_tok)
+    k_fp8_u8 = k_fp8.view(torch.uint8).view(npages, BLOCK_SIZE, D)
+    scale_u8 = scale.squeeze(1).to(torch.float32).view(torch.uint8).view(
+        npages, BLOCK_SIZE, 4
     )
+    kv_blocks[:, : BLOCK_SIZE * D] = k_fp8_u8.reshape(npages, BLOCK_SIZE * D)
+    kv_blocks[:, BLOCK_SIZE * D :] = scale_u8.reshape(npages, BLOCK_SIZE * 4)
     block_table = torch.arange(
         npages, dtype=torch.int32, device="cuda"
     ).view(1, npages)

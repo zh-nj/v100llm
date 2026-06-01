@@ -40,25 +40,29 @@ def _build_synthetic_inputs(
     q_bytes = rng.integers(low=0, high=120, size=(1, 1, num_heads, head_dim), dtype=np.uint8)
     q = torch.from_numpy(q_bytes).cuda()
 
-    # Paged layout: [num_blocks, block_size, head_dim+4] uint8.
+    # Paged layout: [num_blocks, block_size, head_dim+4] uint8, SEGREGATED
+    # within a block (all tokens' head_dim fp8 first, then all 4-byte
+    # scales) -- matches the compressor writer + the kernel reads.
     paged = torch.zeros((num_blocks, block_size, head_dim + 4), dtype=torch.uint8, device="cuda")
     contig_values = torch.zeros((context_len, head_dim), dtype=torch.uint8, device="cuda")
     contig_scales = torch.zeros((context_len,), dtype=torch.float32, device="cuda")
 
-    paged_cpu = paged.cpu()
+    block_nbytes = block_size * (head_dim + 4)
+    paged_flat_cpu = paged.cpu().reshape(num_blocks, block_nbytes)
     contig_values_cpu = contig_values.cpu()
     contig_scales_cpu = contig_scales.cpu()
     for i in range(context_len):
         bi, ti = i // block_size, i % block_size
         v = rng.integers(low=0, high=120, size=(head_dim,), dtype=np.uint8)
         s = float(rng.uniform(0.05, 1.5))
-        paged_cpu[bi, ti, :head_dim] = torch.from_numpy(v)
+        paged_flat_cpu[bi, ti * head_dim : ti * head_dim + head_dim] = torch.from_numpy(v)
         scale_bytes = np.frombuffer(np.float32(s).tobytes(), dtype=np.uint8)
-        paged_cpu[bi, ti, head_dim : head_dim + 4] = torch.from_numpy(scale_bytes.copy())
+        s_off = block_size * head_dim + ti * 4
+        paged_flat_cpu[bi, s_off : s_off + 4] = torch.from_numpy(scale_bytes.copy())
         contig_values_cpu[i] = torch.from_numpy(v)
         contig_scales_cpu[i] = float(s)
 
-    paged.copy_(paged_cpu)
+    paged.copy_(paged_flat_cpu.reshape(num_blocks, block_size, head_dim + 4))
     contig_values.copy_(contig_values_cpu)
     contig_scales.copy_(contig_scales_cpu)
 
