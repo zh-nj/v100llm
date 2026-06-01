@@ -297,6 +297,62 @@ def _profile_indexer_or_null(label: str, ref: torch.Tensor):
         return nullcontext()
 
 
+_NEEDLE_RANK_STEP = 0
+
+
+def _maybe_dump_needle_rank(logits, seq_lens, topk_tokens, k_cache_prefix):
+    """H75 debug: log the indexer rank of a target compressed-row range.
+
+    Env-gated. Set VLLM_HAYSTACK_NEEDLE_RAW="start:end" with the needle's
+    RAW token positions; this maps to compressed rows [start//ratio,
+    end//ratio] and logs their rank within each decode row's indexer
+    logits (descending). compress_ratio is inferred from max_model_len vs
+    the per-row context (both are in the compressed domain here, so the
+    raw->compressed division is done by the caller via the env value
+    already being raw; we divide by VLLM_HAYSTACK_COMPRESS_RATIO, default 4).
+
+    Output: one line per decode step per layer, rank of the best needle
+    compressed row + whether it is inside top-k.
+    """
+    spec = os.environ.get("VLLM_HAYSTACK_NEEDLE_RAW")
+    if not spec:
+        return
+    # Capture-safe: the dump does host-side .item()/.sum() syncs which
+    # would invalidate an in-progress CUDA graph capture. Skip while
+    # capturing; the eager warmup + replay-free steps still fire it.
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        pass
+    global _NEEDLE_RANK_STEP
+    try:
+        ratio = int(os.environ.get("VLLM_HAYSTACK_COMPRESS_RATIO", "4"))
+        raw_lo, raw_hi = (int(x) for x in spec.split(":"))
+        comp_lo, comp_hi = raw_lo // ratio, max(raw_hi // ratio, raw_lo // ratio + 1)
+        # logits: [num_rows, max_model_len] fp32, -inf past context.
+        row = logits[0]
+        seq = row.isfinite().sum().item()
+        if comp_lo >= seq:
+            return
+        comp_hi = min(comp_hi, seq)
+        finite = row[:seq]
+        # rank of each position = how many positions strictly greater.
+        needle_scores = finite[comp_lo:comp_hi]
+        best = needle_scores.max().item()
+        rank = int((finite > best).sum().item()) + 1  # 1-based
+        in_topk = rank <= topk_tokens
+        logger.info(
+            "NEEDLE_RANK call=%d layer=%s ctx_comp=%d "
+            "needle_comp=[%d,%d) best_score=%.4f rank=%d topk=%d in_topk=%s",
+            _NEEDLE_RANK_STEP, k_cache_prefix, seq,
+            comp_lo, comp_hi, best, rank, topk_tokens, in_topk,
+        )
+        _NEEDLE_RANK_STEP += 1
+    except Exception as e:  # never break inference for a debug probe
+        logger.warning("needle-rank dump failed: %s", e)
+
+
 def _gather_workspace_shapes(
     total_seq_lens: int,
     head_dim: int,
@@ -1355,6 +1411,8 @@ def sparse_attn_indexer(
                 )
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+
+        _maybe_dump_needle_rank(logits, seq_lens, topk_tokens, k_cache_prefix)
 
         with _profile_indexer_or_null("indexer.decode.topk", logits):
             if current_platform.is_cuda() and topk_tokens in (512, 1024, 2048):
