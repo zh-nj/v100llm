@@ -13,12 +13,22 @@ import os
 import torch
 from torch.nn import Parameter
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
+)
+from vllm.model_executor.layers.fused_moe.sm70_fused_moe_experts import (
+    SM70FusedMoEExperts,
+    SM70QuantParams,
+)
+from vllm.model_executor.layers.fused_moe.sm70_fused_moe_gate import (
+    SM70FusedConfig,
+    SM70FusionLevel,
+    sm70_fused_support,
 )
 from vllm.model_executor.layers.linear import set_weight_attrs
 
@@ -53,6 +63,58 @@ def _round_up(value: int, align: int) -> int:
     if align <= 0:
         return value
     return ((value + align - 1) // align) * align
+
+
+# --- Experimental SM70 (V100) fused MoE path constants (R6.2 / R6.3) ---------
+# These mirror the compile-time tiling of the hand-written fused CUDA kernel
+# (``csrc/quantization/awq/awq_sm70_fused_moe.cu``) so the Python fallback gate
+# rejects shapes the fused kernel cannot run, instead of letting the kernel
+# ``TORCH_CHECK`` raise. They only matter for the fused-kernel fusion levels
+# (L2/L3); the per-operator levels (L0/L1) are not subject to them.
+_SM70_FUSED_KERNEL_M_TILE = 16  # kM_TILE  -> m_block % 16 == 0
+_SM70_FUSED_KERNEL_I_TILE = 64  # kI_TILE1 -> inter_I % 64 == 0
+_SM70_FUSED_KERNEL_K_TILE = 64  # kK_TILE  -> hidden_K % 64 == 0
+# max(linear1, linear2) SMEM scratch in halves (FusedSmemPlan::kScratch for the
+# default kM_TILE=16/kI_TILE1=64/kCTA_K=32/kK_TILE=64/kCTA_I=32/kPad=8 config).
+_SM70_FUSED_KERNEL_SMEM_HALVES_SCRATCH = 13568
+_SM70_FUSED_KERNEL_SMEM_BUDGET_BYTES = 96 * 1024  # V100 per-block dynamic SMEM
+
+
+def _sm70_fused_kernel_shape_supported(
+    hidden_K: int, inter_I: int, m_block: int
+) -> tuple[bool, str | None]:
+    """Mirror the fused CUDA kernel tile / SMEM constraints (R6.2).
+
+    Returns ``(True, None)`` when the (already gate-approved) shape can run on
+    the fused mega-kernel, otherwise ``(False, reason)`` so the caller logs the
+    reason once and falls back to the existing path. Only applies to the
+    fused-kernel levels (L2/L3); the per-operator levels (L0/L1) are unaffected.
+    """
+    if m_block % _SM70_FUSED_KERNEL_M_TILE != 0:
+        return False, (
+            f"m_block ({m_block}) not a multiple of the kernel M_TILE "
+            f"({_SM70_FUSED_KERNEL_M_TILE})"
+        )
+    if inter_I % _SM70_FUSED_KERNEL_I_TILE != 0:
+        return False, (
+            f"inter_I ({inter_I}) not a multiple of the kernel I tile "
+            f"({_SM70_FUSED_KERNEL_I_TILE})"
+        )
+    if hidden_K % _SM70_FUSED_KERNEL_K_TILE != 0:
+        return False, (
+            f"hidden_K ({hidden_K}) not a multiple of the kernel K tile "
+            f"({_SM70_FUSED_KERNEL_K_TILE})"
+        )
+    total_halves = (
+        _SM70_FUSED_KERNEL_M_TILE * inter_I + _SM70_FUSED_KERNEL_SMEM_HALVES_SCRATCH
+    )
+    total_bytes = total_halves * 2  # sizeof(half)
+    if total_bytes > _SM70_FUSED_KERNEL_SMEM_BUDGET_BYTES:
+        return False, (
+            f"dynamic SMEM {total_bytes} bytes exceeds the V100 96KB per-block "
+            f"budget for inter_I={inter_I}"
+        )
+    return True, None
 
 
 def _pad_last_dim(t: torch.Tensor, pad_elems: int) -> torch.Tensor:
@@ -377,6 +439,16 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         )
         layer.w13_tm_weight = Parameter(w13_tm_weight, requires_grad=False)
         layer.w13_tm_scales = Parameter(w13_tm_scales, requires_grad=False)
+
+        # --- Experimental SM70 fused MoE weight pack (R2.x / R6.3) -----------
+        # Default-off: only build the fused-path weight pack when the
+        # ``VLLM_SM70_FUSED_MOE`` switch is enabled. When off, nothing extra is
+        # prepared and behavior is byte-identical to the current release
+        # (R6.3). The fused path consumes the *original* AWQ int4
+        # weights/scales/zeros (re-packed into the kernel's natural layout), so
+        # the pack MUST be built here, before those tensors are deleted below.
+        self._maybe_build_sm70_fused_quant_params(layer)
+
         del layer.w13_qweight, layer.w13_scales, layer.w13_qzeros
 
         w2_tm_weight, w2_tm_scales, w2_meta = _prepare_tm_weights(
@@ -496,6 +568,60 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer._buf_single_inv_permuted_idx = torch.arange(
             top_k, dtype=torch.int32, device=device).view(1, top_k)
 
+    def _maybe_build_sm70_fused_quant_params(
+        self, layer: torch.nn.Module
+    ) -> None:
+        """Build & stash the SM70 fused-path AWQ weight pack (gated, R6.3).
+
+        Only runs when ``VLLM_SM70_FUSED_MOE`` is enabled, so the default
+        release path allocates nothing new and is unchanged. Must be called
+        while the original AWQ int4 weights (``w13_qweight``/``w13_scales``/
+        ``w13_qzeros`` and the ``w2_*`` triad) are still present on ``layer``
+        (i.e. before they are deleted) because :meth:`SM70QuantParams.from_awq_weights`
+        re-packs exactly those tensors. On any failure it stashes ``None`` so
+        :meth:`apply` falls back to the existing batched / sorted-loop path.
+        """
+        layer.sm70_fused_quant_params = None
+        layer.sm70_fused_experts = None
+        if not envs.VLLM_SM70_FUSED_MOE:
+            return
+        try:
+            quant = SM70QuantParams.from_awq_weights(
+                w13_qweight=layer.w13_qweight,
+                w13_scales=layer.w13_scales,
+                w13_qzeros=layer.w13_qzeros,
+                w2_qweight=layer.w2_qweight,
+                w2_scales=layer.w2_scales,
+                w2_qzeros=layer.w2_qzeros,
+                group_size=self.group_size,
+                hidden_logical_size=layer.sm70_hidden_logical_size,
+                interleave_gated_silu=True,
+                # CUDA path: build the FusedStridedPtr arrays the kernel reads.
+                build_strided_ptrs=True,
+            )
+        except Exception as e:  # pragma: no cover - depends on built ext / GPU
+            logger.warning_once(
+                "SM70 fused MoE: weight pack build failed (%s); the fused path "
+                "is disabled for layer=%s and the existing path is used.",
+                e,
+                getattr(layer, "layer_name", "<unknown>"),
+            )
+            return
+        cfg = SM70FusedConfig.from_env()
+        layer.sm70_fused_quant_params = quant
+        layer.sm70_fused_config = cfg
+        layer.sm70_fused_experts = SM70FusedMoEExperts(config=cfg)
+        logger.info_once(
+            "SM70 fused MoE: weight pack ready (experts=%d, K=%d, I=%d, "
+            "group_size=%d, fusion_level=%s) for layer=%s",
+            quant.num_experts,
+            quant.hidden_K,
+            quant.inter_I,
+            quant.group_size,
+            cfg.fusion_level.value,
+            getattr(layer, "layer_name", "<unknown>"),
+        )
+
     def _get_buffers(self, layer: torch.nn.Module, total_slots: int,
                      num_tokens: int):
         """Use persistent decode buffers when they fit, otherwise temp ones."""
@@ -566,6 +692,127 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                                       device=device),
         }
 
+    def _maybe_apply_sm70_fused(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Try the experimental SM70 fused MoE path; ``None`` => fall back.
+
+        Implements the design's *layered* fallback (§Error Handling) for the
+        fused branch wired into :meth:`apply` (R2.4 / R6.1 / R6.2):
+
+        1. **Gate (decision before execution).** Call the pure-function gate
+           :func:`sm70_fused_support` with the real device capability and the
+           ``VLLM_SM70_FUSED_MOE`` switch. On rejection, log ``reason`` once and
+           return ``None`` (fall back). This also covers non-V100 hardware
+           (R6.1) — the pack is only ever built on the gated path, but the gate
+           re-checks the live capability defensively.
+        2. **Shape pre-check.** Mirror the fused CUDA kernel tile / SMEM
+           constraints (``inter_I % 64``, ``hidden_K % 64``, ``m_block % 16``,
+           96KB SMEM budget). Unsupported shapes log once and fall back instead
+           of letting the kernel ``TORCH_CHECK`` raise (R6.2).
+        3. **Layout pre-check.** The fused kernel only consumes the contiguous
+           (grouped) layout today; a context that would select ``masked``
+           (decode / CUDA-graph capture) is routed to fallback with a one-shot
+           log (``SM70FusedMoEExperts`` raises ``NotImplementedError`` on
+           masked). We force ``layout="contiguous"`` for the executable case.
+        4. **Runtime guard.** Wrap the fused experts call in ``try/except`` so
+           *any* runtime error (kernel/build/shape) falls back to the existing
+           path, logging once (R6.2).
+
+        Returns the fused output on success, or ``None`` to signal the caller to
+        run the existing batched / sorted-loop path.
+        """
+        quant: SM70QuantParams = layer.sm70_fused_quant_params
+        if quant is None:
+            return None
+        experts: SM70FusedMoEExperts = layer.sm70_fused_experts
+        cfg: SM70FusedConfig = getattr(
+            layer, "sm70_fused_config", SM70FusedConfig.from_env()
+        )
+
+        layer_name = getattr(layer, "layer_name", "<unknown>")
+
+        # 1. Gate on the live device capability + switch (pure function, R6.1).
+        try:
+            device_capability = tuple(torch.cuda.get_device_capability(x.device))
+        except Exception:
+            device_capability = (0, 0)
+        support = sm70_fused_support(
+            device_capability=device_capability,
+            flag_enabled=cfg.enabled,
+            weight_bits=self.weight_bits,
+            group_size=self.group_size,
+            activation=getattr(self.moe, "activation", "silu"),
+            hidden=quant.hidden_K,
+            intermediate=quant.inter_I,
+            dtype=x.dtype,
+        )
+        if not support.enabled:
+            logger.warning_once(
+                "SM70 fused MoE: falling back (%s) for layer=%s",
+                support.reason,
+                layer_name,
+            )
+            return None
+
+        m_block = cfg.m_block
+        i_block = cfg.i_block
+
+        # 2. Shape pre-check mirroring the fused kernel constraints (R6.2). Only
+        # the fused-kernel levels (L2/L3) are subject to the tile / SMEM bounds;
+        # the per-operator levels (L0/L1) run dense fp16 and skip this.
+        if cfg.fusion_level in (SM70FusionLevel.L2, SM70FusionLevel.L3):
+            ok, reason = _sm70_fused_kernel_shape_supported(
+                quant.hidden_K, quant.inter_I, m_block
+            )
+            if not ok:
+                logger.warning_once(
+                    "SM70 fused MoE: falling back (unsupported shape: %s) for "
+                    "layer=%s",
+                    reason,
+                    layer_name,
+                )
+                return None
+
+        # 3. Layout pre-check: the fused kernel only consumes the contiguous
+        # layout. Route the masked (decode / CUDA-graph) case to fallback now
+        # (the kernel for it is not yet wired) with a one-shot log (R6.2).
+        num_tokens = x.shape[0]
+        if num_tokens > 0:
+            layout = experts.select_layout(num_tokens)
+            if layout != "contiguous":
+                logger.warning_once(
+                    "SM70 fused MoE: falling back (masked/decode layout not yet "
+                    "supported by the fused kernel) for layer=%s",
+                    layer_name,
+                )
+                return None
+
+        # 4. Run the fused experts with a runtime guard (layered fallback). Force
+        # the contiguous layout (the only executable one today).
+        try:
+            return experts.forward(
+                x,
+                topk_weights,
+                topk_ids,
+                quant=quant,
+                layout="contiguous",
+                m_block=m_block,
+                i_block=i_block,
+            )
+        except Exception as e:
+            logger.warning_once(
+                "SM70 fused MoE: runtime error (%s); falling back to the "
+                "existing path for layer=%s",
+                e,
+                layer_name,
+            )
+            return None
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -575,6 +822,18 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """MoE forward: batched GEMM (preferred) or sorted-loop fallback."""
+        # --- Experimental SM70 fused MoE path (R2.4 / R6.1 / R6.2) -----------
+        # Only taken when the ``VLLM_SM70_FUSED_MOE`` switch built a fused weight
+        # pack during process_weights_after_loading; otherwise (the default) this
+        # is a single attribute check returning None and the existing batched /
+        # sorted-loop path runs unchanged (R6.3). The gate + layered try/except
+        # in the helper fall back on any unsupported shape or runtime error.
+        if getattr(layer, "sm70_fused_experts", None) is not None:
+            fused_out = self._maybe_apply_sm70_fused(
+                layer, x, topk_weights, topk_ids
+            )
+            if fused_out is not None:
+                return fused_out
         if (
             getattr(layer, "sm70_batched_ready", False)
             and x.shape[0] == 1

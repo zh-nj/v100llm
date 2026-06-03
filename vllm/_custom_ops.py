@@ -1314,6 +1314,59 @@ if hasattr(torch.ops._C, "awq_moe_gemm_sm70_out"):
         return None
 
 
+def sm70_fused_moe_out(
+    out: torch.Tensor,
+    permuted_input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    num_experts: int,
+    hidden_K: int,
+    inter_I: int,
+    group_size: int,
+    m_block: int,
+    i_block: int,
+) -> None:
+    torch.ops._C.sm70_fused_moe_out(
+        out,
+        permuted_input,
+        expert_offsets,
+        w13_weight,
+        w13_weight_scale,
+        w2_weight,
+        w2_weight_scale,
+        num_experts,
+        hidden_K,
+        inter_I,
+        group_size,
+        m_block,
+        i_block,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_fused_moe_out"):
+
+    @register_fake("_C::sm70_fused_moe_out")
+    def _sm70_fused_moe_out_fake(
+        out: torch.Tensor,
+        permuted_input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        w13_weight: torch.Tensor,
+        w13_weight_scale: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w2_weight_scale: torch.Tensor,
+        num_experts: int,
+        hidden_K: int,
+        inter_I: int,
+        group_size: int,
+        m_block: int,
+        i_block: int,
+    ) -> None:
+        return None
+
+
 if hasattr(torch.ops._C, "sm70_fp8_moe_gemm_out"):
 
     @register_fake("_C::sm70_fp8_moe_gemm_out")

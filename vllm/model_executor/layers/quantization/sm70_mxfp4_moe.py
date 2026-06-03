@@ -4,7 +4,9 @@
 import torch
 from torch.nn import Module
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
 from vllm.model_executor.layers.deepseek_v4_attention import _profile_or_null
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -19,11 +21,23 @@ from vllm.model_executor.layers.fused_moe.utils import swiglu_limit_func
 from vllm.model_executor.layers.fused_moe.swiglu_limit_triton import (
     sm70_fused_swiglu_limit,
 )
+from vllm.model_executor.layers.fused_moe.sm70_fused_moe_experts import (
+    SM70FusedMoEExperts,
+    SM70MXFP4QuantParams,
+)
+from vllm.model_executor.layers.fused_moe.sm70_fused_moe_gate import (
+    SM70FusedConfig,
+    SM70FusionLevel,
+    sm70_fused_support,
+)
 from vllm.model_executor.layers.quantization.awq_sm70_moe import (
     _DEFAULT_PERSISTENT_MAX_TOKENS,
     _moe_permute_accepts_scale_and_m_indices,
+    _sm70_fused_kernel_shape_supported,
 )
 from vllm.model_executor.utils import set_weight_attrs
+
+logger = init_logger(__name__)
 
 
 class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
@@ -181,6 +195,14 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
         layer.w13_tm_scales = torch.nn.Parameter(w13_scale, requires_grad=False)
         layer.w2_tm_weight = torch.nn.Parameter(w2, requires_grad=False)
         layer.w2_tm_scales = torch.nn.Parameter(w2_scale, requires_grad=False)
+        # --- Experimental SM70 fused MoE weight stash (R2.x / R6.3) ----------
+        # Default-off: only stash the raw MXFP4 expert weights when the
+        # ``VLLM_SM70_FUSED_MOE`` switch is enabled. When off, nothing extra is
+        # done and behavior is byte-identical to the current release (R6.3).
+        # The fused path consumes the *original* MXFP4 packed weights + per-32
+        # block scales, so they MUST be stashed here, before the TurboMind prep
+        # deletes them just below.
+        self._maybe_stash_sm70_mxfp4_weights(layer)
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale, layer.w2_weight_scale
 
@@ -322,6 +344,198 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
             return activation
         return MoEActivation.from_str(activation)
 
+    def _activation_name(self) -> str:
+        """Return the MoE activation as the gate's expected string name."""
+        try:
+            return self._activation().value
+        except Exception:
+            activation = self.moe.activation
+            return activation if isinstance(activation, str) else str(activation)
+
+    def _maybe_stash_sm70_mxfp4_weights(self, layer: Module) -> None:
+        """Stash the raw MXFP4 expert weights + build the fused pack (gated).
+
+        Only runs when ``VLLM_SM70_FUSED_MOE`` is enabled, so the default
+        release path stashes/allocates nothing new and is byte-identical to the
+        current behavior (R6.3). MUST be called while the *original* MXFP4
+        parameters (``w13_weight`` / ``w13_weight_scale`` / ``w2_weight`` /
+        ``w2_weight_scale``) are still present on ``layer`` — i.e. before the
+        TurboMind prep deletes them — because the fused path consumes exactly
+        those packed FP4 tensors and per-32 block scales.
+
+        The raw tensors are stashed under the attribute names
+        :meth:`SM70MXFP4QuantParams.from_layer` reads
+        (``layer.sm70_mxfp4_w13_weight`` etc.) so the pack can be rebuilt after
+        the originals are gone. On any failure the fused attrs are left ``None``
+        so :meth:`apply` falls back to the existing TurboMind grouped-GEMM path.
+        """
+        layer.sm70_fused_quant_params = None
+        layer.sm70_fused_experts = None
+        if not envs.VLLM_SM70_FUSED_MOE:
+            return
+        # Stash the raw MXFP4 tensors before the TurboMind prep deletes the
+        # originals. Reference the underlying tensors (storage stays alive while
+        # referenced); these are the exact packed FP4 weights + per-32 block
+        # scales the fused kernel / dense decode consume.
+        layer.sm70_mxfp4_w13_weight = layer.w13_weight.data
+        layer.sm70_mxfp4_w13_weight_scale = layer.w13_weight_scale.data
+        layer.sm70_mxfp4_w2_weight = layer.w2_weight.data
+        layer.sm70_mxfp4_w2_weight_scale = layer.w2_weight_scale.data
+        layer.group_size = self.group_size
+
+        layer_name = getattr(layer, "layer_name", "<unknown>")
+        try:
+            quant = SM70MXFP4QuantParams.from_layer(
+                layer, group_size=self.group_size
+            )
+        except Exception as e:  # pragma: no cover - depends on built ext / GPU
+            logger.warning_once(
+                "SM70 fused MoE: MXFP4 weight pack build failed (%s); the fused "
+                "path is disabled for layer=%s and the existing TurboMind path "
+                "is used.",
+                e,
+                layer_name,
+            )
+            layer.sm70_fused_quant_params = None
+            layer.sm70_fused_experts = None
+            return
+        cfg = SM70FusedConfig.from_env()
+        layer.sm70_fused_quant_params = quant
+        layer.sm70_fused_config = cfg
+        layer.sm70_fused_experts = SM70FusedMoEExperts(config=cfg)
+        logger.info_once(
+            "SM70 fused MoE: MXFP4 weight pack ready (experts=%d, K=%d, I=%d, "
+            "group_size=%d, fusion_level=%s) for layer=%s",
+            quant.num_experts,
+            quant.hidden_K,
+            quant.inter_I,
+            quant.group_size,
+            cfg.fusion_level.value,
+            layer_name,
+        )
+
+    def _maybe_apply_sm70_fused(
+        self,
+        layer: Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Try the experimental SM70 MXFP4 fused path, else signal fallback.
+
+        Layered gating + fallback (R2.4 / R6.1 / R6.2):
+
+        1. **Pure-function gate** on the live device capability + the
+           ``VLLM_SM70_FUSED_MOE`` switch + dtype/activation/format/shape
+           (:func:`sm70_fused_support`, ``weight_format="mxfp4"``). On rejection,
+           log ``reason`` once and return ``None`` (fall back).
+        2. **Shape pre-check** mirroring the fused kernel tile / SMEM bounds for
+           the fused-kernel levels (L2/L3); on rejection log once and fall back.
+        3. **Capture-safety pre-check.** The fused CUDA mega-kernel consumes the
+           contiguous layout, which is safe for both prefill and *eager decode*;
+           only an active CUDA-graph capture is rejected (the contiguous layout
+           is not replay-safe), logging once and falling back to the shape-stable
+           existing path (R2.7).
+        4. **Runtime guard.** Wrap the fused experts call in ``try/except`` so
+           *any* runtime error (kernel/build/shape) falls back to the existing
+           TurboMind grouped-GEMM path, logging once.
+
+        Returns the fused output on success, or ``None`` to signal the caller to
+        run the existing path.
+        """
+        quant: SM70MXFP4QuantParams | None = getattr(
+            layer, "sm70_fused_quant_params", None
+        )
+        if quant is None:
+            return None
+        experts: SM70FusedMoEExperts = layer.sm70_fused_experts
+        cfg: SM70FusedConfig = getattr(
+            layer, "sm70_fused_config", SM70FusedConfig.from_env()
+        )
+        layer_name = getattr(layer, "layer_name", "<unknown>")
+
+        # 1. Gate on the live device capability + switch (pure function, R6.1).
+        try:
+            device_capability = tuple(torch.cuda.get_device_capability(x.device))
+        except Exception:
+            device_capability = (0, 0)
+        support = sm70_fused_support(
+            device_capability=device_capability,
+            flag_enabled=cfg.enabled,
+            weight_format="mxfp4",
+            group_size=self.group_size,
+            activation=self._activation_name(),
+            hidden=quant.hidden_K,
+            intermediate=quant.inter_I,
+            dtype=x.dtype,
+        )
+        if not support.enabled:
+            logger.warning_once(
+                "SM70 fused MoE: falling back (%s) for layer=%s",
+                support.reason,
+                layer_name,
+            )
+            return None
+
+        m_block = cfg.m_block
+        i_block = cfg.i_block
+
+        # 2. Shape pre-check mirroring the fused kernel constraints (R6.2). Only
+        # the fused-kernel levels (L2/L3) are subject to the tile / SMEM bounds;
+        # the per-operator levels (L0/L1) run dense fp16 and skip this.
+        if cfg.fusion_level in (SM70FusionLevel.L2, SM70FusionLevel.L3):
+            ok, reason = _sm70_fused_kernel_shape_supported(
+                quant.hidden_K, quant.inter_I, m_block
+            )
+            if not ok:
+                logger.warning_once(
+                    "SM70 fused MoE: falling back (unsupported shape: %s) for "
+                    "layer=%s",
+                    reason,
+                    layer_name,
+                )
+                return None
+
+        # 3. Capture-safety pre-check. The fused CUDA mega-kernel consumes the
+        # *contiguous* (moe_permute) layout, which is safe for both prefill
+        # (large M) and **eager decode** (small M) — so decode is routed through
+        # the fused kernel too (R2.6). The only unsafe case is an active CUDA
+        # graph capture: the contiguous layout's moe_permute/moe_unpermute
+        # produce data-dependent shapes + a host sync that are not replay-safe,
+        # so fall back to the (shape-stable) existing path while capturing, with
+        # a one-shot log (R2.7 / R6.2).
+        num_tokens = x.shape[0]
+        if num_tokens > 0 and experts._detect_graph_capturing():
+            logger.warning_once(
+                "SM70 fused MoE: falling back (CUDA graph capture is not "
+                "replay-safe for the contiguous fused kernel) for layer=%s",
+                layer_name,
+            )
+            return None
+
+        # 4. Run the fused experts with a runtime guard (layered fallback). Force
+        # the contiguous layout (the fused kernel's layout, safe for prefill and
+        # eager decode alike). combine uses moe_unpermute which needs fp32
+        # topk_weights (handled inside forward).
+        try:
+            return experts.forward(
+                x,
+                topk_weights,
+                topk_ids,
+                quant=quant,
+                layout="contiguous",
+                m_block=m_block,
+                i_block=i_block,
+            )
+        except Exception as e:
+            logger.warning_once(
+                "SM70 fused MoE: runtime error (%s); falling back to the "
+                "existing path for layer=%s",
+                e,
+                layer_name,
+            )
+            return None
+
     def apply(
         self,
         layer: Module,
@@ -333,6 +547,19 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
         del shared_experts_input
         if not getattr(layer, "sm70_batched_ready", False):
             raise RuntimeError("SM70 MXFP4 MoE batched runtime is not prepared.")
+        # --- Experimental SM70 MXFP4 fused MoE path (R2.4 / R6.1 / R6.2) -----
+        # Only taken when the ``VLLM_SM70_FUSED_MOE`` switch stashed the MXFP4
+        # weights + built a fused pack during process_weights_after_loading;
+        # otherwise (the default) this is a single attribute check returning
+        # None and the existing TurboMind grouped-GEMM path runs unchanged
+        # (R6.3). The gate + layered try/except in the helper fall back on any
+        # unsupported shape, layout, or runtime error.
+        if getattr(layer, "sm70_fused_experts", None) is not None:
+            fused_out = self._maybe_apply_sm70_fused(
+                layer, x, topk_weights, topk_ids
+            )
+            if fused_out is not None:
+                return fused_out
         num_tokens = x.shape[0]
         top_k = topk_ids.shape[1]
         total_slots = num_tokens * top_k

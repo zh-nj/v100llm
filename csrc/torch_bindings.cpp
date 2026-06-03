@@ -388,6 +388,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, "
       "int num_experts, int k, int n, int group_size, bool gated_silu) -> ()");
   ops.impl("awq_moe_gemm_sm70_out", torch::kCUDA, &awq_moe_gemm_sm70_out);
+  // SM70 fused MoE forward: linear1 -> SwiGLU -> linear2 (contiguous layout,
+  // dsv4f MXFP4 expert weights: packed FP4 (E2M1, 2 nibbles/byte) weight
+  // tensors + per-32 E8M0 block-scale tensors, m_block/i_block tiling).
+  // MXFP4 is software-dequantised to fp16 in-kernel; intermediate activations
+  // stay on chip and never materialise to HBM.
+  ops.def(
+      "sm70_fused_moe_out(Tensor(a!) out, Tensor permuted_input, "
+      "Tensor expert_offsets, Tensor w13_weight, Tensor w13_weight_scale, "
+      "Tensor w2_weight, Tensor w2_weight_scale, int num_experts, "
+      "int hidden_K, int inter_I, int group_size, int m_block, int i_block) "
+      "-> ()");
+  ops.impl("sm70_fused_moe_out", torch::kCUDA, &sm70_fused_moe_out);
   ops.def(
       "sm70_fp8_moe_gemm_out(Tensor(a!) out, Tensor sorted_input, "
       "Tensor expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, "

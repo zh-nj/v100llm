@@ -401,6 +401,20 @@ void awq_moe_gemm_sm70_out(torch::Tensor out,
                            int64_t group_size,
                            bool gated_silu);
 
+void sm70_fused_moe_out(torch::Tensor out,
+                        torch::Tensor permuted_input,
+                        torch::Tensor expert_offsets,
+                        torch::Tensor w13_weight,
+                        torch::Tensor w13_weight_scale,
+                        torch::Tensor w2_weight,
+                        torch::Tensor w2_weight_scale,
+                        int64_t num_experts,
+                        int64_t hidden_K,
+                        int64_t inter_I,
+                        int64_t group_size,
+                        int64_t m_block,
+                        int64_t i_block);
+
 torch::Tensor permute_cols(torch::Tensor const& A, torch::Tensor const& perm);
 #endif
 
