@@ -397,7 +397,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "sm70_fused_moe_out(Tensor(a!) out, Tensor permuted_input, "
       "Tensor expert_offsets, Tensor w13_weight, Tensor w13_weight_scale, "
       "Tensor w2_weight, Tensor w2_weight_scale, int num_experts, "
-      "int hidden_K, int inter_I, int group_size, int m_block, int i_block) "
+      "int hidden_K, int inter_I, int group_size, int m_block, int i_block, "
+      "float swiglu_limit) "
       "-> ()");
   ops.impl("sm70_fused_moe_out", torch::kCUDA, &sm70_fused_moe_out);
   ops.def(

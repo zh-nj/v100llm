@@ -180,7 +180,58 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
             interleave_gated_silu,
         )
 
+    def _init_dims_from_raw_mxfp4(self, layer: Module) -> None:
+        """Set the SM70 runtime dims from the raw MXFP4 pack (fused path only).
+
+        Mirrors the dims ``process_weights_after_loading`` derives from the
+        TurboMind meta, but reads them from the stashed
+        :class:`SM70MXFP4QuantParams` so the TurboMind prep can be skipped when
+        the fused path owns the layer (saving the redundant weight copy). The
+        fused kernel writes a ``[M, hidden_K]`` output, so the logical hidden
+        size equals ``hidden_K`` (the MXFP4 method already rounds hidden up to a
+        group_size multiple in ``maybe_roundup_sizes``).
+        """
+        quant: SM70MXFP4QuantParams = layer.sm70_fused_quant_params
+        layer.sm70_num_experts = quant.num_experts
+        layer.sm70_w13_n_dim = 2 * quant.inter_I  # gate|up output width
+        layer.sm70_w13_k_dim = quant.hidden_K
+        layer.sm70_w2_n_dim = quant.hidden_K  # down output width
+        layer.sm70_w2_k_dim = quant.inter_I
+        layer.sm70_hidden_logical_size = quant.hidden_logical_size
+        layer.sm70_intermediate_size = quant.inter_I
+        layer.sm70_batched_ready = True
+        layer._sm70_mxfp4_moe_direct_prepared = True
+
     def process_weights_after_loading(self, layer: Module) -> None:
+        # Build the fused-path MXFP4 pack first (when the switch is on). It
+        # references the *raw* MXFP4 weights (``w13_weight`` / ``w2_weight`` +
+        # scales) which the fused kernel consumes directly. Doing this before the
+        # TurboMind prep lets us SKIP that prep entirely when fusion is active —
+        # the TurboMind-reformatted weights + strided pointers are only needed by
+        # the per-operator fallback, and keeping both copies would roughly double
+        # the per-GPU expert-weight footprint (OOM on large MoEs like the 256-
+        # expert dsv4f at gpu-memory-utilization 0.95).
+        self._maybe_stash_sm70_mxfp4_weights(layer)
+        fused_active = getattr(layer, "sm70_fused_experts", None) is not None
+
+        if fused_active:
+            # Fused path owns this layer: keep only the raw MXFP4 weights (the
+            # kernel's input) and the dims it needs; do NOT build the redundant
+            # TurboMind weights / strided pointers. This frees the second full
+            # expert-weight copy. The per-operator runtime fallback is therefore
+            # unavailable for fused layers — acceptable since the gate approved
+            # fusion and the kernel is numerically validated; a kernel failure
+            # surfaces loudly rather than silently degrading.
+            self._init_dims_from_raw_mxfp4(layer)
+            logger.info_once(
+                "SM70 fused MoE: skipping TurboMind weight prep for layer=%s "
+                "(fused path active; raw MXFP4 weights retained, TurboMind copy "
+                "freed to save HBM).",
+                getattr(layer, "layer_name", "<unknown>"),
+            )
+            self._allocate_buffers(layer, layer.sm70_mxfp4_w13_weight.device)
+            return
+
         w13, w13_scale, w13_meta = self._prepare_matrix(
             layer.w13_weight,
             layer.w13_weight_scale,
@@ -195,14 +246,6 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
         layer.w13_tm_scales = torch.nn.Parameter(w13_scale, requires_grad=False)
         layer.w2_tm_weight = torch.nn.Parameter(w2, requires_grad=False)
         layer.w2_tm_scales = torch.nn.Parameter(w2_scale, requires_grad=False)
-        # --- Experimental SM70 fused MoE weight stash (R2.x / R6.3) ----------
-        # Default-off: only stash the raw MXFP4 expert weights when the
-        # ``VLLM_SM70_FUSED_MOE`` switch is enabled. When off, nothing extra is
-        # done and behavior is byte-identical to the current release (R6.3).
-        # The fused path consumes the *original* MXFP4 packed weights + per-32
-        # block scales, so they MUST be stashed here, before the TurboMind prep
-        # deletes them just below.
-        self._maybe_stash_sm70_mxfp4_weights(layer)
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale, layer.w2_weight_scale
 
@@ -376,27 +419,26 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
 
         layer_name = getattr(layer, "layer_name", "<unknown>")
 
-        # Feature-parity guard (R6.2): the fused CUDA mega-kernel implements a
-        # plain ``silu(gate) * up`` SwiGLU epilogue with no expert bias and no
-        # swiglu clamping. If this layer needs an expert bias or a
-        # ``swiglu_limit`` (both handled by the TurboMind per-operator path via
-        # ``sm70_fused_swiglu_limit`` / the bias add), the fused path would be
-        # *numerically wrong*, so do not build (or stash) the pack at all — the
-        # existing path is used. Skipping here also avoids holding an extra full
-        # copy of the MXFP4 expert weights alive for a pack that can never run.
-        swiglu_limit = getattr(layer, "swiglu_limit", None)
-        has_swiglu_limit = swiglu_limit is not None and swiglu_limit > 0
+        # Feature-parity guard (R6.2): the fused CUDA mega-kernel implements the
+        # ``silu(gate) * up`` SwiGLU epilogue WITH the DeepSeek-V4 ``swiglu_limit``
+        # clamp (applied on chip), but has no expert-bias add. If this layer
+        # needs an expert bias (handled by the TurboMind per-operator path's bias
+        # kernel) the fused path would be numerically wrong, so do not build (or
+        # stash) the pack at all — the existing path is used. Skipping here also
+        # avoids holding an extra full copy of the MXFP4 expert weights alive for
+        # a pack that can never run. ``swiglu_limit`` is supported and forwarded
+        # to the kernel, so it does NOT disable the fused path.
         has_bias = (
             getattr(layer, "w13_bias", None) is not None
             or getattr(layer, "w2_bias", None) is not None
             or bool(getattr(self.moe, "has_bias", False))
         )
-        if has_swiglu_limit or has_bias:
+        if has_bias:
             logger.info_once(
                 "SM70 fused MoE: disabled for layer=%s (the fused kernel does "
-                "not support %s; using the TurboMind per-operator path).",
+                "not support expert bias; using the TurboMind per-operator "
+                "path).",
                 layer_name,
-                "swiglu_limit" if has_swiglu_limit else "expert bias",
             )
             return
 
@@ -503,72 +545,57 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
             )
             return None
 
-        # Feature-parity runtime guard (defense-in-depth): the fused kernel does
-        # not implement an expert bias or a ``swiglu_limit`` clamp, so fall back
-        # if either is present on the layer (the stash guard normally prevents a
-        # pack from being built in this case, but a layer mutated after loading
-        # must still be handled correctly).
-        swiglu_limit = getattr(layer, "swiglu_limit", None)
-        if (swiglu_limit is not None and swiglu_limit > 0) or (
+        # Feature-parity runtime guard (defense-in-depth): the fused kernel now
+        # implements the DeepSeek-V4 ``swiglu_limit`` clamp, but still has no
+        # expert-bias add, so fall back when the layer carries an expert bias
+        # (the stash guard normally prevents a pack from being built then, but a
+        # layer mutated after loading must still be handled correctly).
+        if (
             getattr(layer, "w13_bias", None) is not None
             or getattr(layer, "w2_bias", None) is not None
         ):
             logger.warning_once(
-                "SM70 fused MoE: falling back (swiglu_limit / expert bias not "
-                "supported by the fused kernel) for layer=%s",
+                "SM70 fused MoE: falling back (expert bias not supported by the "
+                "fused kernel) for layer=%s",
                 layer_name,
             )
             return None
+        swiglu_limit_val = getattr(layer, "swiglu_limit", None)
+        swiglu_limit = (
+            float(swiglu_limit_val)
+            if swiglu_limit_val is not None and swiglu_limit_val > 0
+            else 0.0
+        )
 
         m_block = cfg.m_block
         i_block = cfg.i_block
 
-        # 2. Shape pre-check mirroring the fused kernel constraints (R6.2). Only
-        # the fused-kernel levels (L2/L3) are subject to the tile / SMEM bounds;
-        # the per-operator levels (L0/L1) run dense fp16 and skip this.
-        if cfg.fusion_level in (SM70FusionLevel.L2, SM70FusionLevel.L3):
-            ok, reason = _sm70_fused_kernel_shape_supported(
-                quant.hidden_K, quant.inter_I, m_block
-            )
-            if not ok:
-                logger.warning_once(
-                    "SM70 fused MoE: falling back (unsupported shape: %s) for "
-                    "layer=%s",
-                    reason,
-                    layer_name,
-                )
-                return None
-
-        # 3. Capture-safety pre-check. The fused CUDA mega-kernel consumes the
-        # *contiguous* (moe_permute) layout, which is safe for both prefill
-        # (large M) and **eager decode** (small M) — so decode is routed through
-        # the fused kernel too (R2.6). The only unsafe case is an active CUDA
-        # graph capture: the contiguous layout's moe_permute/moe_unpermute
-        # produce data-dependent shapes + a host sync that are not replay-safe,
-        # so fall back to the (shape-stable) existing path while capturing, with
-        # a one-shot log (R2.7 / R6.2).
-        num_tokens = x.shape[0]
-        if num_tokens > 0 and experts._detect_graph_capturing():
+        # 2. Shape pre-check mirroring the fused kernel constraints (R6.2): the
+        # tile / SMEM bounds the mega-kernel needs. The buffer-based fused path
+        # below always runs the mega-kernel, so this gates every call.
+        ok, reason = _sm70_fused_kernel_shape_supported(
+            quant.hidden_K, quant.inter_I, m_block
+        )
+        if not ok:
             logger.warning_once(
-                "SM70 fused MoE: falling back (CUDA graph capture is not "
-                "replay-safe for the contiguous fused kernel) for layer=%s",
+                "SM70 fused MoE: falling back (unsupported shape: %s) for "
+                "layer=%s",
+                reason,
                 layer_name,
             )
             return None
 
-        # 4. Run the fused experts with a runtime guard (layered fallback). Force
-        # the contiguous layout (the fused kernel's layout, safe for prefill and
-        # eager decode alike). combine uses moe_unpermute which needs fp32
-        # topk_weights (handled inside forward).
+        # 3. Run the fused mega-kernel inside the *capture-safe* persistent-buffer
+        # flow (same buffers / moe_permute / moe_unpermute as the production
+        # path, all CUDA-graph-replayable). The (expert, tile) kernel grid
+        # consumes the dense, unaligned moe_permute output directly and decodes
+        # MXFP4 -> fp16 + applies the swiglu_limit clamp on chip, so prefill AND
+        # decode (incl. under CUDA-graph capture) take the fused path. A runtime
+        # guard falls back on any error.
         try:
-            return experts.forward(
-                x,
-                topk_weights,
-                topk_ids,
-                quant=quant,
-                layout="contiguous",
-                m_block=m_block,
-                i_block=i_block,
+            return self._apply_sm70_fused_buffered(
+                layer, x, topk_weights, topk_ids, quant, m_block, i_block,
+                swiglu_limit,
             )
         except Exception as e:
             logger.warning_once(
@@ -578,6 +605,127 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
                 layer_name,
             )
             return None
+
+    def _apply_sm70_fused_buffered(
+        self,
+        layer: Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        quant: "SM70MXFP4QuantParams",
+        m_block: int,
+        i_block: int,
+        swiglu_limit: float,
+    ) -> torch.Tensor:
+        """Capture-safe fused MoE forward over the persistent production buffers.
+
+        Mirrors the production ``apply`` buffer flow exactly — ``moe_permute``
+        into the persistent ``permuted_input`` buffer with device-side
+        ``expert_offsets``, then ``moe_unpermute`` weighted combine — but
+        replaces the three-kernel ``gemm_w13 -> swiglu -> gemm_w2`` sequence with
+        a single ``ops.sm70_fused_moe_out`` mega-kernel call. Every tensor is a
+        pre-allocated persistent buffer and ``moe_permute`` / the fused kernel /
+        ``moe_unpermute`` all read the device-side ``expert_offsets`` / shapes,
+        so there is **no host sync and no data-dependent allocation** — the whole
+        path is CUDA-graph capturable/replayable (unlike
+        ``SM70FusedMoEExperts.forward``, which host-syncs to pad segments).
+
+        The fused mega-kernel's (expert, tile) grid confines each block to one
+        expert's segment, so it consumes the dense (unaligned) ``moe_permute``
+        output directly — no Python-side ``m_block`` padding (the host-sync that
+        broke capture) is needed. The ``swiglu_limit`` clamp is applied on chip.
+        """
+        num_tokens = x.shape[0]
+        top_k = topk_ids.shape[1]
+        total_slots = num_tokens * top_k
+        buffers = self._get_buffers(layer, total_slots, num_tokens)
+        output = buffers["output"]
+        if total_slots == 0:
+            output.zero_()
+            return output
+
+        if topk_ids.dtype == torch.int32 and topk_ids.is_contiguous():
+            topk_ids_i32 = topk_ids
+        else:
+            topk_ids_i32 = buffers["topk_ids_i32"]
+            topk_ids_i32.copy_(topk_ids, non_blocking=True)
+
+        with _profile_or_null("moe.experts.permute", x):
+            if _moe_permute_accepts_scale_and_m_indices():
+                torch.ops._moe_C.moe_permute(
+                    x,
+                    topk_ids_i32,
+                    buffers["token_expert_indices"],
+                    None,
+                    layer.sm70_num_experts,
+                    layer.sm70_num_experts,
+                    top_k,
+                    None,
+                    buffers["permuted_input"],
+                    buffers["expert_offsets64"],
+                    buffers["inv_permuted_idx"],
+                    buffers["permuted_idx"],
+                    buffers["m_indices"],
+                )
+            else:
+                torch.ops._moe_C.moe_permute(
+                    x,
+                    topk_ids_i32,
+                    buffers["token_expert_indices"],
+                    None,
+                    layer.sm70_num_experts,
+                    layer.sm70_num_experts,
+                    top_k,
+                    buffers["permuted_input"],
+                    buffers["expert_offsets64"],
+                    buffers["inv_permuted_idx"],
+                    buffers["permuted_idx"],
+                )
+            buffers["expert_offsets"].copy_(
+                buffers["expert_offsets64"], non_blocking=True
+            )
+
+        # Fused linear1 -> SwiGLU(limit) -> linear2 over the grouped layout. The
+        # mega-kernel writes one [M, hidden_K] output row per permuted row;
+        # padding rows past each expert segment are skipped by its per-tile
+        # m_rows clamp. ``sorted_output`` is a persistent buffer; combine only
+        # gathers valid rows via ``inv_permuted_idx``.
+        sorted_output = buffers["sorted_output"]
+        with _profile_or_null("moe.experts.fused", x):
+            ops.sm70_fused_moe_out(
+                sorted_output,
+                buffers["permuted_input"],
+                buffers["expert_offsets"],
+                quant.w13_weight,
+                quant.w13_weight_scale,
+                quant.w2_weight,
+                quant.w2_weight_scale,
+                quant.num_experts,
+                quant.hidden_K,
+                quant.inter_I,
+                quant.group_size,
+                m_block,
+                i_block,
+                swiglu_limit,
+            )
+
+        # moe_unpermute requires fp32 router weights; the SM70 router emits fp32
+        # already, but cast defensively for any caller-supplied dtype.
+        topk_weights_f32 = (
+            topk_weights
+            if topk_weights.dtype == torch.float32
+            else topk_weights.to(torch.float32)
+        )
+        with _profile_or_null("moe.experts.unpermute", x):
+            torch.ops._moe_C.moe_unpermute(
+                sorted_output[:, : layer.sm70_hidden_logical_size],
+                topk_weights_f32,
+                buffers["inv_permuted_idx"],
+                buffers["expert_offsets64"],
+                top_k,
+                output,
+            )
+        return output
 
     def apply(
         self,

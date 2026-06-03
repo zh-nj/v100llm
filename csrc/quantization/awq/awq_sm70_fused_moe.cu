@@ -311,16 +311,29 @@ __device__ __forceinline__ float sm70_silu(float x) {
 // Write this warp's 16x16 tile of h = silu(gate)*up into smem_h at column
 // offset `h_col0` (row-major, leading dim ldh). Padded rows/cols (beyond the
 // valid m_rows / n_cols of a partial tile) are skipped so `h` stays clean.
+//
+// `swiglu_limit` mirrors the reference / TurboMind ``sm70_fused_swiglu_limit``
+// clamp: when > 0, gate is clamped to <= limit and up to [-limit, +limit]
+// BEFORE silu/mul (DeepSeek-V4 style SwiGLU limit). limit <= 0 disables it
+// (plain silu(gate)*up), preserving the original behaviour exactly.
 __device__ __forceinline__ void sm70_swiglu_epilogue(
     const float (&gate_acc)[8], const float (&up_acc)[8], half* smem_h, int ldh,
-    int h_col0, int m_rows, int n_cols, int lane) {
+    int h_col0, int m_rows, int n_cols, int lane, float swiglu_limit) {
+  const bool has_limit = swiglu_limit > 0.0f;
 #pragma unroll
   for (int e = 0; e < 8; ++e) {
     int row;
     int col;
     sm70_acc_coord(lane, e, row, col);
     if (row < m_rows && col < n_cols) {
-      const float h = sm70_silu(gate_acc[e]) * up_acc[e];
+      float gate = gate_acc[e];
+      float up = up_acc[e];
+      if (has_limit) {
+        // gate = min(gate, limit); up = clamp(up, -limit, +limit).
+        gate = fminf(gate, swiglu_limit);
+        up = fmaxf(fminf(up, swiglu_limit), -swiglu_limit);
+      }
+      const float h = sm70_silu(gate) * up;
       smem_h[row * ldh + h_col0 + col] = __float2half(h);
     }
   }
@@ -423,7 +436,7 @@ struct Sm70Linear1Params {
 __device__ inline void sm70_linear1_swiglu_epilogue(
     const Sm70Linear1Params& p, int row0, int i0, int m_rows, int i_block,
     half* smem_x, half* smem_wg, half* smem_wu, half* smem_h, int ldh, int lane,
-    int warp_id, int tid, int nthreads) {
+    int warp_id, int tid, int nthreads, float swiglu_limit) {
   const int x_slot = kMmaM * kKStep;        // elements per x double-buffer slot
   const int w_slot = i_block * kKStep;      // elements per weight slab slot
   const int num_chunks = p.K / kKStep;
@@ -490,7 +503,7 @@ __device__ inline void sm70_linear1_swiglu_epilogue(
   // On-chip SwiGLU: silu(gate)*up -> smem_h (stays resident for linear2).
   if (n_cols > 0) {
     sm70_swiglu_epilogue(gate_acc, up_acc, smem_h, ldh, /*h_col0=*/n_local0,
-                         m_rows, n_cols, lane);
+                         m_rows, n_cols, lane, swiglu_limit);
   }
 }
 
@@ -679,30 +692,24 @@ __global__ void sm70_fused_moe_kernel(
     const uint8_t* __restrict__ w13_weight,
     const uint8_t* __restrict__ w13_scale,
     const uint8_t* __restrict__ w2_weight, const uint8_t* __restrict__ w2_scale,
-    int num_experts, int K, int I, int group_size, int total_rows) {
-  const int row0 = blockIdx.x * kMmaM;
-  if (row0 >= total_rows) return;
-
-  // Resolve the expert owning this m-tile via a linear scan of expert_offsets
-  // (E is small, <= 16). Padding rows past the last segment early-return.
-  __shared__ int s_expert;
-  __shared__ int s_seg_end;
-  if (threadIdx.x == 0) {
-    int e = -1;
-    for (int ee = 0; ee < num_experts; ++ee) {
-      if (row0 >= expert_offsets[ee] && row0 < expert_offsets[ee + 1]) {
-        e = ee;
-        break;
-      }
-    }
-    s_expert = e;
-    s_seg_end = (e >= 0) ? expert_offsets[e + 1] : row0;
-  }
-  __syncthreads();
-
-  const int expert = s_expert;
-  if (expert < 0) return;  // padding tail: nothing to compute
-  const int m_rows = min(kMmaM, min(s_seg_end, total_rows) - row0);
+    int num_experts, int K, int I, int group_size, int total_rows,
+    float swiglu_limit) {
+  // Capture-safe (expert, tile) grid: block (blockIdx.x = tile, blockIdx.y =
+  // expert) owns the kMmaM-row tile starting at expert_offsets[e] + tile*kMmaM,
+  // confined to expert e's segment. This needs NO m_block alignment of the
+  // segments (a tile never straddles two experts because the expert is fixed by
+  // blockIdx.y and the row range is clamped to [seg_start, seg_end)), so it
+  // consumes the dense, *unaligned* `moe_permute` output of the capture-safe
+  // production buffer flow directly. The grid shape (max_tiles x num_experts)
+  // depends only on the fixed buffer capacity, not the routing distribution, so
+  // it stays constant across CUDA-graph replays.
+  const int expert = blockIdx.y;
+  if (expert >= num_experts) return;
+  const int seg_start = expert_offsets[expert];
+  const int seg_end = expert_offsets[expert + 1];
+  const int row0 = seg_start + blockIdx.x * kMmaM;
+  if (row0 >= seg_end || row0 >= total_rows) return;  // padding / empty tail
+  const int m_rows = min(kMmaM, min(seg_end, total_rows) - row0);
   if (m_rows <= 0) return;
 
   const int tid = threadIdx.x;
@@ -760,7 +767,7 @@ __global__ void sm70_fused_moe_kernel(
   for (int i0 = 0; i0 < I; i0 += slab) {
     sm70_linear1_swiglu_epilogue(l1, row0, i0, m_rows, slab, smem_x, smem_wg,
                                  smem_wu, smem_h + i0, ldh, lane, warp_id, tid,
-                                 nthreads);
+                                 nthreads, swiglu_limit);
     __syncthreads();  // h slab complete + scratch free before reuse / linear2
   }
 
@@ -822,7 +829,8 @@ void sm70_fused_moe_out(
     int64_t inter_I,
     int64_t group_size,
     int64_t m_block,
-    int64_t i_block) {
+    int64_t i_block,
+    double swiglu_limit) {
   // ---- Tensor placement / dtype checks (fp16 activations, uint8 MXFP4) -----
   TORCH_CHECK(permuted_input.is_cuda() &&
                   permuted_input.scalar_type() == torch::kFloat16,
@@ -970,10 +978,13 @@ void sm70_fused_moe_out(
   TORCH_CHECK((slab % fused::kMmaN) == 0 && slab > 0,
               "sm70_fused_moe: i_block (", i_block,
               ") must be a positive multiple of ", fused::kMmaN, ".");
-  TORCH_CHECK((m_block % M_TILE) == 0,
-              "sm70_fused_moe: m_block (", m_block,
-              ") must be a multiple of the kernel M_TILE (", M_TILE, ") so an "
-              "m-tile block never straddles two expert segments.");
+  // NOTE: the (expert, tile) grid confines each block to one expert's segment
+  // (blockIdx.y == expert), so a tile never straddles two experts regardless of
+  // segment alignment. `m_block` is therefore NOT required to align the
+  // segments here (it is retained in the op signature for API compatibility and
+  // as a tiling hint); the kernel consumes the dense, unaligned `moe_permute`
+  // output of the capture-safe production buffer flow directly.
+  (void)m_block;
   const int nwarps = slab / fused::kMmaN;
   const int kThreads = nwarps * fused::kWarpSize;
   TORCH_CHECK(kThreads > 0 && kThreads <= 1024,
@@ -1017,10 +1028,17 @@ void sm70_fused_moe_out(
   const int smem_bytes = static_cast<int>(smem_bytes_ll);
 
   // ---- Launch --------------------------------------------------------------
-  // One block per M_TILE token-block; padding blocks past the last expert
-  // segment early-return. Block size = nwarps warps; the staging copies
-  // vectorise across all threads while each warp computes its own n-tile.
-  const int grid = static_cast<int>((total_tokens + M_TILE - 1) / M_TILE);
+  // 2D grid (max_tiles_per_expert, num_experts): block (tile, expert) handles
+  // expert e's rows [expert_offsets[e] + tile*M_TILE, ...). The grid dims depend
+  // ONLY on the fixed buffer capacity (total_tokens == permuted_input.size(0),
+  // a persistent buffer in the capture-safe production flow) and num_experts —
+  // never on the routing distribution — so the launch is constant across CUDA-
+  // graph replays. Blocks whose tile lies past their expert's segment (or past
+  // the dense total) early-return.
+  const int max_tiles = static_cast<int>(
+      (total_tokens + M_TILE - 1) / M_TILE);
+  const dim3 grid(static_cast<unsigned int>(max_tiles),
+                  static_cast<unsigned int>(num_experts));
 
   auto* kernel = fused::sm70_fused_moe_kernel;
 
@@ -1043,6 +1061,6 @@ void sm70_fused_moe_out(
       reinterpret_cast<const uint8_t*>(w2_weight_scale.data_ptr()),
       static_cast<int>(num_experts), static_cast<int>(hidden_K),
       static_cast<int>(inter_I), static_cast<int>(group_size),
-      static_cast<int>(total_tokens));
+      static_cast<int>(total_tokens), static_cast<float>(swiglu_limit));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

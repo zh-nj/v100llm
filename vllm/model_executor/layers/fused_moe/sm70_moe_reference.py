@@ -180,18 +180,27 @@ def mxfp4_dequant_to_fp16(
     return (signed * scale).to(torch.float16)
 
 
-def _silu_and_mul(gate_up: torch.Tensor) -> torch.Tensor:
+def _silu_and_mul(gate_up: torch.Tensor, swiglu_limit: float = 0.0) -> torch.Tensor:
     """Compute ``silu(gate) * up`` for a ``[..., 2 * I]`` tensor.
 
     Reuses ``torch.ops._C.silu_and_mul`` (the same op the production path uses)
     when the compiled extension is loaded, and falls back to an equivalent
     torch-native implementation otherwise.  The computation is performed in the
     input dtype (fp16 for the reference path, fp32 for the golden path).
+
+    When ``swiglu_limit > 0`` the DeepSeek-V4 SwiGLU clamp is applied before
+    silu/mul (``gate = min(gate, limit)``; ``up = clamp(up, -limit, +limit)``),
+    matching ``swiglu_limit_func`` and the fused kernel epilogue.
     """
     assert gate_up.shape[-1] % 2 == 0, (
         f"silu_and_mul expects an even last dim, got {gate_up.shape[-1]}"
     )
     d = gate_up.shape[-1] // 2
+
+    if swiglu_limit and swiglu_limit > 0:
+        gate = torch.clamp(gate_up[..., :d], max=swiglu_limit)
+        up = torch.clamp(gate_up[..., d:], min=-swiglu_limit, max=swiglu_limit)
+        return torch.nn.functional.silu(gate) * up
 
     c_op = getattr(getattr(torch.ops, "_C", None), "silu_and_mul", None)
     if c_op is not None and gate_up.is_cuda:
@@ -218,6 +227,7 @@ def _moe_reference_impl(
     num_experts: int,
     activation: str,
     compute_dtype: torch.dtype,
+    swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     """Shared per-expert ``linear1 -> act -> linear2 -> combine`` core.
 
@@ -258,7 +268,7 @@ def _moe_reference_impl(
         # linear1: [n_e, K] @ [K, 2I] -> [n_e, 2I]
         gate_up = inp @ w1c[e].transpose(0, 1)
         # SwiGLU: silu(gate) * up -> [n_e, I]
-        h = _silu_and_mul(gate_up)
+        h = _silu_and_mul(gate_up, swiglu_limit)
         # linear2: [n_e, I] @ [I, K] -> [n_e, K]
         slot_out[mask] = h @ w2c[e].transpose(0, 1)
 
@@ -280,6 +290,7 @@ def sm70_moe_reference(
     num_experts: int,
     activation: str = "silu",
     group_size: int = _MXFP4_DEFAULT_GROUP_SIZE,
+    swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     """fp16 per-operator golden reference for the SM70 fused MoE forward.
 
@@ -300,6 +311,7 @@ def sm70_moe_reference(
         num_experts: total number of experts ``E``.
         activation: gated activation; only ``"silu"`` is supported.
         group_size: MXFP4 block size (32 for dsv4f).
+        swiglu_limit: DeepSeek-V4 SwiGLU clamp limit; ``<= 0`` disables it.
 
     Returns:
         ``[num_tokens, K]`` fp16 output.
@@ -315,6 +327,7 @@ def sm70_moe_reference(
         num_experts,
         activation,
         compute_dtype=torch.float16,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -329,6 +342,7 @@ def sm70_moe_reference_golden(
     num_experts: int,
     activation: str = "silu",
     group_size: int = _MXFP4_DEFAULT_GROUP_SIZE,
+    swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     """fp32 "golden" variant of :func:`sm70_moe_reference`.
 
@@ -348,6 +362,7 @@ def sm70_moe_reference_golden(
         num_experts,
         activation,
         compute_dtype=torch.float32,
+        swiglu_limit=swiglu_limit,
     )
 
 

@@ -413,7 +413,8 @@ void sm70_fused_moe_out(torch::Tensor out,
                         int64_t inter_I,
                         int64_t group_size,
                         int64_t m_block,
-                        int64_t i_block);
+                        int64_t i_block,
+                        double swiglu_limit);
 
 torch::Tensor permute_cols(torch::Tensor const& A, torch::Tensor const& perm);
 #endif

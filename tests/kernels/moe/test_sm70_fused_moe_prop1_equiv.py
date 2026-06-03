@@ -512,3 +512,70 @@ def test_executed_coverage(capsys) -> None:
     assert ("contiguous", SM70FusionLevel.L0) in executed_set
     assert ("contiguous", SM70FusionLevel.L1) in executed_set
     assert ("masked", SM70FusionLevel.L1) in executed_set
+
+
+def test_swiglu_limit_equivalence() -> None:
+    """The DeepSeek-V4 ``swiglu_limit`` clamp matches the reference (R2.3/R2.5).
+
+    With a positive ``swiglu_limit`` the gate is clamped to ``<= limit`` and up
+    to ``[-limit, +limit]`` before ``silu*mul``. The reference, the dense L0/L1
+    path and (when built) the fused mega-kernel all apply the *same* clamp, so
+    every runnable realization must agree within the fp16 tolerance. Inputs are
+    scaled up so the clamp actually bites (many gate/up values exceed the
+    limit).
+    """
+    device = torch.device("cuda")
+    limit = 10.0
+    quant, x, topk_ids, topk_weights, K, I = _build_case(
+        seed=99,
+        k_mult=2,
+        i_mult=2,
+        num_experts=8,
+        topk=2,
+        num_tokens=48,
+        weight_regime="wide",
+        routing_mode="uniform",
+        device=device,
+    )
+    # Amplify activations so a meaningful fraction of gate/up pre-activations
+    # exceed the limit (otherwise the clamp would be a no-op and the test would
+    # not actually exercise it).
+    x = (x.to(torch.float32) * 6.0).to(torch.float16)
+
+    ref = sm70_moe_reference(
+        x, topk_weights, topk_ids,
+        quant.w13_weight, quant.w13_weight_scale,
+        quant.w2_weight, quant.w2_weight_scale,
+        8, group_size=quant.group_size, swiglu_limit=limit,
+    )
+    if not bool(torch.isfinite(ref).all()):
+        pytest.skip("reference output is non-finite (fp16 overflow); out of scope")
+    golden = sm70_moe_reference_golden(
+        x, topk_weights, topk_ids,
+        quant.w13_weight, quant.w13_weight_scale,
+        quant.w2_weight, quant.w2_weight_scale,
+        8, group_size=quant.group_size, swiglu_limit=limit,
+    )
+
+    # Sanity: the clamp is non-trivial here — the unclamped reference differs.
+    ref_noclamp = sm70_moe_reference(
+        x, topk_weights, topk_ids,
+        quant.w13_weight, quant.w13_weight_scale,
+        quant.w2_weight, quant.w2_weight_scale,
+        8, group_size=quant.group_size, swiglu_limit=0.0,
+    )
+    assert not torch.allclose(ref, ref_noclamp, rtol=1e-2, atol=1e-2), (
+        "swiglu_limit clamp had no effect; amplify the input so it bites"
+    )
+
+    experts = SM70FusedMoEExperts()
+    for layout, level in _runnable_combos():
+        out = experts.forward(
+            x, topk_weights, topk_ids, quant=quant, layout=layout,
+            m_block=32, i_block=64, fusion_level=level, swiglu_limit=limit,
+        )
+        check = check_fp16_close(out, ref, K=K, I=I, topk=2, golden=golden)
+        assert check.passed, (
+            f"swiglu_limit fused path disagrees with the reference: "
+            f"{check.reason} | layout={layout}, level={level.value}"
+        )

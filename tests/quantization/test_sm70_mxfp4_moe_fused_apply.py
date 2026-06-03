@@ -267,13 +267,12 @@ def test_stash_builds_pack_and_sets_from_layer_attrs(cap_logger) -> None:
     assert layer.sm70_fused_quant_params.group_size == 32
 
 
-def test_stash_skipped_for_swiglu_limit_layer(cap_logger) -> None:
-    """Switch on but layer needs swiglu_limit => no pack built (feature parity).
+def test_stash_allows_swiglu_limit_layer(cap_logger) -> None:
+    """Switch on + swiglu_limit set => pack IS built (kernel supports the clamp).
 
-    The fused kernel implements a plain ``silu(gate)*up`` epilogue with no
-    swiglu clamp, so a layer carrying a positive ``swiglu_limit`` must NOT build
-    the fused pack (it would be numerically wrong) — and must not hold the extra
-    raw-weight copy alive. The TurboMind per-operator path is used instead.
+    The fused kernel now applies the DeepSeek-V4 ``swiglu_limit`` clamp on chip,
+    so a layer carrying a positive ``swiglu_limit`` must still build the fused
+    pack (the limit is forwarded to the kernel, not a disable condition).
     """
     method = _make_method()
     layer = _make_mxfp4_layer()
@@ -282,10 +281,9 @@ def test_stash_skipped_for_swiglu_limit_layer(cap_logger) -> None:
     with mock.patch.object(sm70_mxfp4_moe.envs, "VLLM_SM70_FUSED_MOE", True):
         method._maybe_stash_sm70_mxfp4_weights(layer)
 
-    assert layer.sm70_fused_quant_params is None
-    assert layer.sm70_fused_experts is None
-    # No extra raw-weight copy stashed (memory-safety).
-    assert not hasattr(layer, "sm70_mxfp4_w13_weight")
+    assert isinstance(layer.sm70_fused_quant_params, SM70MXFP4QuantParams)
+    assert isinstance(layer.sm70_fused_experts, SM70FusedMoEExperts)
+    assert hasattr(layer, "sm70_mxfp4_w13_weight")
 
 
 def test_stash_skipped_for_biased_layer() -> None:
@@ -302,12 +300,12 @@ def test_stash_skipped_for_biased_layer() -> None:
     assert not hasattr(layer, "sm70_mxfp4_w13_weight")
 
 
-def test_fallback_when_swiglu_limit_present(cap_logger) -> None:
-    """Runtime guard: a swiglu_limit on the layer => fall back, log once."""
+def test_fallback_when_expert_bias_present(cap_logger) -> None:
+    """Runtime guard: an expert bias on the layer => fall back, log once."""
     method = _make_method()
     experts = _StubExperts(layout="contiguous")
     layer = _make_layer(experts, enabled=True, fusion_level=SM70FusionLevel.L2)
-    layer.swiglu_limit = 10.0
+    layer.w13_bias = torch.zeros((2, 128), dtype=torch.float16)
     x = torch.zeros((32, 512), dtype=torch.float16)
     tw = torch.zeros((32, 2), dtype=torch.float16)
     ti = torch.zeros((32, 2), dtype=torch.int64)
@@ -320,9 +318,8 @@ def test_fallback_when_swiglu_limit_present(cap_logger) -> None:
         out = method._maybe_apply_sm70_fused(layer, x, tw, ti)
 
     assert out is None
-    assert experts.forward_called is False
     w = _warnings(cap_logger)
-    assert len(w) == 1 and "swiglu_limit" in w[0].getMessage()
+    assert len(w) == 1 and "expert bias" in w[0].getMessage()
 
 
 def test_stash_survives_turbomind_delete_via_from_layer() -> None:
@@ -395,79 +392,43 @@ def test_fallback_when_shape_unsupported(cap_logger) -> None:
     assert len(w) == 1 and "unsupported shape" in w[0].getMessage()
 
 
-def test_fallback_when_graph_capturing(cap_logger) -> None:
-    """An active CUDA-graph capture => fall back (contiguous layout not replay-safe)."""
+def test_fused_path_runs_under_graph_capture() -> None:
+    """An active CUDA-graph capture still takes the fused path (capture-safe).
+
+    The fused mega-kernel now runs inside the persistent-buffer flow
+    (``_apply_sm70_fused_buffered``: moe_permute -> fused op -> moe_unpermute,
+    all on pre-allocated buffers + device-side offsets), so it is CUDA-graph
+    replayable and is NOT rejected while capturing. We stub the buffered helper
+    and assert it is invoked even with capture in progress.
+    """
     method = _make_method()
     experts = _StubExperts(layout="contiguous", capturing=True)
     layer = _make_layer(experts, enabled=True, fusion_level=SM70FusionLevel.L2)
-    x = torch.zeros((4, 512), dtype=torch.float16)  # small batch -> decode
+    x = torch.zeros((4, 512), dtype=torch.float16)
     tw = torch.zeros((4, 2), dtype=torch.float16)
     ti = torch.zeros((4, 2), dtype=torch.int64)
+    sentinel = torch.full((4, 512), 2.0, dtype=torch.float16)
 
-    with mock.patch.object(
-        sm70_mxfp4_moe,
-        "sm70_fused_support",
-        return_value=SM70FusedSupport(enabled=True, reason=None),
+    with (
+        mock.patch.object(
+            sm70_mxfp4_moe,
+            "sm70_fused_support",
+            return_value=SM70FusedSupport(enabled=True, reason=None),
+        ),
+        mock.patch.object(
+            Mxfp4SM70MoEMethod,
+            "_apply_sm70_fused_buffered",
+            return_value=sentinel,
+        ) as buffered,
     ):
         out = method._maybe_apply_sm70_fused(layer, x, tw, ti)
 
-    assert out is None
-    assert experts.forward_called is False
-    w = _warnings(cap_logger)
-    assert len(w) == 1 and "CUDA graph capture" in w[0].getMessage()
-
-
-def test_eager_decode_takes_fused_path() -> None:
-    """Eager decode (small M, not capturing) => fused experts.forward is used.
-
-    The fused CUDA mega-kernel consumes the contiguous layout, which is safe for
-    eager decode as well as prefill — only an active graph capture is rejected.
-    A small (decode-sized) batch with no capture in progress must therefore run
-    the fused path, not fall back.
-    """
-    method = _make_method()
-    experts = _StubExperts(layout="masked", capturing=False)  # decode-sized M
-    layer = _make_layer(experts, enabled=True, fusion_level=SM70FusionLevel.L2)
-    x = torch.zeros((4, 512), dtype=torch.float16)  # small batch -> decode
-    tw = torch.zeros((4, 2), dtype=torch.float16)
-    ti = torch.zeros((4, 2), dtype=torch.int64)
-
-    with mock.patch.object(
-        sm70_mxfp4_moe,
-        "sm70_fused_support",
-        return_value=SM70FusedSupport(enabled=True, reason=None),
-    ):
-        out = method._maybe_apply_sm70_fused(layer, x, tw, ti)
-
-    assert out is not None
-    assert experts.forward_called is True
-    assert out.shape == (4, 512)
+    buffered.assert_called_once()
+    assert torch.equal(out, sentinel)
 
 
 def test_fallback_on_runtime_error(cap_logger) -> None:
-    """Any runtime error from the fused experts => fall back, log once."""
-    method = _make_method()
-    experts = _StubExperts(layout="contiguous", raise_on_forward=True)
-    layer = _make_layer(experts, enabled=True, fusion_level=SM70FusionLevel.L2)
-    x = torch.zeros((32, 512), dtype=torch.float16)
-    tw = torch.zeros((32, 2), dtype=torch.float16)
-    ti = torch.zeros((32, 2), dtype=torch.int64)
-
-    with mock.patch.object(
-        sm70_mxfp4_moe,
-        "sm70_fused_support",
-        return_value=SM70FusedSupport(enabled=True, reason=None),
-    ):
-        out = method._maybe_apply_sm70_fused(layer, x, tw, ti)
-
-    assert out is None
-    assert experts.forward_called is True
-    w = _warnings(cap_logger)
-    assert len(w) == 1 and "runtime error" in w[0].getMessage()
-
-
-def test_fused_path_taken_on_success() -> None:
-    """Happy path: gate ok + contiguous layout => fused experts.forward used."""
+    """Any runtime error from the buffered fused path => fall back, log once."""
     method = _make_method()
     experts = _StubExperts(layout="contiguous")
     layer = _make_layer(experts, enabled=True, fusion_level=SM70FusionLevel.L2)
@@ -475,13 +436,48 @@ def test_fused_path_taken_on_success() -> None:
     tw = torch.zeros((32, 2), dtype=torch.float16)
     ti = torch.zeros((32, 2), dtype=torch.int64)
 
-    with mock.patch.object(
-        sm70_mxfp4_moe,
-        "sm70_fused_support",
-        return_value=SM70FusedSupport(enabled=True, reason=None),
+    with (
+        mock.patch.object(
+            sm70_mxfp4_moe,
+            "sm70_fused_support",
+            return_value=SM70FusedSupport(enabled=True, reason=None),
+        ),
+        mock.patch.object(
+            Mxfp4SM70MoEMethod,
+            "_apply_sm70_fused_buffered",
+            side_effect=RuntimeError("boom: fused kernel unavailable"),
+        ),
     ):
         out = method._maybe_apply_sm70_fused(layer, x, tw, ti)
 
-    assert out is not None
-    assert experts.forward_called is True
-    assert out.shape == (32, 512)
+    assert out is None
+    w = _warnings(cap_logger)
+    assert len(w) == 1 and "runtime error" in w[0].getMessage()
+
+
+def test_fused_path_taken_on_success() -> None:
+    """Happy path: gate ok + shape ok => the buffered fused path is used."""
+    method = _make_method()
+    experts = _StubExperts(layout="contiguous")
+    layer = _make_layer(experts, enabled=True, fusion_level=SM70FusionLevel.L2)
+    x = torch.zeros((32, 512), dtype=torch.float16)
+    tw = torch.zeros((32, 2), dtype=torch.float16)
+    ti = torch.zeros((32, 2), dtype=torch.int64)
+    sentinel = torch.full((32, 512), 3.0, dtype=torch.float16)
+
+    with (
+        mock.patch.object(
+            sm70_mxfp4_moe,
+            "sm70_fused_support",
+            return_value=SM70FusedSupport(enabled=True, reason=None),
+        ),
+        mock.patch.object(
+            Mxfp4SM70MoEMethod,
+            "_apply_sm70_fused_buffered",
+            return_value=sentinel,
+        ) as buffered,
+    ):
+        out = method._maybe_apply_sm70_fused(layer, x, tw, ti)
+
+    buffered.assert_called_once()
+    assert torch.equal(out, sentinel)

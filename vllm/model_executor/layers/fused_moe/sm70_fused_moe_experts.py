@@ -235,21 +235,34 @@ def _unpack_natural_k(packed: torch.Tensor) -> torch.Tensor:
     return codes.reshape(n, k_packed * _PACK_FACTOR)
 
 
-def _silu_and_mul(gate_up: torch.Tensor) -> torch.Tensor:
+def _silu_and_mul(
+    gate_up: torch.Tensor, swiglu_limit: float = 0.0
+) -> torch.Tensor:
     """Compute ``silu(gate) * up`` for a ``[..., 2 * I]`` tensor.
 
     Mirrors the SwiGLU (``kGatedSilu``) semantics used by the reference path
     (:func:`sm70_moe_reference`) and the fused kernel epilogue: ``silu`` applied
     to the first half (gate) multiplied element-wise by the second half (up).
-    Reuses the compiled ``torch.ops._C.silu_and_mul`` op when available on CUDA
-    (the exact op the production path uses) and falls back to the torch-native
-    equivalent otherwise, so it stays importable/runnable without a built
-    extension. The computation runs in the input dtype (fp16 for this path).
+
+    When ``swiglu_limit > 0`` the DeepSeek-V4 style SwiGLU clamp is applied
+    BEFORE silu/mul (matching ``swiglu_limit_func`` / the kernel epilogue):
+    ``gate = min(gate, limit)`` and ``up = clamp(up, -limit, +limit)``. With
+    ``swiglu_limit <= 0`` (the default) it reduces to plain ``silu(gate)*up``
+    and reuses the compiled ``torch.ops._C.silu_and_mul`` op when available on
+    CUDA (the exact op the production path uses), falling back to the
+    torch-native equivalent otherwise. The computation runs in the input dtype
+    (fp16 for this path).
     """
     assert gate_up.shape[-1] % 2 == 0, (
         f"silu_and_mul expects an even last dim, got {gate_up.shape[-1]}"
     )
     d = gate_up.shape[-1] // 2
+
+    if swiglu_limit and swiglu_limit > 0:
+        # Clamp gate/up to the limit (DeepSeek-V4 SwiGLU limit), then silu*mul.
+        gate = torch.clamp(gate_up[..., :d], max=swiglu_limit)
+        up = torch.clamp(gate_up[..., d:], min=-swiglu_limit, max=swiglu_limit)
+        return torch.nn.functional.silu(gate) * up
 
     c_op = getattr(getattr(torch.ops, "_C", None), "silu_and_mul", None)
     if c_op is not None and gate_up.is_cuda:
@@ -1069,6 +1082,7 @@ class SM70FusedMoEExperts:
         i_block: int = 64,
         fusion_level: SM70FusionLevel | None = None,
         is_graph_capturing: bool | None = None,
+        swiglu_limit: float = 0.0,
     ) -> torch.Tensor:
         """Run the fused MoE forward and return ``[num_tokens, hidden]`` fp16.
 
@@ -1150,7 +1164,8 @@ class SM70FusedMoEExperts:
             # fused CUDA mega-kernel consumes the contiguous layout only, so the
             # masked path uses the per-operator (dense fp16) realization.
             return self._forward_masked(
-                x, topk_weights, topk_ids, quant=quant
+                x, topk_weights, topk_ids, quant=quant,
+                swiglu_limit=swiglu_limit,
             )
 
         # 1. Grouped/contiguous layout (reuses moe_permute, m_block aligned).
@@ -1163,7 +1178,8 @@ class SM70FusedMoEExperts:
         # 2. Expert FFN over the contiguous layout, dispatched by fusion level.
         if level in self._PER_OPERATOR_LEVELS:
             sorted_out = self._experts_per_operator(
-                layout_out.permuted_input, expert_offsets64, quant, level
+                layout_out.permuted_input, expert_offsets64, quant, level,
+                swiglu_limit=swiglu_limit,
             )
         elif level in self._FUSED_KERNEL_LEVELS:
             sorted_out = self._experts_fused_kernel(
@@ -1172,6 +1188,7 @@ class SM70FusedMoEExperts:
                 quant,
                 m_block,
                 i_block,
+                swiglu_limit=swiglu_limit,
             )
         else:  # pragma: no cover - guarded by the isinstance check above.
             raise ValueError(f"unhandled fusion level {level!r}")
@@ -1205,6 +1222,7 @@ class SM70FusedMoEExperts:
         topk_ids: torch.Tensor,
         *,
         quant: "SM70MXFP4QuantParams | SM70QuantParams",
+        swiglu_limit: float = 0.0,
     ) -> torch.Tensor:
         """Decode / CUDA-graph masked-layout MoE forward (R2.7, Property 5).
 
@@ -1265,7 +1283,7 @@ class SM70FusedMoEExperts:
                 continue
             inp = batched_input[e, :rows]  # [rows, K] fp16
             gate_up = inp @ w1[e].transpose(0, 1)  # linear1 -> [rows, 2*I]
-            h = _silu_and_mul(gate_up)  # SwiGLU -> [rows, I]
+            h = _silu_and_mul(gate_up, swiglu_limit)  # SwiGLU -> [rows, I]
             expert_out = h @ w2[e].transpose(0, 1)  # linear2 -> [rows, K]
             expert_out = expert_out[:, :hidden_logical]
 
@@ -1298,6 +1316,7 @@ class SM70FusedMoEExperts:
         quant: "SM70MXFP4QuantParams | SM70QuantParams",
         m_block: int,
         i_block: int,
+        swiglu_limit: float = 0.0,
     ) -> torch.Tensor:
         """L2/L3: single fused mega-kernel ``linear1 -> SwiGLU -> linear2``.
 
@@ -1345,6 +1364,7 @@ class SM70FusedMoEExperts:
                 quant.group_size,
                 m_block,
                 i_block,
+                swiglu_limit,
             )
         else:
             # Legacy AWQ int4 pack: four FusedStridedPtr arrays (out of scope;
@@ -1363,6 +1383,7 @@ class SM70FusedMoEExperts:
                 quant.group_size,
                 m_block,
                 i_block,
+                swiglu_limit,
             )
         return sorted_out
 
@@ -1372,6 +1393,7 @@ class SM70FusedMoEExperts:
         expert_offsets64: torch.Tensor,
         quant: "SM70MXFP4QuantParams | SM70QuantParams",
         level: SM70FusionLevel,
+        swiglu_limit: float = 0.0,
     ) -> torch.Tensor:
         """L0/L1: per-operator FFN over the grouped layout (dense fp16).
 
@@ -1420,12 +1442,12 @@ class SM70FusedMoEExperts:
             if level is SM70FusionLevel.L0:
                 # Baseline: three independent steps, both intermediates named.
                 gate_up = seg @ w1[e].transpose(0, 1)  # linear1 -> [n, 2*I]
-                h = _silu_and_mul(gate_up)  # SiluAndMul -> [n, I]
+                h = _silu_and_mul(gate_up, swiglu_limit)  # SiluAndMul -> [n, I]
                 out[start:end] = h @ w2[e].transpose(0, 1)  # linear2 -> [n, K]
             else:  # SM70FusionLevel.L1
                 # linear1 + SwiGLU epilogue fused: gate_up is a transient that is
                 # consumed immediately, dropping the Python-level [n, 2*I]
                 # intermediate materialization (buffer reuse).
-                h = _silu_and_mul(seg @ w1[e].transpose(0, 1))  # [n, I]
+                h = _silu_and_mul(seg @ w1[e].transpose(0, 1), swiglu_limit)  # [n, I]
                 out[start:end] = h @ w2[e].transpose(0, 1)  # [n, K]
         return out

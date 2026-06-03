@@ -1328,6 +1328,7 @@ def sm70_fused_moe_out(
     group_size: int,
     m_block: int,
     i_block: int,
+    swiglu_limit: float = 0.0,
 ) -> None:
     torch.ops._C.sm70_fused_moe_out(
         out,
@@ -1343,6 +1344,7 @@ def sm70_fused_moe_out(
         group_size,
         m_block,
         i_block,
+        swiglu_limit,
     )
 
 
@@ -1363,6 +1365,7 @@ if hasattr(torch.ops._C, "sm70_fused_moe_out"):
         group_size: int,
         m_block: int,
         i_block: int,
+        swiglu_limit: float = 0.0,
     ) -> None:
         return None
 

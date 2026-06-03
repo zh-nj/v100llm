@@ -196,6 +196,12 @@ def _iter_unique_moe_layers(model: torch.nn.Module) -> Iterable[torch.nn.Module]
             continue
         if getattr(layer, "_sm70_fp8_moe_direct_prepared", False):
             continue
+        # SM70 fused MoE layers consume the raw MXFP4 weights via a single fused
+        # mega-kernel and have NO TurboMind weights / strided pointers to warm
+        # up (those were freed to save HBM). Skip them here — the fused kernel
+        # needs no grouped-GEMM warmup.
+        if getattr(layer, "sm70_fused_experts", None) is not None:
+            continue
         group_size = _group_size_from_tm_scales(
             int(layer.sm70_w13_k_dim), layer.w13_tm_scales[0]
         )
