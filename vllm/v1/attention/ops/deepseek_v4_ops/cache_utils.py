@@ -18,6 +18,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+from .fused_indexer_q import _sm70_fp32_to_fp8e4m3_u8
+
 
 def _should_use_torch_fp8_cache_fallback(k_cache: torch.Tensor) -> bool:
     if not k_cache.is_cuda:
@@ -250,29 +252,7 @@ def quantize_and_insert_k_kernel(
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
             if USE_SM70_FP8_ENCODE:
-                # SM70: manual FP8 e4m3fn encode via fp16 bit manipulation
-                x_f16_bits = x_clamped.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32)
-                fp16_sign = (x_f16_bits >> 15) & 1
-                fp16_exp = (x_f16_bits >> 10) & 0x1F
-                fp16_mant = x_f16_bits & 0x3FF
-                exp_fp8 = fp16_exp - 8
-                mant_fp8 = (fp16_mant >> 7) & 0x7
-                round_bit = (fp16_mant >> 6) & 1
-                sticky = fp16_mant & 0x3F
-                do_round = round_bit & (sticky | (mant_fp8 & 1))
-                mant_fp8 = mant_fp8 + do_round
-                carry = mant_fp8 > 7
-                mant_fp8 = tl.where(carry, 0, mant_fp8)
-                exp_fp8 = tl.where(carry, exp_fp8 + 1, exp_fp8)
-                is_max_exceeded = (exp_fp8 == 15) & (mant_fp8 > 6)
-                mant_fp8 = tl.where(is_max_exceeded, 6, mant_fp8)
-                is_overflow = exp_fp8 > 15
-                exp_fp8 = tl.where(is_overflow, 15, exp_fp8)
-                mant_fp8 = tl.where(is_overflow, 6, mant_fp8)
-                is_underflow = (exp_fp8 <= 0) | (fp16_exp == 0)
-                exp_fp8 = tl.where(is_underflow, 0, exp_fp8)
-                mant_fp8 = tl.where(is_underflow, 0, mant_fp8)
-                x_uint8 = ((fp16_sign << 7) | (exp_fp8 << 3) | mant_fp8).to(tl.uint8)
+                x_uint8 = _sm70_fp32_to_fp8e4m3_u8(x_clamped)
             else:
                 # SM80+: native FP8 conversion
                 x_fp8 = x_clamped.to(tl.float8e4nv)

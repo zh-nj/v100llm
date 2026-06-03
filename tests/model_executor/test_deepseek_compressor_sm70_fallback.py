@@ -10,7 +10,10 @@ from vllm.model_executor.layers.deepseek_compressor import (
     _normalize_sm70_fp8_cache_exponents,
     _torch_fused_compress_norm_rope_insert_fp8_fallback,
 )
-
+from vllm.triton_utils import triton
+from vllm.v1.attention.ops.deepseek_v4_ops.fused_compress_quant_cache import (
+    _fused_kv_compress_norm_rope_insert_sparse_attn,
+)
 
 FP8_MAX = 448.0
 
@@ -122,6 +125,29 @@ def _decode_sparse_attention_cache(
     )
 
 
+def _expected_sparse_attention_cache_bytes(
+    expected: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    expected_nope = expected[:448].to(torch.bfloat16).float()
+    expected_rope = (
+        expected[448:].to(torch.bfloat16).contiguous().view(torch.uint8).view(-1)
+    )
+    blocks = expected_nope.view(7, 64)
+    absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+    exponents = torch.ceil(torch.log2(absmax / FP8_MAX))
+    scales = torch.exp2(exponents)
+    fp8_bytes = (
+        (blocks / scales)
+        .clamp(-FP8_MAX, FP8_MAX)
+        .to(torch.float8_e4m3fn)
+        .contiguous()
+        .view(torch.uint8)
+        .view(-1)
+    )
+    scale_bytes = (exponents.flatten() + 127.0).clamp(0, 255).to(torch.uint8)
+    return fp8_bytes, expected_rope, scale_bytes
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_sm70_compressor_fp8_indexer_fallback_writes_quantized_cache() -> None:
     device = "cuda"
@@ -203,7 +229,8 @@ def test_sm70_compressor_fp8_indexer_fallback_writes_quantized_cache() -> None:
             compress_ratio,
             True,
             rope_head_dim,
-        ).to(torch.bfloat16).float()
+        )
+        expected = expected.to(torch.bfloat16).float()
         expected_scale = 2.0**math.ceil(
             math.log2(max(expected.abs().max().item(), 1e-4) / FP8_MAX))
 
@@ -311,3 +338,114 @@ def test_sm70_compressor_sparse_attention_fallback_writes_flashmla_cache(
 
     cache_2d = kv_cache.reshape(kv_cache.shape[0], -1)
     assert torch.all(cache_2d[0, :token_stride] == 0x7B)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_sm70_compressor_sparse_attention_triton_matches_reference_cache_bytes(
+) -> None:
+    if torch.cuda.get_device_capability()[0] != 7:
+        pytest.skip("SM70 parity test")
+
+    device = "cuda"
+    torch.manual_seed(123)
+    head_size = 512
+    rope_head_dim = 64
+    compress_ratio = 4
+    block_size = 4
+    state_width = 2 * head_size
+    num_tokens = 8
+    num_blocks = 3
+    token_stride = 576
+    scale_dim = 8
+
+    state_cache = torch.randn(
+        num_blocks,
+        block_size,
+        2 * state_width,
+        dtype=torch.float32,
+        device=device,
+    )
+    token_to_req_indices = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    block_table = torch.arange(num_blocks, dtype=torch.int32,
+                               device=device).unsqueeze(0)
+    norm_weight = torch.randn(head_size, dtype=torch.float32, device=device)
+    cos_sin_cache = torch.randn(32, rope_head_dim, dtype=torch.float32,
+                                device=device)
+    kv_cache = torch.full(
+        (num_blocks, block_size, 584),
+        0x7B,
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    _fused_kv_compress_norm_rope_insert_sparse_attn[(num_tokens,)](
+        state_cache,
+        state_cache.stride(0),
+        state_cache.stride(1),
+        token_to_req_indices,
+        positions,
+        slot_mapping,
+        block_table,
+        block_table.stride(0),
+        block_size,
+        norm_weight,
+        1e-6,
+        cos_sin_cache,
+        cos_sin_cache.stride(0),
+        kv_cache,
+        slot_mapping,
+        kv_cache.shape[1],
+        HEAD_SIZE=head_size,
+        TRITON_BLOCK_SIZE=triton.next_power_of_2(head_size),
+        STATE_WIDTH=state_width,
+        COMPRESS_RATIO=compress_ratio,
+        OVERLAP=True,
+        ROPE_HEAD_DIM=rope_head_dim,
+        FP8_MAX=FP8_MAX,
+        QUANT_BLOCK=64,
+        TOKEN_STRIDE=token_stride,
+        SCALE_DIM=scale_dim,
+        KV_BLOCK_STRIDE=kv_cache.stride(0),
+        num_warps=4,
+        launch_pdl=False,
+    )
+    torch.cuda.synchronize()
+
+    cache_2d = kv_cache.reshape(kv_cache.shape[0], -1)
+    for token_idx in (3, 7):
+        expected = _boundary_reference(
+            state_cache,
+            token_idx,
+            token_to_req_indices,
+            positions,
+            block_table,
+            block_size,
+            norm_weight,
+            1e-6,
+            cos_sin_cache,
+            head_size,
+            state_width,
+            compress_ratio,
+            True,
+            rope_head_dim,
+        )
+        fp8_bytes, rope_bytes, scale_bytes = _expected_sparse_attention_cache_bytes(
+            expected
+        )
+
+        slot = int(slot_mapping[token_idx].item())
+        block_idx = slot // block_size
+        pos_in_block = slot % block_size
+        data_offset = pos_in_block * token_stride
+        scale_offset = block_size * token_stride + pos_in_block * scale_dim
+        actual_fp8 = cache_2d[block_idx, data_offset:data_offset + 448]
+        actual_rope = cache_2d[
+            block_idx, data_offset + 448:data_offset + token_stride
+        ]
+        actual_scales = cache_2d[block_idx, scale_offset:scale_offset + 7]
+
+        torch.testing.assert_close(actual_fp8, fp8_bytes)
+        torch.testing.assert_close(actual_rope, rope_bytes)
+        torch.testing.assert_close(actual_scales, scale_bytes)

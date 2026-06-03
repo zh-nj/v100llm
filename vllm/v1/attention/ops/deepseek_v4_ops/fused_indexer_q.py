@@ -80,30 +80,64 @@ def _quantize_mxfp4_pair(x_lo, x_hi):
 
 
 @triton.jit
+def _round_shift_right_even_i32(value, shift):
+    """Round ``value / 2**shift`` to nearest-even using integer arithmetic."""
+    quotient = value >> shift
+    remainder = value - (quotient << shift)
+    one = tl.full((), 1, tl.int32)
+    half = one << (shift - 1)
+    round_up = (remainder > half) | ((remainder == half) & ((quotient & 1) == 1))
+    return quotient + round_up.to(tl.int32)
+
+
+@triton.jit
 def _sm70_fp32_to_fp8e4m3_u8(x):
-    """Convert float32 values to FP8 e4m3fn encoded as uint8 (SM70 compatible)."""
-    x_f16_bits = x.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32)
-    fp16_sign = (x_f16_bits >> 15) & 1
-    fp16_exp = (x_f16_bits >> 10) & 0x1F
-    fp16_mant = x_f16_bits & 0x3FF
-    exp_fp8 = fp16_exp - 8
-    mant_fp8 = (fp16_mant >> 7) & 0x7
-    round_bit = (fp16_mant >> 6) & 1
-    sticky = fp16_mant & 0x3F
-    do_round = round_bit & (sticky | (mant_fp8 & 1))
-    mant_fp8 = mant_fp8 + do_round
-    carry = mant_fp8 > 7
-    mant_fp8 = tl.where(carry, 0, mant_fp8)
-    exp_fp8 = tl.where(carry, exp_fp8 + 1, exp_fp8)
-    is_max_exceeded = (exp_fp8 == 15) & (mant_fp8 > 6)
-    mant_fp8 = tl.where(is_max_exceeded, 6, mant_fp8)
-    is_overflow = exp_fp8 > 15
-    exp_fp8 = tl.where(is_overflow, 15, exp_fp8)
-    mant_fp8 = tl.where(is_overflow, 6, mant_fp8)
-    is_underflow = (exp_fp8 <= 0) | (fp16_exp == 0)
-    exp_fp8 = tl.where(is_underflow, 0, exp_fp8)
-    mant_fp8 = tl.where(is_underflow, 0, mant_fp8)
-    return ((fp16_sign << 7) | (exp_fp8 << 3) | mant_fp8).to(tl.uint8)
+    """Convert fp32 directly to torch.float8_e4m3fn-compatible bytes.
+
+    Upstream V4 kernels quantize from fp32 (after any explicit bf16
+    roundtrip) with ``tl.float8e4nv``.  SM70 cannot emit that conversion, so
+    reproduce e4m3fn round-to-nearest-even in integer code without an
+    intermediate fp16 rounding step.
+    """
+    x_bits = x.to(tl.int32, bitcast=True)
+    sign = (x_bits >> 31) & 1
+    abs_bits = x_bits & 0x7FFFFFFF
+    abs_x = abs_bits.to(tl.float32, bitcast=True)
+    abs_x = tl.minimum(abs_x, 448.0)
+
+    fp32_exp = (abs_bits >> 23) & 0xFF
+    fp32_mant = abs_bits & 0x7FFFFF
+    exp_unbiased = fp32_exp - 127
+    mant_full = (1 << 23) | fp32_mant
+
+    # Subnormal lattice is k * 2^-9 for k=0..7; k=8 carries to min-normal
+    # exp=1,mant=0. Use fp32 exponent/mantissa bits directly so exact halfway
+    # values round the same way as torch.float8_e4m3fn / tl.float8e4nv.
+    sub_can_round = (fp32_exp != 0) & (exp_unbiased >= -10)
+    sub_shift = 14 - exp_unbiased
+    sub_shift = tl.minimum(tl.maximum(sub_shift, 1), 30)
+    sub_k = _round_shift_right_even_i32(mant_full, sub_shift)
+    sub_k = tl.where(sub_can_round, sub_k, 0)
+    sub_k = tl.minimum(tl.maximum(sub_k, 0), 8)
+    sub_exp = tl.where(sub_k == 8, 1, 0)
+    sub_mant = tl.where(sub_k == 8, 0, sub_k)
+
+    normal_mant = _round_shift_right_even_i32(fp32_mant, 20)
+    carry = normal_mant >= 8
+    normal_mant = tl.where(carry, 0, normal_mant)
+    normal_exp = exp_unbiased + 7 + carry.to(tl.int32)
+
+    too_large = (normal_exp > 15) | ((normal_exp == 15) & (normal_mant > 6))
+    normal_exp = tl.where(too_large, 15, normal_exp)
+    normal_mant = tl.where(too_large, 6, normal_mant)
+
+    use_sub = abs_x < 0.015625
+    exp_fp8 = tl.where(use_sub, sub_exp, normal_exp)
+    mant_fp8 = tl.where(use_sub, sub_mant, normal_mant)
+    is_zero = abs_x == 0.0
+    exp_fp8 = tl.where(is_zero, 0, exp_fp8)
+    mant_fp8 = tl.where(is_zero, 0, mant_fp8)
+    return ((sign << 7) | (exp_fp8 << 3) | mant_fp8).to(tl.uint8)
 
 
 @triton.jit
@@ -174,14 +208,14 @@ def _fused_indexer_q_rope_quant_kernel(
     r_even = x_even * cos - x_odd * sin
     r_odd = x_odd * cos + x_even * sin
 
-    # Match reference numerics: fp32 → bf16 → fp32 before the ue8m0 absmax.
-    # Same pattern as the K-side compressor kernel (fused_compress_quant_cache.py).
+    # Match the upstream vLLM reference numerics: fp32 -> bf16 -> fp32 before
+    # the ue8m0 absmax. The leading NoPE dimensions are passed through raw.
     r_even = r_even.to(tl.bfloat16).to(tl.float32)
     r_odd = r_odd.to(tl.bfloat16).to(tl.float32)
 
     amax = tl.maximum(tl.max(tl.abs(r_even)), tl.max(tl.abs(r_odd)))
     if INDEX_Q_NOPE_DIM > 0:
-        NOPE_PAD: tl.constexpr = INDEX_Q_HEAD_DIM  # power-of-2 superset
+        NOPE_PAD: tl.constexpr = INDEX_Q_HEAD_DIM
         nope_offset = tl.arange(0, NOPE_PAD)
         nope_mask = nope_offset < INDEX_Q_NOPE_DIM
         x_nope = tl.load(base_ptr + nope_offset, mask=nope_mask, other=0.0).to(tl.float32)
@@ -193,21 +227,14 @@ def _fused_indexer_q_rope_quant_kernel(
     fp8_base_ptr = (
         index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
     )
-    if INDEX_Q_NOPE_DIM > 0:
-        if USE_SM70_FP8_ENCODE:
+    fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
+    if USE_SM70_FP8_ENCODE:
+        if INDEX_Q_NOPE_DIM > 0:
             tl.store(
                 fp8_base_ptr + nope_offset,
                 _sm70_fp32_to_fp8e4m3_u8(tl.div_rn(x_nope, index_q_scale)),
                 mask=nope_mask,
             )
-        else:
-            tl.store(
-                fp8_base_ptr + nope_offset,
-                tl.div_rn(x_nope, index_q_scale).to(tl.float8e4nv),
-                mask=nope_mask,
-            )
-    fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
-    if USE_SM70_FP8_ENCODE:
         tl.store(
             fp8_rot_base + half_offset * 2,
             _sm70_fp32_to_fp8e4m3_u8(tl.div_rn(r_even, index_q_scale)),
@@ -217,6 +244,12 @@ def _fused_indexer_q_rope_quant_kernel(
             _sm70_fp32_to_fp8e4m3_u8(tl.div_rn(r_odd, index_q_scale)),
         )
     else:
+        if INDEX_Q_NOPE_DIM > 0:
+            tl.store(
+                fp8_base_ptr + nope_offset,
+                tl.div_rn(x_nope, index_q_scale).to(tl.float8e4nv),
+                mask=nope_mask,
+            )
         tl.store(
             fp8_rot_base + half_offset * 2,
             tl.div_rn(r_even, index_q_scale).to(tl.float8e4nv),

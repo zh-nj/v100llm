@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit test for fused_indexer_q_rope_quant.
 
-Compares the fused Triton kernel against the unfused reference flow used by
-the DeepseekV4 indexer in model_tracking:
+Compares the fused Triton kernel against the upstream vLLM indexer flow:
     q_rot = ops.rotary_embedding(positions, q, None, head_dim, cos_sin_cache,
                                  is_neox_style=False,
                                  rope_dim_offset=head_dim - rope_dim)
@@ -98,6 +97,11 @@ def _torch_reference(
 @pytest.mark.parametrize("cache_dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
 def test_fused_indexer_q_rope_quant_matches_unfused(num_tokens, cache_dtype):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability()[0] != 7:
+        pytest.skip("this DeepSeek V4 indexer regression target is SM70-only")
+
     device = "cuda"
     torch.manual_seed(0)
 
@@ -117,12 +121,14 @@ def test_fused_indexer_q_rope_quant_matches_unfused(num_tokens, cache_dtype):
         positions, q.clone(), cos_sin_cache, weights, softmax_scale, head_scale
     )
 
-    # fp8 tensors aren't directly comparable via torch.equal — reinterpret as int8.
+    # SM70 uses a manual FP8 encoder. It is numerically exact, but PyTorch's
+    # fp8 cast may preserve negative-zero sign bits differently.
     ref_bits = q_fp8_ref.view(torch.int8)
     fused_bits = q_fp8_fused.view(torch.int8)
-    assert torch.equal(ref_bits, fused_bits), (
-        f"q_fp8 mismatch: "
-        f"{(ref_bits != fused_bits).sum().item()} / {ref_bits.numel()} bytes differ"
+    bit_mismatch = ref_bits != fused_bits
+    assert torch.equal(q_fp8_ref.float(), q_fp8_fused.float()), (
+        f"q_fp8 value mismatch: "
+        f"{bit_mismatch.sum().item()} / {ref_bits.numel()} bytes differ"
     )
 
     assert torch.equal(weights_ref, weights_fused), (
@@ -155,5 +161,37 @@ def test_sm70_fallback_matches_torch_reference():
         positions, q, cos_sin_cache, weights, softmax_scale, head_scale
     )
 
-    assert torch.equal(q_fp8_ref.view(torch.int8), q_fp8_fused.view(torch.int8))
+    assert torch.equal(q_fp8_ref.float(), q_fp8_fused.float())
     torch.testing.assert_close(weights_fused, weights_ref, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_sm70_fp8_encoder_tie_cases_match_torch_reference_nope():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for SM70 fallback coverage")
+    if torch.cuda.get_device_capability()[0] >= 8:
+        pytest.skip("SM70 fallback coverage requires a pre-Ampere CUDA device")
+
+    device = "cuda"
+    q = torch.zeros(1, N_HEAD, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    # Keep these in the NoPE prefix so the test isolates FP8 encoding from
+    # RoPE FMA ordering. With q[..., 2] = 448, the UE8M0 scale is exactly 1.
+    q[0, 0, 0] = 1.0625  # tie between 1.0 and 1.125 -> even mantissa 1.0
+    q[0, 0, 1] = 0.0029296875  # tie between subnormals 1 and 2 -> even 2
+    q[0, 0, 2] = 448.0
+    positions = torch.zeros(1, dtype=torch.int64, device=device)
+    cos_sin_cache = torch.zeros(MAX_POS, ROPE_DIM, dtype=torch.float32,
+                                device=device)
+    weights = torch.zeros(1, N_HEAD, dtype=torch.bfloat16, device=device)
+
+    q_fp8_ref, _ = _torch_reference(
+        positions, q, cos_sin_cache, weights, HEAD_DIM**-0.5, N_HEAD**-0.5
+    )
+    q_fp8_fused, _ = fused_indexer_q_rope_quant(
+        positions, q, cos_sin_cache, weights, HEAD_DIM**-0.5, N_HEAD**-0.5
+    )
+
+    assert torch.equal(
+        q_fp8_ref[0, 0, :3].view(torch.uint8),
+        q_fp8_fused[0, 0, :3].view(torch.uint8),
+    )

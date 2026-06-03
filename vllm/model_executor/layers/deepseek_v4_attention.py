@@ -49,6 +49,9 @@ from vllm.v1.attention.ops.deepseek_v4_ops import (
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
 )
+from vllm.v1.attention.ops.deepseek_v4_ops.fused_indexer_q import (
+    _sm70_fp32_to_fp8e4m3_u8,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -1348,57 +1351,7 @@ def _encode_fp8_e4m3fn(value):
     Reverse of _decode_fp8_e4m3fn from sm70_mqa_logits.py.
     FP8 e4m3fn: sign(1) | exp(4) | mantissa(3), bias=7, max=448.0
     """
-    # Extract sign
-    val_i32 = value.to(tl.int32, bitcast=True)
-    sign = (val_i32 >> 31) & 1  # 0 or 1
-
-    abs_val = tl.abs(value)
-
-    # Clamp to FP8 e4m3fn max
-    abs_val = tl.minimum(abs_val, 448.0)
-
-    # Handle zero / subnormal boundary
-    # FP8 e4m3fn subnormals: exp=0, mant in [1..7] → values 1*2^-9 .. 7*2^-9
-    # Smallest normal: exp=1, mant=0 → 2^(1-7) = 2^-6 = 0.015625
-    # We use a threshold to decide normal vs subnormal
-    is_zero = abs_val == 0.0
-
-    # For normal values: extract FP32 exponent and mantissa
-    abs_i32 = abs_val.to(tl.int32, bitcast=True)
-    fp32_exp = (abs_i32 >> 23) & 0xFF  # biased FP32 exponent
-    fp32_mant = abs_i32 & 0x7FFFFF  # 23-bit FP32 mantissa
-
-    # FP8 biased exponent = fp32_exp - 127 + 7 = fp32_exp - 120
-    fp8_exp = fp32_exp - 120
-
-    # Round mantissa: FP8 has 3 mantissa bits, FP32 has 23
-    # Shift right by 20, with round-to-nearest-even
-    fp8_mant = (fp32_mant + (1 << 19)) >> 20
-    # Handle mantissa overflow (rounding up can overflow 3 bits)
-    carry = fp8_mant >> 3
-    fp8_exp = fp8_exp + carry
-    fp8_mant = fp8_mant & 0x7
-
-    # Clamp exponent to valid range [1..15] for normal, handle overflow
-    fp8_exp = tl.minimum(fp8_exp, 15)
-
-    # Subnormal path: fp8_exp <= 0
-    # For subnormal: mantissa encodes value / 2^-9
-    # subnorm_mant = round(abs_val / 2^-9) = round(abs_val * 512)
-    subnorm_mant = (abs_val * 512.0 + 0.5).to(tl.int32)
-    subnorm_mant = tl.minimum(subnorm_mant, 7)
-
-    is_subnorm = fp8_exp <= 0
-
-    # Assemble FP8 byte
-    normal_byte = (fp8_exp << 3) | fp8_mant
-    subnorm_byte = subnorm_mant
-    fp8_byte = tl.where(is_subnorm, subnorm_byte, normal_byte)
-    fp8_byte = tl.where(is_zero, 0, fp8_byte)
-
-    # Apply sign
-    fp8_byte = fp8_byte | (sign << 7)
-    return fp8_byte.to(tl.uint8)
+    return _sm70_fp32_to_fp8e4m3_u8(value)
 
 
 @triton.jit
@@ -1554,6 +1507,12 @@ def _sm70_qnorm_rope_kv_insert_triton_kernel(
     # ---- Write RoPE portion as BF16 bytes ----
     # Convert rotated even/odd values to BF16 uint16, then write as uint8 pairs
     rope_u8_base = token_data_base + NOPE_DIM
+
+    # The SM70 fallback runs with fp16 Q/KV tensors. Match the torch reference:
+    # RoPE math is fp32, then the rotated KV tail is materialized at input dtype
+    # before the cache stores it as bf16 bytes.
+    kv_rope_new_even = kv_rope_new_even.to(tl.float16).to(tl.float32)
+    kv_rope_new_odd = kv_rope_new_odd.to(tl.float16).to(tl.float32)
 
     # Convert even values to BF16
     even_u32 = kv_rope_new_even.to(tl.int32, bitcast=True)
@@ -3627,9 +3586,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             if self.compress_ratio == 4:
                 # C4A: local indices differ per layer (filled by Indexer).
                 assert self.topk_indices_buffer is not None
+                local_decode_topk = self.topk_indices_buffer[:num_decode_tokens]
                 with _profile_or_null("decode.compute_global_topk", q):
                     global_indices, topk_lens = compute_global_topk_indices_and_lens(
-                        self.topk_indices_buffer[:num_decode_tokens],
+                        local_decode_topk,
                         swa_metadata.token_to_req_indices,
                         attn_metadata.block_table[:num_decodes],
                         block_size,
@@ -4089,8 +4049,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     "N": int(N),
                 },
             ):
+                topk_slice = topk_indices[query_start:query_end]
                 combined_indices, combined_lens = combine_topk_swa_indices(
-                    topk_indices[query_start:query_end],
+                    topk_slice,
                     query_start_loc[
                         num_decodes + chunk_start : num_decodes + chunk_end + 1
                     ],

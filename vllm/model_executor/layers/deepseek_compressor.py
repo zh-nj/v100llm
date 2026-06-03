@@ -31,6 +31,7 @@ from vllm.v1.attention.ops.deepseek_v4_ops.fused_compress_quant_cache import (
 )
 from vllm.v1.attention.ops.deepseek_v4_ops.fused_indexer_q import (
     MXFP4_BLOCK_SIZE,
+    _sm70_fp32_to_fp8e4m3_u8,
 )
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -594,31 +595,7 @@ def _sm70_fused_compress_norm_rope_insert_fp8_kernel(
         x_scaled = result_bf16 * inv_scale
         x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
 
-        # Manual FP8 e4m3fn encode via fp16 bit manipulation
-        x_f16_bits = (
-            x_clamped.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32)
-        )
-        fp16_sign = (x_f16_bits >> 15) & 1
-        fp16_exp = (x_f16_bits >> 10) & 0x1F
-        fp16_mant = x_f16_bits & 0x3FF
-        exp_fp8 = fp16_exp - 8
-        mant_fp8 = (fp16_mant >> 7) & 0x7
-        round_bit = (fp16_mant >> 6) & 1
-        sticky = fp16_mant & 0x3F
-        do_round = round_bit & (sticky | (mant_fp8 & 1))
-        mant_fp8 = mant_fp8 + do_round
-        carry = mant_fp8 > 7
-        mant_fp8 = tl.where(carry, 0, mant_fp8)
-        exp_fp8 = tl.where(carry, exp_fp8 + 1, exp_fp8)
-        is_max_exceeded = (exp_fp8 == 15) & (mant_fp8 > 6)
-        mant_fp8 = tl.where(is_max_exceeded, 6, mant_fp8)
-        is_overflow = exp_fp8 > 15
-        exp_fp8 = tl.where(is_overflow, 15, exp_fp8)
-        mant_fp8 = tl.where(is_overflow, 6, mant_fp8)
-        is_underflow = (exp_fp8 <= 0) | (fp16_exp == 0)
-        exp_fp8 = tl.where(is_underflow, 0, exp_fp8)
-        mant_fp8 = tl.where(is_underflow, 0, mant_fp8)
-        x_uint8 = ((fp16_sign << 7) | (exp_fp8 << 3) | mant_fp8).to(tl.uint8)
+        x_uint8 = _sm70_fp32_to_fp8e4m3_u8(x_clamped)
 
         tl.store(fp8_ptr + block, x_uint8, mask=mask)
 
@@ -649,31 +626,7 @@ def _sm70_fused_compress_norm_rope_insert_fp8_kernel(
         x_scaled = quant_2d * inv_scales_col
         x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
 
-        # Manual FP8 e4m3fn encode via fp16 bit manipulation
-        x_f16_bits = (
-            x_clamped.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32)
-        )
-        fp16_sign = (x_f16_bits >> 15) & 1
-        fp16_exp = (x_f16_bits >> 10) & 0x1F
-        fp16_mant = x_f16_bits & 0x3FF
-        exp_fp8 = fp16_exp - 8
-        mant_fp8 = (fp16_mant >> 7) & 0x7
-        round_bit = (fp16_mant >> 6) & 1
-        sticky = fp16_mant & 0x3F
-        do_round = round_bit & (sticky | (mant_fp8 & 1))
-        mant_fp8 = mant_fp8 + do_round
-        carry = mant_fp8 > 7
-        mant_fp8 = tl.where(carry, 0, mant_fp8)
-        exp_fp8 = tl.where(carry, exp_fp8 + 1, exp_fp8)
-        is_max_exceeded = (exp_fp8 == 15) & (mant_fp8 > 6)
-        mant_fp8 = tl.where(is_max_exceeded, 6, mant_fp8)
-        is_overflow = exp_fp8 > 15
-        exp_fp8 = tl.where(is_overflow, 15, exp_fp8)
-        mant_fp8 = tl.where(is_overflow, 6, mant_fp8)
-        is_underflow = (exp_fp8 <= 0) | (fp16_exp == 0)
-        exp_fp8 = tl.where(is_underflow, 0, exp_fp8)
-        mant_fp8 = tl.where(is_underflow, 0, mant_fp8)
-        x_uint8 = ((fp16_sign << 7) | (exp_fp8 << 3) | mant_fp8).to(tl.uint8)
+        x_uint8 = _sm70_fp32_to_fp8e4m3_u8(x_clamped)
         x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
 
         nope_mask = block < NOPE_HEAD_DIM

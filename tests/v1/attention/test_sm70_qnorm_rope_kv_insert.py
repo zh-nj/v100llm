@@ -203,6 +203,21 @@ def test_multi_token():
     )
 
 
+def test_cache_bytes_match_torch_reference_exact():
+    """The production SM70 SWA KV insert must match torch.float8_e4m3fn
+    byte-for-byte. A loose mismatch threshold hides systematic FP8 rounding
+    drift in every layer's sliding-window cache."""
+    q_triton, k_cache_triton, q_torch, k_cache_torch = run_both(
+        num_tokens=16,
+        n_heads=8,
+        block_size=16,
+        seed=42,
+    )
+
+    torch.testing.assert_close(q_triton, q_torch, rtol=1e-2, atol=5e-3)
+    torch.testing.assert_close(k_cache_triton, k_cache_torch, rtol=0, atol=0)
+
+
 # ── Test 4: Padding sentinel ─────────────────────────────────────────────────
 
 
