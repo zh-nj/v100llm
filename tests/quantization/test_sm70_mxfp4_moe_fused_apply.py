@@ -267,6 +267,64 @@ def test_stash_builds_pack_and_sets_from_layer_attrs(cap_logger) -> None:
     assert layer.sm70_fused_quant_params.group_size == 32
 
 
+def test_stash_skipped_for_swiglu_limit_layer(cap_logger) -> None:
+    """Switch on but layer needs swiglu_limit => no pack built (feature parity).
+
+    The fused kernel implements a plain ``silu(gate)*up`` epilogue with no
+    swiglu clamp, so a layer carrying a positive ``swiglu_limit`` must NOT build
+    the fused pack (it would be numerically wrong) — and must not hold the extra
+    raw-weight copy alive. The TurboMind per-operator path is used instead.
+    """
+    method = _make_method()
+    layer = _make_mxfp4_layer()
+    layer.swiglu_limit = 10.0
+
+    with mock.patch.object(sm70_mxfp4_moe.envs, "VLLM_SM70_FUSED_MOE", True):
+        method._maybe_stash_sm70_mxfp4_weights(layer)
+
+    assert layer.sm70_fused_quant_params is None
+    assert layer.sm70_fused_experts is None
+    # No extra raw-weight copy stashed (memory-safety).
+    assert not hasattr(layer, "sm70_mxfp4_w13_weight")
+
+
+def test_stash_skipped_for_biased_layer() -> None:
+    """Switch on but the MoE has expert bias => no pack built (feature parity)."""
+    method = _make_method()
+    method.moe = SimpleNamespace(activation="silu", has_bias=True)
+    layer = _make_mxfp4_layer()
+
+    with mock.patch.object(sm70_mxfp4_moe.envs, "VLLM_SM70_FUSED_MOE", True):
+        method._maybe_stash_sm70_mxfp4_weights(layer)
+
+    assert layer.sm70_fused_quant_params is None
+    assert layer.sm70_fused_experts is None
+    assert not hasattr(layer, "sm70_mxfp4_w13_weight")
+
+
+def test_fallback_when_swiglu_limit_present(cap_logger) -> None:
+    """Runtime guard: a swiglu_limit on the layer => fall back, log once."""
+    method = _make_method()
+    experts = _StubExperts(layout="contiguous")
+    layer = _make_layer(experts, enabled=True, fusion_level=SM70FusionLevel.L2)
+    layer.swiglu_limit = 10.0
+    x = torch.zeros((32, 512), dtype=torch.float16)
+    tw = torch.zeros((32, 2), dtype=torch.float16)
+    ti = torch.zeros((32, 2), dtype=torch.int64)
+
+    with mock.patch.object(
+        sm70_mxfp4_moe,
+        "sm70_fused_support",
+        return_value=SM70FusedSupport(enabled=True, reason=None),
+    ):
+        out = method._maybe_apply_sm70_fused(layer, x, tw, ti)
+
+    assert out is None
+    assert experts.forward_called is False
+    w = _warnings(cap_logger)
+    assert len(w) == 1 and "swiglu_limit" in w[0].getMessage()
+
+
 def test_stash_survives_turbomind_delete_via_from_layer() -> None:
     """The stash lets ``from_layer`` rebuild after the originals are deleted."""
     method = _make_method()

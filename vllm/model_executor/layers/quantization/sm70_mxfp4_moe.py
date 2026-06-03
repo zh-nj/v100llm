@@ -373,6 +373,33 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
         layer.sm70_fused_experts = None
         if not envs.VLLM_SM70_FUSED_MOE:
             return
+
+        layer_name = getattr(layer, "layer_name", "<unknown>")
+
+        # Feature-parity guard (R6.2): the fused CUDA mega-kernel implements a
+        # plain ``silu(gate) * up`` SwiGLU epilogue with no expert bias and no
+        # swiglu clamping. If this layer needs an expert bias or a
+        # ``swiglu_limit`` (both handled by the TurboMind per-operator path via
+        # ``sm70_fused_swiglu_limit`` / the bias add), the fused path would be
+        # *numerically wrong*, so do not build (or stash) the pack at all — the
+        # existing path is used. Skipping here also avoids holding an extra full
+        # copy of the MXFP4 expert weights alive for a pack that can never run.
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
+        has_swiglu_limit = swiglu_limit is not None and swiglu_limit > 0
+        has_bias = (
+            getattr(layer, "w13_bias", None) is not None
+            or getattr(layer, "w2_bias", None) is not None
+            or bool(getattr(self.moe, "has_bias", False))
+        )
+        if has_swiglu_limit or has_bias:
+            logger.info_once(
+                "SM70 fused MoE: disabled for layer=%s (the fused kernel does "
+                "not support %s; using the TurboMind per-operator path).",
+                layer_name,
+                "swiglu_limit" if has_swiglu_limit else "expert bias",
+            )
+            return
+
         # Stash the raw MXFP4 tensors before the TurboMind prep deletes the
         # originals. Reference the underlying tensors (storage stays alive while
         # referenced); these are the exact packed FP4 weights + per-32 block
@@ -383,7 +410,6 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
         layer.sm70_mxfp4_w2_weight_scale = layer.w2_weight_scale.data
         layer.group_size = self.group_size
 
-        layer_name = getattr(layer, "layer_name", "<unknown>")
         try:
             quant = SM70MXFP4QuantParams.from_layer(
                 layer, group_size=self.group_size
@@ -473,6 +499,23 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
             logger.warning_once(
                 "SM70 fused MoE: falling back (%s) for layer=%s",
                 support.reason,
+                layer_name,
+            )
+            return None
+
+        # Feature-parity runtime guard (defense-in-depth): the fused kernel does
+        # not implement an expert bias or a ``swiglu_limit`` clamp, so fall back
+        # if either is present on the layer (the stash guard normally prevents a
+        # pack from being built in this case, but a layer mutated after loading
+        # must still be handled correctly).
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
+        if (swiglu_limit is not None and swiglu_limit > 0) or (
+            getattr(layer, "w13_bias", None) is not None
+            or getattr(layer, "w2_bias", None) is not None
+        ):
+            logger.warning_once(
+                "SM70 fused MoE: falling back (swiglu_limit / expert bias not "
+                "supported by the fused kernel) for layer=%s",
                 layer_name,
             )
             return None
