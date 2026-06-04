@@ -124,6 +124,16 @@ class OffloadingConnectorWorker:
                     if num_blocks_physical_dim == 0:
                         storage = layer_kv_cache.untyped_storage()
                         page = layer_kv_cache_spec.page_size_bytes
+                        # Per-tensor block count: DeepSeek-V4's heterogeneous
+                        # allocator gives some groups (e.g. the SWA ring) a
+                        # different physical block count than the global
+                        # kv_cache_config.num_blocks, so derive it from the
+                        # actual storage size rather than assuming the global.
+                        layer_num_blocks = storage.nbytes() // page
+                        assert layer_num_blocks * page == storage.nbytes(), (
+                            f"layer {layer_name}: storage {storage.nbytes()} "
+                            f"not divisible by page {page}"
+                        )
                         tensors_per_block[layer_name] = (
                             torch.tensor(
                                 [],
@@ -131,7 +141,7 @@ class OffloadingConnectorWorker:
                                 device=layer_kv_cache.device,
                             )
                             .set_(storage)
-                            .view(num_blocks, page),
+                            .view(layer_num_blocks, page),
                         )
                         page_size_bytes[layer_name] = (
                             layer_kv_cache_spec.page_size_bytes
@@ -148,6 +158,16 @@ class OffloadingConnectorWorker:
                         # unbind the tensor to separate K and V tensors
                         half_page_size = layer_kv_cache_spec.page_size_bytes // 2
                         storage = layer_kv_cache.untyped_storage()
+                        # Per-tensor block count (see note above): for the
+                        # (2, num_blocks, half_page) layout the storage holds
+                        # 2 * layer_num_blocks * half_page bytes.
+                        layer_num_blocks = storage.nbytes() // (2 * half_page_size)
+                        assert (
+                            layer_num_blocks * 2 * half_page_size == storage.nbytes()
+                        ), (
+                            f"layer {layer_name}: storage {storage.nbytes()} not "
+                            f"divisible by 2*half_page {2 * half_page_size}"
+                        )
                         raw = (
                             torch.tensor(
                                 [],
@@ -155,7 +175,7 @@ class OffloadingConnectorWorker:
                                 device=layer_kv_cache.device,
                             )
                             .set_(storage)
-                            .view(2, num_blocks, half_page_size)
+                            .view(2, layer_num_blocks, half_page_size)
                         )
                         tensors_per_block[layer_name] = tuple(raw.unbind(0))
 
@@ -173,14 +193,22 @@ class OffloadingConnectorWorker:
                     assert len(state_tensors) > 0
                     first_state_tensor = state_tensors[0]
                     assert first_state_tensor.storage_offset() == 0
+                    mamba_storage = first_state_tensor.untyped_storage()
+                    mamba_page = layer_kv_cache_spec.page_size_bytes
+                    # Per-tensor block count (see note above).
+                    layer_num_blocks = mamba_storage.nbytes() // mamba_page
+                    assert layer_num_blocks * mamba_page == mamba_storage.nbytes(), (
+                        f"layer {layer_name}: storage {mamba_storage.nbytes()} "
+                        f"not divisible by page {mamba_page}"
+                    )
                     tensor = (
                         torch.tensor(
                             [],
                             dtype=torch.int8,
                             device=first_state_tensor.device,
                         )
-                        .set_(first_state_tensor.untyped_storage())
-                        .view((num_blocks, layer_kv_cache_spec.page_size_bytes))
+                        .set_(mamba_storage)
+                        .view((layer_num_blocks, layer_kv_cache_spec.page_size_bytes))
                     )
                     tensors_per_block[layer_name] = (tensor,)
 
