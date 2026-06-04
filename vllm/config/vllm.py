@@ -580,6 +580,16 @@ class VllmConfig:
             self.kv_transfer_config.kv_connector_extra_config.update(
                 {"cpu_bytes_to_use": kv_offloading_size * (1 << 30)}
             )
+        elif kv_offloading_backend == "native_hma":
+            # HMA-aware CPU offload: works with the hybrid KV-cache manager and
+            # heterogeneous KV layouts (e.g. DeepSeek-V4's SWA ring + compressed
+            # 4/128 + indexer groups), which the plain "native" OffloadingConnector
+            # rejects. ``cpu_bytes_to_use`` is server-wide (the connector divides
+            # by world_size internally for per-rank capacity).
+            self.kv_transfer_config.kv_connector = "SimpleCPUOffloadConnector"
+            self.kv_transfer_config.kv_connector_extra_config.update(
+                {"cpu_bytes_to_use": kv_offloading_size * (1 << 30)}
+            )
         elif kv_offloading_backend == "lmcache":
             self.kv_transfer_config.kv_connector = "LMCacheConnectorV1"
             kv_gb_per_rank = kv_offloading_size / num_kv_ranks
