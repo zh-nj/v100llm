@@ -40,6 +40,170 @@ from vllm.model_executor.utils import set_weight_attrs
 logger = init_logger(__name__)
 
 
+class _SM70MoEPrefillScratch:
+    """Grow-only, cross-layer shared scratch for the SM70 MXFP4 MoE prefill path.
+
+    The per-operator prefill path needs several large ``[slots, dim]`` fp16
+    buffers (``permuted_input`` / ``sorted_output`` / ``gate_up`` /
+    ``intermediate``) plus a few index buffers. Previously these were
+    ``torch.empty``-ed fresh on every MoE layer of every prefill step, churning
+    the CUDA caching allocator with large short-lived blocks and driving
+    fragmentation (the "big request then OOM on a smaller one" failure mode).
+
+    MoE layers execute sequentially on the compute stream and the only tensor
+    that escapes ``apply()`` is the freshly allocated ``output``, so a single set
+    of these buffers can be reused across all layers and steps. We keep one
+    shared, grow-only pool per ``(device, dims)``: it grows to the largest
+    slot/token count seen and is then reused, so the big allocations happen once
+    instead of once-per-layer-per-step.
+
+    NOT used by the decode / CUDA-graph path: that path stays on the per-layer
+    persistent ``_buf_*`` buffers (small, capture-safe). This pool is only
+    consulted for the large (prefill) case, which runs eagerly, so there is no
+    graph-replay aliasing hazard (the persistent-branch threshold keeps every
+    captured size off this pool).
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        *,
+        hidden: int,
+        w13_n_dim: int,
+        intermediate_size: int,
+        num_experts: int,
+        top_k: int,
+    ) -> None:
+        self.device = device
+        self.hidden = hidden
+        self.w13_n_dim = w13_n_dim
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.capacity_slots = 0
+        self.capacity_tokens = 0
+        # Sized by num_experts (constant across calls); allocate once.
+        self.expert_offsets = torch.empty(
+            num_experts + 1, dtype=torch.int32, device=device
+        )
+        self.expert_offsets64 = torch.empty(
+            num_experts + 1, dtype=torch.int64, device=device
+        )
+        # Slot-scaled buffers (grown on demand).
+        self.permuted_input: torch.Tensor | None = None
+        self.sorted_output: torch.Tensor | None = None
+        self.gate_up: torch.Tensor | None = None
+        self.intermediate: torch.Tensor | None = None
+        self.permuted_idx: torch.Tensor | None = None
+        self.m_indices: torch.Tensor | None = None
+        self.token_expert_indices: torch.Tensor | None = None
+        # Token-scaled buffers (grown on demand).
+        self.inv_permuted_idx: torch.Tensor | None = None
+        self.topk_ids_i32: torch.Tensor | None = None
+
+    def _grow_slots(self, total_slots: int) -> None:
+        # Drop old references before allocating new ones so the allocator can
+        # reuse the freed blocks instead of holding both (avoids a transient
+        # double-residency spike on grow).
+        self.permuted_input = None
+        self.sorted_output = None
+        self.gate_up = None
+        self.intermediate = None
+        self.permuted_idx = None
+        self.m_indices = None
+        self.token_expert_indices = None
+        d = self.device
+        self.permuted_input = torch.empty(
+            total_slots, self.hidden, dtype=torch.float16, device=d
+        )
+        self.sorted_output = torch.empty(
+            total_slots, self.hidden, dtype=torch.float16, device=d
+        )
+        self.gate_up = torch.empty(
+            total_slots, self.w13_n_dim, dtype=torch.float16, device=d
+        )
+        self.intermediate = torch.empty(
+            total_slots, self.intermediate_size, dtype=torch.float16, device=d
+        )
+        self.permuted_idx = torch.empty(total_slots, dtype=torch.int32, device=d)
+        self.m_indices = torch.empty(total_slots, dtype=torch.int32, device=d)
+        self.token_expert_indices = torch.arange(
+            total_slots, dtype=torch.int32, device=d
+        )
+        self.capacity_slots = total_slots
+
+    def _grow_tokens(self, num_tokens: int) -> None:
+        self.inv_permuted_idx = None
+        self.topk_ids_i32 = None
+        d = self.device
+        self.inv_permuted_idx = torch.empty(
+            num_tokens, self.top_k, dtype=torch.int32, device=d
+        )
+        self.topk_ids_i32 = torch.empty(
+            num_tokens, self.top_k, dtype=torch.int32, device=d
+        )
+        self.capacity_tokens = num_tokens
+
+    def get(
+        self, total_slots: int, num_tokens: int, output: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        if total_slots > self.capacity_slots:
+            self._grow_slots(total_slots)
+        if num_tokens > self.capacity_tokens:
+            self._grow_tokens(num_tokens)
+        # total_slots == num_tokens * top_k (guaranteed by the caller), so the
+        # flat arange sliced to total_slots reshapes cleanly to [num_tokens, tk].
+        return {
+            "output": output,
+            "permuted_input": self.permuted_input[:total_slots],
+            "sorted_output": self.sorted_output[:total_slots],
+            "gate_up": self.gate_up[:total_slots],
+            "intermediate": self.intermediate[:total_slots],
+            "expert_offsets": self.expert_offsets,
+            "expert_offsets64": self.expert_offsets64,
+            "inv_permuted_idx": self.inv_permuted_idx[:num_tokens],
+            "topk_ids_i32": self.topk_ids_i32[:num_tokens],
+            "token_expert_indices": self.token_expert_indices[:total_slots].view(
+                num_tokens, self.top_k
+            ),
+            "permuted_idx": self.permuted_idx[:total_slots],
+            "m_indices": self.m_indices[:total_slots],
+        }
+
+
+# Cross-layer shared prefill scratch, keyed by (device, expert dims). All
+# DeepSeek-V4 MoE layers share identical expert dims, so this is normally a
+# single pool reused by every layer; heterogeneous dims (e.g. an MTP layer)
+# get their own pool automatically.
+_SM70_MOE_PREFILL_SCRATCH: dict[tuple, _SM70MoEPrefillScratch] = {}
+
+
+def _get_sm70_moe_prefill_scratch(
+    layer: Module, device: torch.device
+) -> _SM70MoEPrefillScratch:
+    top_k = layer._buf_top_k
+    key = (
+        str(device),
+        layer.sm70_hidden_logical_size,
+        layer.sm70_w13_n_dim,
+        layer.sm70_intermediate_size,
+        layer.sm70_num_experts,
+        top_k,
+    )
+    scratch = _SM70_MOE_PREFILL_SCRATCH.get(key)
+    if scratch is None:
+        scratch = _SM70MoEPrefillScratch(
+            device,
+            hidden=layer.sm70_hidden_logical_size,
+            w13_n_dim=layer.sm70_w13_n_dim,
+            intermediate_size=layer.sm70_intermediate_size,
+            num_experts=layer.sm70_num_experts,
+            top_k=top_k,
+        )
+        _SM70_MOE_PREFILL_SCRATCH[key] = scratch
+    return scratch
+
+
 class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
     """SM70 direct MXFP4 MoE method using TurboMind grouped GEMM."""
 
@@ -338,48 +502,18 @@ class Mxfp4SM70MoEMethod(FusedMoEMethodBase):
                 "m_indices": layer._buf_m_indices[:total_slots],
             }
         device = layer._buf_output.device
-        top_k = layer._buf_top_k
         hidden_size = layer.sm70_hidden_logical_size
-        return {
-            "output": torch.empty(
-                num_tokens, hidden_size, dtype=torch.float16, device=device
-            ),
-            "permuted_input": torch.empty(
-                total_slots, hidden_size, dtype=torch.float16, device=device
-            ),
-            "sorted_output": torch.empty(
-                total_slots, hidden_size, dtype=torch.float16, device=device
-            ),
-            "gate_up": torch.empty(
-                total_slots,
-                layer.sm70_w13_n_dim,
-                dtype=torch.float16,
-                device=device,
-            ),
-            "intermediate": torch.empty(
-                total_slots,
-                layer.sm70_intermediate_size,
-                dtype=torch.float16,
-                device=device,
-            ),
-            "expert_offsets": torch.empty(
-                layer.sm70_num_experts + 1, dtype=torch.int32, device=device
-            ),
-            "expert_offsets64": torch.empty(
-                layer.sm70_num_experts + 1, dtype=torch.int64, device=device
-            ),
-            "inv_permuted_idx": torch.empty(
-                num_tokens, top_k, dtype=torch.int32, device=device
-            ),
-            "topk_ids_i32": torch.empty(
-                num_tokens, top_k, dtype=torch.int32, device=device
-            ),
-            "token_expert_indices": torch.arange(
-                total_slots, dtype=torch.int32, device=device
-            ).view(num_tokens, top_k),
-            "permuted_idx": torch.empty(total_slots, dtype=torch.int32, device=device),
-            "m_indices": torch.empty(total_slots, dtype=torch.int32, device=device),
-        }
+        # Large (prefill) case: reuse a grow-only, cross-layer shared scratch
+        # pool instead of allocating fresh ``[slots, dim]`` buffers every layer.
+        # This is the churn that drove CUDA-allocator fragmentation; the pool
+        # grows to the largest size seen and is then reused. ``output`` escapes
+        # this function (it is consumed by the TP all-reduce / shared-expert
+        # combine), so it stays a fresh per-call allocation.
+        scratch = _get_sm70_moe_prefill_scratch(layer, device)
+        output = torch.empty(
+            num_tokens, hidden_size, dtype=torch.float16, device=device
+        )
+        return scratch.get(total_slots, num_tokens, output)
 
     def _activation(self) -> MoEActivation:
         activation = self.moe.activation
