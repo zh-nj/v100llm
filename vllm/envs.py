@@ -93,7 +93,7 @@ if TYPE_CHECKING:
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
-    VLLM_SM70_FUSED_MOE: bool = True
+    VLLM_SM70_FUSED_MOE: bool = False
     VLLM_SM70_MHC_FAST: bool = True
     VLLM_PREFILL_CUDAGRAPH: bool = False
     VLLM_PREFILL_CUDAGRAPH_DEBUG: bool = False
@@ -990,12 +990,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_TRITON_AWQ": lambda: bool(int(os.getenv("VLLM_USE_TRITON_AWQ", "0"))),
     # If set (to 1), enable the SM70 (V100) fused MoE forward path
     # (linear1 -> SwiGLU -> linear2 fused, intermediate activations kept on-chip).
-    # Default 1 (on) for the dsv4f MXFP4 path: the gate still only activates on
-    # SM70 (compute capability 7.0) with fp16 + MXFP4 experts and falls back to
-    # the existing TurboMind grouped-GEMM path on any miss (non-V100, masked /
-    # decode layout, unbuilt kernel, runtime error), so non-SM70 deployments are
-    # unaffected. Set to 0 to force the legacy per-operator path everywhere.
-    "VLLM_SM70_FUSED_MOE": lambda: bool(int(os.getenv("VLLM_SM70_FUSED_MOE", "1"))),
+    # Default 0 (off): the legacy per-operator TurboMind grouped-GEMM path is
+    # used everywhere, so behavior is identical to the current release. When set
+    # to 1 the gate still only activates on SM70 (compute capability 7.0) with
+    # fp16 + MXFP4 experts and falls back to the existing path on any miss
+    # (non-V100, masked / decode layout, unbuilt kernel, runtime error).
+    "VLLM_SM70_FUSED_MOE": lambda: bool(int(os.getenv("VLLM_SM70_FUSED_MOE", "0"))),
     # If set to 0, SM70 serialized block-FP8 dense Linear uses the legacy
     # runtime decode fallback instead of the direct E4M3 GEMM path.
     "VLLM_SM70_FP8_DIRECT_GEMM": lambda: bool(
