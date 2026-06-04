@@ -29,12 +29,12 @@ CacheDType = Literal[
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
-# "native"     -> OffloadingConnector (homogeneous KV only; rejects HMA).
-# "native_hma" -> SimpleCPUOffloadConnector (HMA-aware CPU offload; works with
-#                 hybrid / heterogeneous KV such as DeepSeek-V4's SWA ring +
-#                 compressed (4/128) + indexer layers, which "native" cannot).
-# "lmcache"    -> LMCacheConnectorV1 (external dependency).
-KVOffloadingBackend = Literal["native", "native_hma", "lmcache"]
+# "native"  -> OffloadingConnector by default; SimpleCPUOffloadConnector when
+#             VLLM_USE_SIMPLE_KV_OFFLOAD=1. Both are HMA-aware (work with the
+#             hybrid KV-cache manager / heterogeneous KV such as DeepSeek-V4's
+#             SWA ring + compressed 4/128 + indexer layers).
+# "lmcache" -> LMCacheConnectorV1 (external dependency).
+KVOffloadingBackend = Literal["native", "lmcache"]
 
 
 @config

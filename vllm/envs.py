@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
+    VLLM_USE_SIMPLE_KV_OFFLOAD: bool = False
     VLLM_SM70_FUSED_MOE: bool = False
     VLLM_SM70_MHC_FAST: bool = True
     VLLM_PREFILL_CUDAGRAPH: bool = False
@@ -988,6 +989,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will use Triton implementations of AWQ.
     "VLLM_USE_TRITON_AWQ": lambda: bool(int(os.getenv("VLLM_USE_TRITON_AWQ", "0"))),
+    # Enable simple KV offload (use SimpleCPUOffloadConnector for the "native"
+    # kv_offloading_backend instead of OffloadingConnector). Both are HMA-aware.
+    "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
+        int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
+    ),
     # If set (to 1), enable the SM70 (V100) fused MoE forward path
     # (linear1 -> SwiGLU -> linear2 fused, intermediate activations kept on-chip).
     # Default 0 (off): the legacy per-operator TurboMind grouped-GEMM path is
