@@ -123,6 +123,12 @@ if TYPE_CHECKING:
     # FP8 cache directly without the (CHUNK_SIZE, M, head_dim) BF16
     # workspace. Default OFF until P5-E/F/G validation completes.
     VLLM_DEEPSEEK_V4_PREFILL_INDEXED: bool = False
+    # Auto-route compressed-MLA prefill (C4A/C128A) to the indexed (no-gather)
+    # kernel ONLY when the dense BF16 gather workspace for a layer would exceed
+    # VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB. Lets short prompts keep the
+    # faster dense path while long-context layers avoid the O(seq_len/ratio)
+    # gather peak. Independent of the force-on VLLM_DEEPSEEK_V4_PREFILL_INDEXED.
+    VLLM_DEEPSEEK_V4_PREFILL_INDEXED_AUTO: bool = False
     # P5-E debug switches: when both indexed=1 and debug=1 are set,
     # _forward_prefill runs both paths and logs MAE/maxAE per chunk.
     VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG: bool = False
@@ -1099,6 +1105,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # directly. Default OFF until validated end-to-end.
     "VLLM_DEEPSEEK_V4_PREFILL_INDEXED": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_PREFILL_INDEXED", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_AUTO": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_PREFILL_INDEXED_AUTO", "0"))
     ),
     "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG", "0"))

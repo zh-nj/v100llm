@@ -3885,9 +3885,35 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_block_table = swa_metadata.block_table[num_decodes:]
 
         workspace_manager = current_workspace_manager()
-        kv = workspace_manager.get_simultaneous(
-            ((reqs_per_chunk, M, q.shape[-1]), torch.bfloat16),
-        )[0]
+        # When the indexed (no-gather) path will handle every chunk of this
+        # layer (force-on, or AUTO-triggered by the byte budget for a covered
+        # compressed-MLA layer), skip allocating the large BF16 gather
+        # workspace entirely — that allocation is the very peak we're avoiding.
+        _layer_indexed_covered = (
+            not swa_only
+            and self.compress_ratio in (4, 128)
+            and compressed_k_cache is not None
+            and attn_metadata is not None
+            and q.shape[-1] in (512, 576)
+        )
+        _budget_bytes_layer = _sparse_prefill_workspace_budget_bytes()
+        _dense_ws_bytes_layer = M * q.shape[-1] * 2
+        _all_chunks_indexed = _layer_indexed_covered and (
+            envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED
+            or (
+                envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_AUTO
+                and _budget_bytes_layer > 0
+                and _dense_ws_bytes_layer > _budget_bytes_layer
+            )
+        )
+        # In debug mode the dense path is always run for comparison, so keep
+        # the workspace.
+        if _all_chunks_indexed and not envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG:
+            kv = None
+        else:
+            kv = workspace_manager.get_simultaneous(
+                ((reqs_per_chunk, M, q.shape[-1]), torch.bfloat16),
+            )[0]
         # Aux stream operations (KV-insert, compressor) launched via
         # maybe_execute_in_parallel in attention_impl have already completed
         # by the time we reach here — event synchronization in that helper
@@ -3907,26 +3933,57 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             output_slice = output[query_start:query_end]
             num_chunk_tokens = query_end - query_start
 
-            # P5 experimental: direct-indexed prefill kernel that
-            # reads paged FP8 caches without the (CHUNK_SIZE, M,
-            # head_dim) BF16 workspace. Skips the
-            # dequantize_and_gather_k_cache + combine_topk_swa_indices
-            # chain. Gated OFF by default; enable with
-            # VLLM_DEEPSEEK_V4_PREFILL_INDEXED=1. Bit-exactness
-            # verified on synthetic caches; production wiring is
-            # experimental until P5-E real-model microtest passes.
-            if (
-                envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED
-                and not swa_only
-                and self.compress_ratio == 4
+            # P5: direct-indexed prefill kernel that reads paged FP8 caches
+            # without the (CHUNK_SIZE, M, head_dim) BF16 gather workspace.
+            # Skips dequantize_and_gather_k_cache + combine_topk_swa_indices.
+            # Covers the compressed-MLA layers (C4A ratio=4 and C128A
+            # ratio=128) whose gather pool (N = seq_len/ratio) drives the
+            # prefill activation peak at long context. SWA-only layers
+            # (ratio<=1, N=0) keep the dense path; their gather buffer is
+            # tiny (window+mbt) so they need no bounding.
+            #
+            # Dispatch modes:
+            #  - VLLM_DEEPSEEK_V4_PREFILL_INDEXED=1: force indexed for all
+            #    covered layers (legacy explicit switch).
+            #  - VLLM_DEEPSEEK_V4_PREFILL_INDEXED_AUTO=1: use indexed ONLY when
+            #    the dense gather workspace for this layer would exceed the
+            #    byte budget (VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB),
+            #    otherwise fall through to the (faster, bit-exact) dense path.
+            indexed_covered = (
+                not swa_only
+                and self.compress_ratio in (4, 128)
                 and compressed_k_cache is not None
-                and q.shape[-1] in (512, 576)  # P5-C kernel internally
-                                              # operates on a 512-dim
-                                              # KV (NoPE 448 + RoPE 64).
-                                              # q can be 512 (production
-                                              # prefill) or 576 (some
-                                              # legacy paths).
+                and attn_metadata is not None
+                and q.shape[-1] in (512, 576)
+            )
+            # Single-request dense workspace bytes for this layer (the peak
+            # the indexed path avoids). Used by the AUTO trigger.
+            _dense_ws_bytes = M * q.shape[-1] * 2
+            _budget_bytes = _sparse_prefill_workspace_budget_bytes()
+            _auto_trigger = (
+                envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_AUTO
+                and _budget_bytes > 0
+                and _dense_ws_bytes > _budget_bytes
+            )
+            use_indexed = indexed_covered and (
+                envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED or _auto_trigger
+            )
+            if (
+                _auto_trigger
+                and indexed_covered
+                and not getattr(self, "_logged_indexed_auto", False)
             ):
+                logger.info_once(
+                    "DeepSeekV4 sparse prefill: AUTO-routing compress_ratio=%d "
+                    "layers to the indexed (no-gather) kernel; dense workspace "
+                    "%.0f MB > budget %d MB at M=%d.",
+                    self.compress_ratio,
+                    _dense_ws_bytes / (1024 * 1024),
+                    envs.VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB,
+                    M,
+                )
+                self._logged_indexed_auto = True
+            if use_indexed:
                 if envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG:
                     logger.warning(
                         "[P5E_DEBUG] DISPATCH ENTERED %s chunk=%d num_tokens=%d "
@@ -4028,7 +4085,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 indexed_debug_out = None
                 if (
-                    envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED
+                    (envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED
+                     or envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_AUTO)
                     and envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG
                 ):
                     logger.warning(
