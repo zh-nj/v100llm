@@ -117,6 +117,36 @@ def _get_prefill_chunk_size() -> int:
 
 
 PREFILL_CHUNK_SIZE = _get_prefill_chunk_size()
+
+
+def _sparse_prefill_workspace_budget_bytes() -> int:
+    """Byte budget for the BF16 KV-gather workspace (0 = unbounded/legacy)."""
+    mb = envs.VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB
+    return max(0, int(mb)) * 1024 * 1024
+
+
+def _sparse_prefill_reqs_per_subchunk(
+    *,
+    M: int,
+    head_dim: int,
+    element_size: int = 2,  # bfloat16 gather workspace
+) -> int:
+    """How many requests can share one gather workspace within the byte budget.
+
+    The gather workspace is (reqs, M, head_dim) bf16. Given a byte budget B,
+    return the largest reqs in [1, PREFILL_CHUNK_SIZE] whose workspace fits.
+    Mirrors fastllm's adaptive tokenBlock halving and upstream's
+    get_prefill_workspace_size cap: one request always proceeds even if its
+    own M*head_dim exceeds the budget (cannot split a single request's
+    compressed pool without a KV-tiling kernel; we still bound the *number*
+    of requests batched together).
+    """
+    budget = _sparse_prefill_workspace_budget_bytes()
+    if budget <= 0:
+        return PREFILL_CHUNK_SIZE
+    bytes_per_req = max(1, M * head_dim * element_size)
+    fit = budget // bytes_per_req
+    return max(1, min(PREFILL_CHUNK_SIZE, int(fit)))
 _SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 _QK_NOPE_DIM = 448
 _QK_ROPE_DIM = 64
@@ -1920,7 +1950,16 @@ class PrefillGraphDispatcher:
     ) -> None:
         assert self.kv_padded is not None
         capture_M = capture_size.max_M
-        kv_source = kv_flat.view(PREFILL_CHUNK_SIZE, M, self.head_dim)
+        # kv_flat is the eager gather workspace viewed as (-1, 1, head_dim).
+        # Its first dim is (workspace_reqs * M); workspace_reqs may be < the
+        # static PREFILL_CHUNK_SIZE when the byte-budgeted sub-chunking shrank
+        # it. Derive it from the tensor instead of assuming PREFILL_CHUNK_SIZE.
+        workspace_reqs = kv_flat.shape[0] // M
+        assert chunk_size <= workspace_reqs, (
+            f"chunk_size={chunk_size} exceeds gather workspace rows "
+            f"={workspace_reqs} (M={M})"
+        )
+        kv_source = kv_flat.view(workspace_reqs, M, self.head_dim)
         self.kv_padded[:chunk_size, :M].copy_(kv_source[:chunk_size, :M])
         if capture_M > M:
             self.kv_padded[:chunk_size, M:capture_M].zero_()
@@ -2825,8 +2864,14 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 else (sub.max_model_len + sub.compress_ratio - 1) // sub.compress_ratio
             )
             M = N + sub.window_size + sub.max_num_batched_tokens
+            # Match _forward_prefill's byte-budgeted workspace sizing so the
+            # shared pool reserves exactly what the real prefill will use.
+            reqs_per_chunk = min(
+                PREFILL_CHUNK_SIZE,
+                _sparse_prefill_reqs_per_subchunk(M=M, head_dim=q.shape[-1]),
+            )
             current_workspace_manager().get_simultaneous(
-                ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                ((reqs_per_chunk, M, q.shape[-1]), torch.bfloat16),
             )
             out.zero_()
             return
@@ -3806,7 +3851,28 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             N = 0
 
         M = N + self.window_size + self.max_num_batched_tokens
-        num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
+        # Byte-budgeted request sub-chunking: bound the live BF16 gather
+        # workspace (reqs, M, head_dim) to VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB.
+        # When M is large (long context), fewer requests share one workspace.
+        # Mirrors upstream get_prefill_workspace_size + fastllm adaptive tokenBlock.
+        reqs_per_chunk = min(
+            PREFILL_CHUNK_SIZE,
+            _sparse_prefill_reqs_per_subchunk(M=M, head_dim=q.shape[-1]),
+        )
+        num_chunks = (num_prefills + reqs_per_chunk - 1) // reqs_per_chunk
+        if (
+            reqs_per_chunk < PREFILL_CHUNK_SIZE
+            and not getattr(self, "_logged_prefill_budget_shrink", False)
+        ):
+            budget_mb = envs.VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB
+            ws_mb = reqs_per_chunk * M * q.shape[-1] * 2 / (1024 * 1024)
+            logger.info_once(
+                "DeepSeekV4 sparse prefill: gather workspace bounded to %.0f MB "
+                "(budget=%d MB) -> %d req(s)/sub-chunk at M=%d (was %d). "
+                "Lower --max-num-batched-tokens to reduce M further.",
+                ws_mb, budget_mb, reqs_per_chunk, M, PREFILL_CHUNK_SIZE,
+            )
+            self._logged_prefill_budget_shrink = True
         trace_prefill = (
             os.getenv("VLLM_DEEPSEEK_V4_NAN_TRACE", "0") == "1"
             and self.prefix.endswith("layers.1.attn")
@@ -3820,7 +3886,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         workspace_manager = current_workspace_manager()
         kv = workspace_manager.get_simultaneous(
-            ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            ((reqs_per_chunk, M, q.shape[-1]), torch.bfloat16),
         )[0]
         # Aux stream operations (KV-insert, compressor) launched via
         # maybe_execute_in_parallel in attention_impl have already completed
@@ -3829,8 +3895,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # below therefore runs entirely on the default stream with no
         # cross-stream hazards.
         for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
-            chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
+            chunk_start = chunk_idx * reqs_per_chunk
+            chunk_end = min(chunk_start + reqs_per_chunk, num_prefills)
             chunk_size = chunk_end - chunk_start
             query_start = (
                 query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base

@@ -110,6 +110,15 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_NAN_TRACE: bool = False
     VLLM_DEEPSEEK_V4_INDEXER_TOPK: int = 0
     VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE: int = 4
+    # Byte budget (MB) for the BF16 KV-gather workspace used by the sparse
+    # prefill path (the (reqs, M, head_dim) buffer where M ~= seq_len /
+    # compress_ratio + window + max_num_batched_tokens). When the buffer a
+    # request-chunk would need exceeds this budget, the prefill is processed
+    # in smaller request sub-chunks so the live workspace stays bounded
+    # (mirrors upstream get_prefill_workspace_size and fastllm's
+    # FASTLLM_DSV4_SPARSE_PREFILL_TEMP_MB adaptive tokenBlock). 0 disables
+    # the budget (legacy behavior: one buffer of PREFILL_CHUNK_SIZE reqs).
+    VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB: int = 512
     # P5: experimental direct-indexed prefill kernel that reads paged
     # FP8 cache directly without the (CHUNK_SIZE, M, head_dim) BF16
     # workspace. Default OFF until P5-E/F/G validation completes.
@@ -1079,6 +1088,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V4_PREFILL_CHUNK_SIZE", "4")
+    ),
+    "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB", "512")
     ),
     # P5 experimental indexed prefill kernel switch. When set to 1,
     # _forward_prefill skips the dequantize_and_gather_k_cache +
