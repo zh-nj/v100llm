@@ -2864,15 +2864,41 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 else (sub.max_model_len + sub.compress_ratio - 1) // sub.compress_ratio
             )
             M = N + sub.window_size + sub.max_num_batched_tokens
-            # Match _forward_prefill's byte-budgeted workspace sizing so the
-            # shared pool reserves exactly what the real prefill will use.
-            reqs_per_chunk = min(
-                PREFILL_CHUNK_SIZE,
-                _sparse_prefill_reqs_per_subchunk(M=M, head_dim=q.shape[-1]),
+            # If the indexed (no-gather) path will handle every chunk of this
+            # layer at runtime (force-on, or AUTO-triggered by the byte budget
+            # for a covered compressed-MLA layer), it allocates NO gather
+            # workspace — so the dummy run must not reserve it either, or the
+            # shared pool locks at the full M size and wastes the headroom the
+            # indexed path is meant to free.
+            head_dim = q.shape[-1]
+            indexed_covered = (
+                not swa_only
+                and sub.compress_ratio in (4, 128)
+                and head_dim in (512, 576)
             )
-            current_workspace_manager().get_simultaneous(
-                ((reqs_per_chunk, M, q.shape[-1]), torch.bfloat16),
+            budget_bytes = _sparse_prefill_workspace_budget_bytes()
+            dense_ws_bytes = M * head_dim * 2
+            all_chunks_indexed = indexed_covered and (
+                envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED
+                or (
+                    envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_AUTO
+                    and budget_bytes > 0
+                    and dense_ws_bytes > budget_bytes
+                )
             )
+            if not (
+                all_chunks_indexed
+                and not envs.VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG
+            ):
+                # Match _forward_prefill's byte-budgeted workspace sizing so
+                # the shared pool reserves exactly what the real prefill uses.
+                reqs_per_chunk = min(
+                    PREFILL_CHUNK_SIZE,
+                    _sparse_prefill_reqs_per_subchunk(M=M, head_dim=head_dim),
+                )
+                current_workspace_manager().get_simultaneous(
+                    ((reqs_per_chunk, M, head_dim), torch.bfloat16),
+                )
             out.zero_()
             return
 
