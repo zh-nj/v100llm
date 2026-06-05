@@ -125,6 +125,13 @@ if TYPE_CHECKING:
     # caching for sparse SWA layers. Default enabled after P6 N1-N5 gates
     # and 256k frontier smoke; explicit opt-out remains available.
     VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE: bool = True
+    # Use the per-request physical SWA ring + snapshot pool for DeepSeek V4
+    # SWA layers. Default OFF: upstream v0.22.0 keeps SWA blocks in the shared
+    # block pool (generic SlidingWindowManager), which gives correct standard
+    # prefix caching. The ring is a worktree-only HBM optimization that, when
+    # enabled, requires the snapshot index to be populated for SWA prefix-cache
+    # hits and otherwise yields 0% SWA hits (hybrid coordinator MIN starves).
+    VLLM_DEEPSEEK_V4_SWA_RING: bool = False
     # Snapshot pool byte budget per layer. 60 SWA layers × this byte cap
     # = total snapshot memory upper bound. Default 32 MiB per layer
     # gives ~1.9 GiB total (about 80 cached prefixes at 16k tokens).
@@ -1097,6 +1104,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # for the SWA ring group).
     "VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE", "1"))
+    ),
+    # Per-request physical SWA ring + snapshot pool (worktree-only HBM
+    # optimization). Default 0 = upstream block-pool SWA with correct prefix
+    # caching. Set 1 to restore the legacy P6 ring path.
+    "VLLM_DEEPSEEK_V4_SWA_RING": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_SWA_RING", "0"))
     ),
     # P6 task 41: per-layer snapshot pool byte cap.
     "VLLM_DEEPSEEK_V4_SWA_SNAPSHOT_BYTES": lambda: int(

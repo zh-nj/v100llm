@@ -402,7 +402,11 @@ class Scheduler(SchedulerInterface):
         *,
         copyin_tail_only: bool = False,
     ) -> SWARingSnapshotData | None:
-        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE:
+        # Snapshots are only meaningful for the per-request physical SWA ring.
+        # With the default block-pool SWA (ring off), SWA blocks live in the
+        # shared pool and standard prefix caching applies, so no snapshot is
+        # produced.
+        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE or not envs.VLLM_DEEPSEEK_V4_SWA_RING:
             return None
         swa_spec = self._get_deepseek_v4_swa_spec()
         if swa_spec is None:

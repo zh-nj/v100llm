@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
+import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
@@ -2200,7 +2201,8 @@ def test_unify_hybrid_kv_cache_specs():
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
 
 
-def test_deepseek_v4_swa_mla_uses_ring_sized_tensors():
+def test_deepseek_v4_swa_mla_uses_ring_sized_tensors(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_DEEPSEEK_V4_SWA_RING", True)
     model_config = ModelConfig(max_model_len=4096)
     scheduler_config = SchedulerConfig(
         max_model_len=4096,
@@ -2252,7 +2254,8 @@ def test_deepseek_v4_swa_mla_uses_ring_sized_tensors():
     assert swa_group.physical_blocks_per_req == swa_ring_blocks_per_req
 
 
-def test_deepseek_v4_swa_mla_minimal_profiling_allows_fixed_ring():
+def test_deepseek_v4_swa_mla_minimal_profiling_allows_fixed_ring(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_DEEPSEEK_V4_SWA_RING", True)
     model_config = ModelConfig(max_model_len=4096)
     scheduler_config = SchedulerConfig(
         max_model_len=4096,
@@ -2273,7 +2276,12 @@ def test_deepseek_v4_swa_mla_minimal_profiling_allows_fixed_ring():
     swa_ring_blocks_per_req = cdiv(
         swa_spec.max_memory_usage_bytes(vllm_config), swa_spec.page_size_bytes
     )
-    swa_physical_blocks = swa_ring_blocks_per_req * scheduler_config.max_num_seqs
+    # During minimal CUDA-graph profiling (available_memory=0 with
+    # num_gpu_blocks_override set), the ring is sized for
+    # max(1, num_gpu_blocks_override) requests, not max_num_seqs.
+    swa_physical_blocks = swa_ring_blocks_per_req * max(
+        1, vllm_config.cache_config.num_gpu_blocks_override or 1
+    )
 
     kv_cache_groups = kv_cache_utils.get_kv_cache_groups(
         vllm_config,

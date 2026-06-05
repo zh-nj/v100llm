@@ -2471,3 +2471,78 @@ def test_can_fit_full_sequence_full_attention_still_gates_oversized():
     req = make_request("oversized", list(range(prompt_len)), block_size, sha256)
 
     assert not manager.can_fit_full_sequence(req)
+
+
+def test_deepseek_v4_hybrid_swa_prefix_cache_hit_default():
+    """Regression: DeepSeek-V4 hybrid (full-MLA + SWA-MLA) must produce a
+    prefix-cache hit on an identical prompt under the DEFAULT config.
+
+    Before the fix, SlidingWindowMLASpec(deepseek_v4) was routed to the
+    per-request RingSlidingWindowMLAManager whose find_longest_cache_hit
+    returned 0 whenever the SWARingSnapshotIndex was empty. The hybrid
+    coordinator takes the MIN hit across groups, so the full-MLA group's
+    correct 768-token hit was starved to 0 -> 0% prefix cache hit rate.
+
+    With the default ring disabled (VLLM_DEEPSEEK_V4_SWA_RING=0, matching
+    upstream v0.22.0), SWA blocks live in the shared block pool and the
+    generic SlidingWindowManager yields the standard hit.
+    """
+    from vllm.v1.kv_cache_interface import (
+        MLAAttentionSpec,
+        SlidingWindowMLASpec,
+    )
+
+    hash_block = 64
+    full_mla = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    swa = SlidingWindowMLASpec(
+        block_size=hash_block,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        sliding_window=128,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+        compress_ratio=1,
+        model_version="deepseek_v4",
+    )
+    config = KVCacheConfig(
+        num_blocks=4096,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["c4a.0", "c128a.0"], full_mla),
+            KVCacheGroupSpec(["swa.0", "swa.1"], swa),
+        ],
+    )
+
+    manager = KVCacheManager(
+        config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block,
+    )
+    # SWA group must NOT use the per-request ring manager by default.
+    mgr_names = [type(m).__name__ for m in manager.coordinator.single_type_managers]
+    assert "RingSlidingWindowMLAManager" not in mgr_names
+    assert "SlidingWindowManager" in mgr_names
+
+    prefix = [i % 50 for i in range(802)]
+    req0 = make_request("v4-0", prefix, hash_block, sha256)
+    _, n0 = manager.get_computed_blocks(req0)
+    assert n0 == 0
+    cb0, _ = manager.get_computed_blocks(req0)
+    manager.allocate_slots(req0, len(prefix), len(cb0.blocks[0]) * hash_block, cb0)
+
+    req1 = make_request("v4-1", prefix, hash_block, sha256)
+    _, n1 = manager.get_computed_blocks(req1)
+    # 802 tokens, blocks of 64, capped at prompt_len-1 and 256-aligned (LCM)
+    # -> 768-token (12 SWA / 3 full-MLA blocks) hit.
+    assert n1 == 768, f"expected 768-token prefix hit, got {n1}"

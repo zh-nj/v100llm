@@ -1193,10 +1193,15 @@ def _get_kv_cache_config_deepseek_v4(
     """
     ring_groups: list[KVCacheGroupSpec] = []
     full_groups: list[KVCacheGroupSpec] = []
+    use_ring = envs.VLLM_DEEPSEEK_V4_SWA_RING
     for group in kv_cache_groups:
-        if _is_deepseek_v4_swa_ring_group(group):
+        if use_ring and _is_deepseek_v4_swa_ring_group(group):
             ring_groups.append(group)
         else:
+            # Upstream v0.22.0 path: SWA groups are allocated as ordinary
+            # block-pool tensors (bucketed together with the full-MLA group),
+            # so the generic SlidingWindowManager provides standard prefix
+            # caching. The per-request physical ring is opt-in only.
             full_groups.append(group)
 
     assert full_groups, "DeepseekV4 allocator expects at least one full MLA group"

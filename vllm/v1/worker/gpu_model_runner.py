@@ -1460,7 +1460,7 @@ class GPUModelRunner(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> None:
-        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE:
+        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE or not envs.VLLM_DEEPSEEK_V4_SWA_RING:
             return
 
         snapshot_by_req = {
@@ -1494,7 +1494,7 @@ class GPUModelRunner(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> None:
-        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE:
+        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE or not envs.VLLM_DEEPSEEK_V4_SWA_RING:
             return
 
         snapshot_by_req = {

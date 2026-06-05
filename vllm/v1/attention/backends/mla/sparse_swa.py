@@ -99,7 +99,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         return DeepseekSparseSWABackend
 
     def _ensure_snapshot_pool(self) -> SWARingSnapshotPool | None:
-        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE:
+        if not envs.VLLM_DEEPSEEK_V4_SWA_PREFIX_CACHE or not envs.VLLM_DEEPSEEK_V4_SWA_RING:
             return None
         if self.kv_cache.numel() == 0:
             return None

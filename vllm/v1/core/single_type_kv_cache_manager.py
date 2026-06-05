@@ -1310,7 +1310,13 @@ def get_manager_for_kv_cache_spec(
     if (
         isinstance(kv_cache_spec, SlidingWindowMLASpec)
         and kv_cache_spec.model_version == "deepseek_v4"
+        and envs.VLLM_DEEPSEEK_V4_SWA_RING
     ):
+        # Opt-in (legacy P6) path: per-request physical SWA ring backed by a
+        # snapshot pool. NOTE: this disables standard prefix caching for the
+        # SWA group unless the snapshot index is populated; upstream v0.22.0
+        # does NOT use a ring and instead keeps SWA blocks in the shared
+        # block pool via the generic SlidingWindowManager (the default below).
         manager_class = RingSlidingWindowMLAManager
     else:
         manager_class = spec_manager_map[type(kv_cache_spec)]
