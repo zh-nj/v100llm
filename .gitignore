@@ -249,3 +249,12 @@ vllm/grpc/vllm_engine_pb2.pyi
 csrc/cpu/cpu_attn_dispatch_generated.h
 
 .worktrees/
+
+# Vendored FlashMLA (SM70/V100) — build artifacts & cutlass submodule.
+# The FlashMLA source under ./FlashMLA is built in-tree by
+# cmake/external_projects/flashmla.cmake (default FLASH_MLA_SRC_DIR). cutlass is
+# a git submodule of FlashMLA; do not commit its contents into this repo.
+FlashMLA/build/
+FlashMLA/flash_mla/*.so
+FlashMLA/flash_mla.egg-info/
+FlashMLA/**/__pycache__/

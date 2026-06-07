@@ -1,0 +1,4 @@
+[submodule "FlashMLA/csrc/cutlass"]
+	path = FlashMLA/csrc/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
+	ignore = untracked

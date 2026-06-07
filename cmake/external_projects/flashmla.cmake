@@ -33,6 +33,15 @@ if (DEFINED ENV{FLASH_MLA_SRC_DIR})
   set(FLASH_MLA_SRC_DIR $ENV{FLASH_MLA_SRC_DIR})
 endif()
 
+# Default to the in-tree vendored FlashMLA checkout (./FlashMLA at the repo
+# root) when it exists and no explicit FLASH_MLA_SRC_DIR was provided. This lets
+# the V100/SM70 fork build the bundled FlashMLA source without a network fetch;
+# set FLASH_MLA_SRC_DIR (env or -D) to override.
+if(NOT FLASH_MLA_SRC_DIR AND EXISTS "${CMAKE_SOURCE_DIR}/FlashMLA/csrc")
+  set(FLASH_MLA_SRC_DIR "${CMAKE_SOURCE_DIR}/FlashMLA")
+  message(STATUS "Using in-tree FlashMLA at ${FLASH_MLA_SRC_DIR}")
+endif()
+
 if(FLASH_MLA_SRC_DIR)
   FetchContent_Declare(
         flashmla 
