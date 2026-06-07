@@ -4027,44 +4027,61 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 # swa_lens[t]        = min(abs_pos + 1, window_size)
                 # where abs_pos = (seq_lens[req] - query_lens_in_chunk[req])
                 #                  + position-within-this-request
-                chunk_seq_lens = seq_lens[chunk_start:chunk_end]
-                chunk_qstart = (
-                    query_start_loc[num_decodes + chunk_start:
-                                    num_decodes + chunk_end + 1]
-                    - query_start_loc[num_decodes + chunk_start]
-                )
-                # Build query_to_req on device (each request contributes
-                # query_lens[r] entries equal to r).
-                query_lens_chunk = (chunk_qstart[1:] - chunk_qstart[:-1])
-                query_to_req = torch.repeat_interleave(
-                    torch.arange(chunk_size, device=q.device,
-                                 dtype=torch.int32),
-                    query_lens_chunk.to(torch.int32),
-                )
-                # Position of each query token within its request.
-                # abs_pos[t] = (seq_len[r] - query_len[r]) + offset_within_req
-                # = (seq_len[r] - query_len[r]) + (t - chunk_qstart[r])
-                # Compute abs_pos via cumulative offset trick.
-                start_pos_per_req = (
-                    chunk_seq_lens.to(torch.int32) - query_lens_chunk.to(torch.int32)
-                )
-                # Per-token query offset within its request.
-                t_idx = torch.arange(num_chunk_tokens, device=q.device,
-                                     dtype=torch.int32)
-                req_for_t = query_to_req
-                abs_pos = start_pos_per_req[req_for_t] + (
-                    t_idx - chunk_qstart[req_for_t]
-                )
-                compressed_lens = torch.minimum(
-                    (abs_pos + 1) // self.compress_ratio,
-                    torch.tensor(top_k, device=q.device,
-                                 dtype=torch.int32),
-                ).to(torch.int32)
-                swa_lens_chunk = torch.minimum(
-                    abs_pos + 1,
-                    torch.tensor(self.window_size, device=q.device,
-                                 dtype=torch.int32),
-                ).to(torch.int32)
+                # P0-A hoist (see .kiro/specs/deepseek-v4-sm70-path-launch-
+                # overlap-optimization/measurements/p0a_prefill_meta_overhead_v100.md):
+                # the per-chunk repeat_interleave/arange rebuild cost ~620us/
+                # layer/chunk eager (repeat_interleave alone ~290us). Both
+                # query_to_req and abs_pos are already available from the
+                # SWA metadata builder / positions, computed once per step.
+                #
+                # abs_pos[t] is the absolute sequence position of prefill
+                # token t. `positions` here is positions[num_decode_tokens:]
+                # (the prefill slice passed into _forward_prefill), so the
+                # chunk's abs_pos is just its positions slice.
+                token_to_req = getattr(swa_metadata, "token_to_req_indices", None)
+                with _profile_or_null("prefill.indexed_metadata", q):
+                    if token_to_req is not None and envs.VLLM_DEEPSEEK_V4_INDEXED_PREFILL_PLAN:
+                        # Reuse the builder's token->global-req map; make it
+                        # chunk-local by subtracting the chunk's first request.
+                        q2r_lo = num_decode_tokens + query_start
+                        q2r_hi = num_decode_tokens + query_end
+                        query_to_req = (
+                            token_to_req[q2r_lo:q2r_hi] - chunk_start
+                        ).to(torch.int32)
+                        abs_pos = positions[query_start:query_end].to(torch.int32)
+                    else:
+                        # Legacy per-chunk rebuild (fallback / A-B baseline when
+                        # the plan is disabled or token_to_req_indices is None).
+                        chunk_seq_lens = seq_lens[chunk_start:chunk_end]
+                        chunk_qstart = (
+                            query_start_loc[num_decodes + chunk_start:
+                                            num_decodes + chunk_end + 1]
+                            - query_start_loc[num_decodes + chunk_start]
+                        )
+                        query_lens_chunk = (chunk_qstart[1:] - chunk_qstart[:-1])
+                        query_to_req = torch.repeat_interleave(
+                            torch.arange(chunk_size, device=q.device,
+                                         dtype=torch.int32),
+                            query_lens_chunk.to(torch.int32),
+                        )
+                        start_pos_per_req = (
+                            chunk_seq_lens.to(torch.int32)
+                            - query_lens_chunk.to(torch.int32)
+                        )
+                        t_idx = torch.arange(num_chunk_tokens, device=q.device,
+                                             dtype=torch.int32)
+                        req_for_t = query_to_req
+                        abs_pos = (start_pos_per_req[req_for_t] + (
+                            t_idx - chunk_qstart[req_for_t]
+                        )).to(torch.int32)
+                    compressed_lens = torch.clamp(
+                        (abs_pos + 1) // self.compress_ratio,
+                        max=top_k,
+                    ).to(torch.int32)
+                    swa_lens_chunk = torch.clamp(
+                        abs_pos + 1,
+                        max=self.window_size,
+                    ).to(torch.int32)
                 # Topk indices for this chunk: rows [query_start, query_end)
                 # of the topk_indices buffer (which is per-prefill-token).
                 topk_local = topk_indices[query_start:query_end]

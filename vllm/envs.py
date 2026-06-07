@@ -129,6 +129,12 @@ if TYPE_CHECKING:
     # faster dense path while long-context layers avoid the O(seq_len/ratio)
     # gather peak. Independent of the force-on VLLM_DEEPSEEK_V4_PREFILL_INDEXED.
     VLLM_DEEPSEEK_V4_PREFILL_INDEXED_AUTO: bool = False
+    # P0-A: hoist the per-chunk indexed-prefill metadata (query_to_req/abs_pos)
+    # out of the per-layer rebuild by reusing the SWA metadata builder's
+    # token_to_req_indices + positions. Default ON; set 0 to use the legacy
+    # per-chunk repeat_interleave/arange rebuild (A/B baseline). See
+    # .kiro/specs/deepseek-v4-sm70-path-launch-overlap-optimization.
+    VLLM_DEEPSEEK_V4_INDEXED_PREFILL_PLAN: bool = True
     # P5-E debug switches: when both indexed=1 and debug=1 are set,
     # _forward_prefill runs both paths and logs MAE/maxAE per chunk.
     VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG: bool = False
@@ -1108,6 +1114,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_AUTO": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_PREFILL_INDEXED_AUTO", "0"))
+    ),
+    # P0-A: hoist indexed-prefill per-chunk metadata. Default ON (1).
+    "VLLM_DEEPSEEK_V4_INDEXED_PREFILL_PLAN": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_INDEXED_PREFILL_PLAN", "1"))
     ),
     "VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_PREFILL_INDEXED_DEBUG", "0"))
