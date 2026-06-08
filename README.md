@@ -17,6 +17,12 @@ used by recent Qwen3.5 and MiniMax models.
 - 当前 `Gemma4` 相关验证基线使用 `transformers 5.5.4`。
 - 已在实际 V100 环境验证 `Qwen3.5-27B-AWQ`、`Qwen3.5-122B-A10B-AWQ-4bit`、`MiniMax-M2.5-AWQ`、
   `MiniMax-M2.7-AWQ-4bit` 的关键推理路径。
+- 内置 `SM70` 版 `FlashMLA`（`./FlashMLA`），为 `DeepSeek-V4` 的 prefill / decode / MTP MLA 路径提供
+  手写 `SM70` CUDA 内核；`vLLM` 构建时随包编译，无需额外网络拉取。
+- 支持 `DeepSeek-V4 Flash`（`DeepseekV4ForCausalLM` + `DeepSeekV4MTPModel`）的稀疏 MLA 推理：prefill
+  走 `TileLang` 内核、decode / MTP 走 `SM70` `FlashMLA`，并已做过 prefill 吞吐与 MTP 长上下文相关调优。
+- 支持 `Gemma 4 31B`（`Gemma4ForCausalLM` / `Gemma4ForConditionalGeneration` / `Gemma4MTPModel`）的
+  `SM70` 推理链路，验证基线使用 `transformers 5.5.4`。
 
 ## Quick Start / 快速开始
 
@@ -31,6 +37,9 @@ python -m pip install torch torchvision torchaudio --index-url https://download.
 
 # Recommended on V100 when you have a local flash-attention-v100 source tree.
 export VLLM_FLASH_ATTN_SRC_DIR=/path/to/flash-attention-v100
+
+# Fetch the bundled SM70 FlashMLA's cutlass submodule (needed for DeepSeek-V4).
+git submodule update --init FlashMLA/csrc/cutlass
 
 python -m pip install --upgrade "transformers==5.5.4" "tokenizers==0.22.2" "huggingface_hub>=1.5,<2"
 python -m pip install -e . --no-build-isolation
@@ -60,6 +69,8 @@ Additional notes:
 | `Qwen3.5-122B-A10B-AWQ-4bit` | `4x V100` | `compressed-tensors` 自动识别 + `SM70` TurboMind MoE | 真实生成通过 |
 | `MiniMax-M2.5-AWQ` | `8x V100` | `AWQ` + `SM70` MoE warmup | AsyncLLM smoke 通过 |
 | `MiniMax-M2.7-AWQ-4bit` | `8x V100` | `compressed-tensors -> AWQ` on `SM70` | AsyncLLM smoke 通过 |
+| `DeepSeek-V4 Flash` | `8x V100` | 稀疏 MLA：`TileLang` prefill + `SM70` `FlashMLA` decode/MTP | prefill / decode / MTP 路径打通并调优 |
+| `Gemma 4 31B` | `V100` | `Gemma4ForCausalLM` + MTP on `SM70`（`transformers 5.5.4`） | 推理链路打通 |
 
 详细命令、日志和验证记录见：
 
@@ -73,6 +84,9 @@ Additional notes:
 - `AWQ` 和 `compressed-tensors MoE` 在 `SM70` 上的运行时兼容
 - `fused_moe`、量化辅助函数、`_C` 绑定与入口契约恢复
 - `Qwen3.5` 和 `MiniMax` 相关真实推理链路打通
+- 内置 `SM70` 版 `FlashMLA`（`./FlashMLA`），打通 `DeepSeek-V4` 的 prefill / decode / MTP MLA 路径
+- 新增 `DeepSeek-V4 Flash` 稀疏 MLA（`TileLang` prefill + `SM70` `FlashMLA` decode/MTP）与
+  `Gemma 4 31B`（含 MTP）在 `SM70` 上的模型支持
 
 这些差异的目标是让当前分支像组合分支一样能在 V100 上完成实际推理，而不是通过绕开原有模型路径来“跑通一次”。
 
@@ -111,6 +125,25 @@ python -m vllm.entrypoints.cli.main --version
 0.19.1
 ```
 
+### Bundled FlashMLA (SM70) / 内置 FlashMLA
+
+`./FlashMLA` 是为 `Tesla V100 / SM70` 手写的 `FlashMLA`，供 `DeepSeek-V4` 的 prefill / decode / MTP
+MLA 路径使用。`vLLM` 构建时会通过 `cmake/external_projects/flashmla.cmake` 自动发现并随包一起编译：
+
+- 默认情况下，当 `./FlashMLA/csrc` 存在且未显式设置 `FLASH_MLA_SRC_DIR` 时，构建会直接使用这份
+  in-tree 源码，无需联网拉取。可通过 `FLASH_MLA_SRC_DIR`（环境变量或 `-D`）覆盖。
+- `cutlass` 以 git submodule 形式固定在指定 commit，首次构建前需执行：
+  `git submodule update --init FlashMLA/csrc/cutlass`。
+- 面向 `SM70` 构建时设置：
+
+```bash
+export CUDA_ARCHS=7.0
+export FLASH_MLA_ENABLE_SM70=1
+python -m pip install -e . --no-build-isolation
+```
+
+  其中 `sm90 / sm100` 源码会在 `7.0` 目标下被 gencode 过滤掉，只编译 `SM70` 内核。
+
 ## License / 许可证
 
 本仓库沿用 upstream `vLLM` 的许可证体系，详见 [`LICENSE`](LICENSE)。
@@ -121,3 +154,5 @@ python -m vllm.entrypoints.cli.main --version
 - [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)
 - [lmdeploy / TurboMind](https://github.com/InternLM/lmdeploy)
 - [flash-attention-v100](https://github.com/zhinianqin/flash-attention-v100)
+- [FlashMLA](https://github.com/deepseek-ai/FlashMLA)
+- [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass)
