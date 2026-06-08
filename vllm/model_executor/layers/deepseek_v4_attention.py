@@ -2322,6 +2322,9 @@ def _should_use_tilelang_sparse_prefill_fast_io(
             assume_valid_indices=(
                 envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES
             ),
+            q_dchunk=(
+                envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_Q_DCHUNK
+            ),
         )
         if cached:
             return True
@@ -3502,6 +3505,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                                     assume_valid_indices=(
                                         envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES
                                     ),
+                                    q_dchunk=(
+                                        envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_Q_DCHUNK
+                                    ),
                                 )
                 except Exception as exc:  # pragma: no cover - best-effort
                     logger.warning(
@@ -4365,6 +4371,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                                 ),
                                 assume_valid_indices=(
                                     envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES
+                                ),
+                                q_dchunk=(
+                                    envs.VLLM_SM70_TILELANG_SPARSE_PREFILL_Q_DCHUNK
                                 ),
                             )
                         )

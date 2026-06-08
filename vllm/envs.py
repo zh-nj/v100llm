@@ -217,10 +217,11 @@ if TYPE_CHECKING:
     VLLM_SM70_TILELANG_SPARSE_PREFILL_FAST_IO: bool = True
     VLLM_SM70_TILELANG_SPARSE_PREFILL_JIT_ON_MISS: bool = True
     VLLM_SM70_TILELANG_SPARSE_PREFILL_PREWARM_MAX_CONTEXT: int = 0
-    VLLM_SM70_TILELANG_SPARSE_PREFILL_BI: int = 16
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_BI: int = 32
     VLLM_SM70_TILELANG_SPARSE_PREFILL_STAGES: int = 1
     VLLM_SM70_TILELANG_SPARSE_PREFILL_HEADS_PER_BLOCK: int = 64
-    VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS: int = 128
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS: int = 256
+    VLLM_SM70_TILELANG_SPARSE_PREFILL_Q_DCHUNK: int = 64
     VLLM_SM70_TILELANG_SPARSE_PREFILL_PV_POLICY: str = "full_row"
     VLLM_SM70_TILELANG_SPARSE_PREFILL_ASSUME_VALID_INDICES: bool = False
     VLLM_SM70_TILELANG_SPARSE_PREFILL_OUTPUT_CHUNK_MB: int = 64
@@ -1246,7 +1247,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # validated on V100; larger values OOM smem, smaller values violate
     # the SM70 MMA macro's N >= 16 constraint.
     "VLLM_SM70_TILELANG_SPARSE_PREFILL_BI": lambda: int(
-        os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_BI", "16")
+        os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_BI", "32")
     ),
     # TileLang sparse MLA pipeline stages. Default remains the validated
     # single-stage V100 path; set to 2 only for explicit micro sweeps.
@@ -1262,7 +1263,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TileLang sparse MLA threads per block. 128 is the validated
     # setting on V100.
     "VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS": lambda: int(
-        os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS", "128")
+        os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_THREADS", "256")
+    ),
+    # D-tile (chunk) size for the Q operand of the QK GEMM inside the TileLang
+    # sparse prefill kernel. 0 = disabled (stage full D=512 of Q at once, the
+    # historical default). When >0 and < D, Q_shared holds only [H, Q_DCHUNK]
+    # and the QK GEMM loops over D-chunks, re-staging Q per chunk. This shrinks
+    # Q_shared SMEM, which on V100 frees room for BI=32 + threads=256 — measured
+    # 2.5-2.7x kernel speedup (DC=64). Must divide D (512). See
+    # .kiro/specs/deepseek-v4-flash-flashmla-sparse-internals/measurements/
+    # proto_tilelang_prefill_dtile_bi32_t256.md.
+    "VLLM_SM70_TILELANG_SPARSE_PREFILL_Q_DCHUNK": lambda: int(
+        os.getenv("VLLM_SM70_TILELANG_SPARSE_PREFILL_Q_DCHUNK", "64")
     ),
     # Warp partition policy for the PV GEMM inside the TileLang sparse prefill
     # kernel. Keep the default on the validated FullRow lowering; use this as

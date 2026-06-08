@@ -266,6 +266,7 @@ def _build_kernel_factory():
         has_sink: bool = True,
         has_topk_length: bool = True,
         output_dtype_str: str = "float16",
+        q_dchunk: int = 0,
     ):
         """Emit a fresh JIT-compiled TileLang kernel for the given config.
 
@@ -327,6 +328,14 @@ def _build_kernel_factory():
         D = dim
         D_tail = tail_dim
 
+        # Q D-tiling: when q_dchunk in (0, D), stage only [H, DC] of Q at a
+        # time and loop the QK GEMM over D-chunks. Shrinks Q_shared SMEM so
+        # larger BI / threads fit on V100. DC must divide D.
+        DC = q_dchunk if (0 < q_dchunk < D) else D
+        assert D % DC == 0, f"q_dchunk={q_dchunk} must divide dim={D}"
+        N_DCHUNK = D // DC
+        Q_TILE_COLS = DC
+
         if head_kv > heads_per_block:
             assert head_kv % heads_per_block == 0
             REPLICATE_H = head_kv // heads_per_block
@@ -355,8 +364,13 @@ def _build_kernel_factory():
             with T.Kernel(
                 seq_len * REPLICATE_H, batch, kv_group, threads=threads
             ) as (bx, by, bz):
-                Q_shared = T.alloc_shared([H_per_block, D], dtype)
+                Q_shared = T.alloc_shared([H_per_block, Q_TILE_COLS], dtype)
                 KV_shared = T.alloc_shared([BI, D], dtype)
+                # When Q is D-tiled, the QK GEMM consumes a [BI, DC] slice of
+                # KV per chunk; copy it into a dedicated exact-shape buffer
+                # because the SM70 ldmatrix macro rejects sliced GEMM operands.
+                if DC != D:
+                    KV_qk_chunk = T.alloc_shared([BI, DC], dtype)
                 if has_tail:
                     Q_tail_shared = T.alloc_shared(
                         [H_per_block, D_tail], dtype)
@@ -393,9 +407,10 @@ def _build_kernel_factory():
                 )
                 H1 = H0 + H_per_block
 
-                T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
                 if has_tail:
                     T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+                if DC == D:
+                    T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
 
                 if not assume_valid_indices:
                     tl_cur = T.alloc_fragment([1], topk_len_dtype)
@@ -452,11 +467,28 @@ def _build_kernel_factory():
                         for h_i, bi_i in T.Parallel(H_per_block, BI):
                             acc_s[h_i, bi_i] = T.if_then_else(
                                 mask[bi_i] != 0, 0, -T.infinity(acc_s.dtype))
-                    T.gemm(
-                        Q_shared, KV_shared, acc_s,
-                        transpose_B=True,
-                        policy=T.GemmWarpPolicy.FullRow,
-                    )
+                    if DC == D:
+                        T.gemm(
+                            Q_shared, KV_shared, acc_s,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullRow,
+                        )
+                    else:
+                        # D-tile QK: re-stage each Q D-chunk and the matching
+                        # KV D-slice, accumulate into acc_s. KV_shared stays
+                        # full-D for the PV GEMM below.
+                        for dc in T.serial(N_DCHUNK):
+                            T.copy(
+                                Q[b_i, s_i, H0:H1, dc * DC:(dc + 1) * DC],
+                                Q_shared)
+                            for bi_i, d_i in T.Parallel(BI, DC):
+                                KV_qk_chunk[bi_i, d_i] = KV_shared[
+                                    bi_i, dc * DC + d_i]
+                            T.gemm(
+                                Q_shared, KV_qk_chunk, acc_s,
+                                transpose_B=True,
+                                policy=T.GemmWarpPolicy.FullRow,
+                            )
                     if has_tail:
                         T.gemm(
                             Q_tail_shared, K_tail_shared, acc_s,
@@ -544,6 +576,7 @@ def _get_kernel(
     pv_gemm_policy: str = "full_row",
     assume_valid_indices: bool = False,
     output_dtype_str: str = "float16",
+    q_dchunk: int = 0,
 ):
     _validate_kernel_launch_config(heads, heads_per_block, threads)
     pv_gemm_policy = _normalize_pv_gemm_policy(pv_gemm_policy)
@@ -552,15 +585,15 @@ def _get_kernel(
         _KERNEL_FACTORY = _build_kernel_factory()
     key = (heads, dim, tail_dim, topk, sm_scale, has_sink,
            has_topk_length, block_I, num_stages, heads_per_block, threads,
-           pv_gemm_policy, assume_valid_indices, output_dtype_str)
+           pv_gemm_policy, assume_valid_indices, output_dtype_str, q_dchunk)
     if key not in _KERNEL_CACHE:
         logger.info(
             "TileLang sparse MLA: JIT compiling for "
             "heads=%d dim=%d tail=%d topk=%d sink=%s topk_len=%s "
-            "out=%s (BI=%d stages=%d hpb=%d threads=%d pv=%s valid=%s) — takes ~45s",
+            "out=%s (BI=%d stages=%d hpb=%d threads=%d pv=%s valid=%s dc=%d) — takes ~45s",
             heads, dim, tail_dim, topk, has_sink, has_topk_length,
             output_dtype_str, block_I, num_stages, heads_per_block, threads,
-            pv_gemm_policy, assume_valid_indices,
+            pv_gemm_policy, assume_valid_indices, q_dchunk,
         )
         _KERNEL_CACHE[key] = _KERNEL_FACTORY(
             heads=heads, dim=dim, tail_dim=tail_dim, topk=topk,
@@ -571,6 +604,7 @@ def _get_kernel(
             has_sink=has_sink,
             has_topk_length=has_topk_length,
             output_dtype_str=output_dtype_str,
+            q_dchunk=q_dchunk,
         )
         logger.info("TileLang sparse MLA: compile complete")
     return _KERNEL_CACHE[key]
@@ -591,6 +625,7 @@ def _is_kernel_cached(
     pv_gemm_policy: str = "full_row",
     assume_valid_indices: bool = False,
     output_dtype_str: str = "float16",
+    q_dchunk: int = 0,
 ) -> bool:
     """Return True if a compiled kernel for this config is in the cache.
 
@@ -604,7 +639,7 @@ def _is_kernel_cached(
         return False
     key = (heads, dim, tail_dim, topk, sm_scale, has_sink,
            has_topk_length, block_I, num_stages, heads_per_block, threads,
-           pv_gemm_policy, assume_valid_indices, output_dtype_str)
+           pv_gemm_policy, assume_valid_indices, output_dtype_str, q_dchunk)
     return key in _KERNEL_CACHE
 
 
@@ -624,6 +659,7 @@ def is_tilelang_sparse_fwd_cached(
     threads: int = 128,
     pv_gemm_policy: str = "full_row",
     assume_valid_indices: bool = False,
+    q_dchunk: int = 0,
 ) -> bool:
     """Public check: would `flash_mla_sparse_fwd_tilelang(q, kv, ...)` hit
     the kernel cache, or would it trigger a JIT compile?
@@ -664,6 +700,7 @@ def is_tilelang_sparse_fwd_cached(
         pv_gemm_policy=pv_gemm_policy,
         assume_valid_indices=assume_valid_indices,
         output_dtype_str=output_dtype_str,
+        q_dchunk=q_dchunk,
     )
 
 
@@ -683,6 +720,7 @@ def flash_mla_sparse_fwd_tilelang(
     threads: int = 128,
     pv_gemm_policy: str = "full_row",
     assume_valid_indices: bool = False,
+    q_dchunk: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Drop-in replacement for FlashMLA's `flash_mla_sparse_fwd`.
 
@@ -740,6 +778,7 @@ def flash_mla_sparse_fwd_tilelang(
                 threads=threads,
                 pv_gemm_policy=pv_gemm_policy,
                 assume_valid_indices=assume_valid_indices,
+                q_dchunk=q_dchunk,
             )
             max_logits_full[row_start:row_end].copy_(max_part)
             lse_full[row_start:row_end].copy_(lse_part)
@@ -775,6 +814,7 @@ def flash_mla_sparse_fwd_tilelang(
         pv_gemm_policy=pv_gemm_policy,
         assume_valid_indices=assume_valid_indices,
         output_dtype_str=output_dtype_str,
+        q_dchunk=q_dchunk,
     )
 
     out_tl, max_tl, lse_tl = kernel(
@@ -816,6 +856,7 @@ def prewarm_tilelang_sparse_fwd(
     pv_gemm_policy: str = "full_row",
     assume_valid_indices: bool = False,
     all_feature_variants: bool = False,
+    q_dchunk: int = 0,
 ) -> None:
     """Trigger JIT compile + first-call allocation of the TileLang kernel
     before it enters the prefill hot path.
@@ -854,6 +895,7 @@ def prewarm_tilelang_sparse_fwd(
             heads_per_block=heads_per_block, threads=threads,
             pv_gemm_policy=pv_gemm_policy,
             assume_valid_indices=assume_valid_indices,
+            q_dchunk=q_dchunk,
         )
     torch.cuda.synchronize()
     logger.info("TileLang sparse MLA: prewarm complete")
